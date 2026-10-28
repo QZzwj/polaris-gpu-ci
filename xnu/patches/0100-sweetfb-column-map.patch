@@ -1,0 +1,64 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index eaee891..fb4fd29 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -105,6 +105,7 @@ public:
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* panel origin of the logical display */
+ 	uint32_t      fContentW, fContentH;     /* panel area the logical display fills */
++	uint16_t      fXmap[4096];              /* per-call source column for each panel x */
+ 	int           fScale;                   /* scale the logical display into the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -471,7 +472,31 @@ AppleCLCD::present(const uint8_t *rec)
+ 			if (py1 > (int32_t)fHeight) {
+ 				py1 = (int32_t)fHeight;
+ 			}
+-			uint64_t xstep = ((uint64_t)fLogicalW << 16) / fContentW;
++			/*
++			 * The column mapping is the same for every row, so resolve it once
++			 * into fXmap and index it per pixel: this replaces a 64-bit
++			 * multiply-and-advance per pixel with one 16-bit load. Columns outside
++			 * the dirty rectangle are marked 0xffff and skipped.
++			 */
++			int32_t span = px1 - px0;
++			if (span > (int32_t)(sizeof(fXmap) / sizeof(fXmap[0]))) {
++				span = (int32_t)(sizeof(fXmap) / sizeof(fXmap[0]));
++			}
++			{
++				uint64_t xstep = ((uint64_t)fLogicalW << 16) / fContentW;
++				uint64_t xpos = (uint64_t)(px0 - fOffX) * xstep;
++				for (int32_t i = 0; i < span; i++) {
++					int32_t lx = (int32_t)(xpos >> 16);
++					int32_t column = sx + lx - dx;
++					xpos += xstep;
++					if (lx < dx || lx >= dx + w ||
++					    column < 0 || column > 0xffff) {
++						fXmap[i] = 0xffffu;
++					} else {
++						fXmap[i] = (uint16_t)column;
++					}
++				}
++			}
+ 			for (int32_t y = py0; y < py1; y++) {
+ 				int32_t ly = (int32_t)(((int64_t)(y - fOffY) * fLogicalH) / fContentH);
+ 				int32_t syy = sy + ly - dy;
+@@ -481,14 +506,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
+ 				const uint32_t *srow = (const uint32_t *)(src + s->offset +
+ 				    (uint64_t)syy * s->bytesPerRow);
+-				uint64_t xpos = (uint64_t)(px0 - fOffX) * xstep;
+-				for (int32_t x = px0; x < px1; x++) {
+-					int32_t lx = (int32_t)(xpos >> 16);
+-					xpos += xstep;
+-					if (lx < dx || lx >= dx + w) {
+-						continue;
++				for (int32_t i = 0; i < span; i++) {
++					uint16_t column = fXmap[i];
++					if (column != 0xffffu) {
++						drow[px0 + i] = srow[column];
+ 					}
+-					drow[x] = srow[sx + lx - dx];
+ 				}
+ 			}
+ 		} else if (src != 0 && bpe == 4) {

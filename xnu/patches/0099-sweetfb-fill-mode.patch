@@ -1,0 +1,35 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bf6b9fa..eaee891 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -170,8 +170,10 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	int polaris = 0;
++	int fill = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	PE_parse_boot_argn("sweetfb_polaris", &polaris, sizeof(polaris));
++	PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	fContentW = fWidth;
+@@ -181,7 +183,18 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+-	if (!native && polaris) {
++	if (!native && fill) {
++		/*
++		 * Fill the panel instead of keeping the aspect ratio: the 41-pixel
++		 * side bars disappear, at the cost of a non-uniform scale
++		 * (1125x2436 into 1080x2160 is about 8% vertically). Opt-in only.
++		 */
++		fContentW = fWidth;
++		fContentH = fHeight;
++		fOffX = 0;
++		fOffY = 0;
++		fScale = 1;
++	} else if (!native && polaris) {
+ 		/*
+ 		 * Polaris is 1080x2160 (18:9). Fit the whole iPhone X logical
+ 		 * display by height (998x2160) instead of cropping it, with
