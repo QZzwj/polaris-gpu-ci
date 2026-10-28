@@ -865,3 +865,14 @@ session. This session still has not booted, rebooted or flashed the handset.
 Next build the full 0001-0102 tree. Keep `polarisgpuon=0`; a real GPU execution
 and iOS renderer are still missing. The isolated packaging/device helpers remain
 usable after replacing their recorded CI source with the new exact snapshot.
+
+0102 milestone: local commit `0b160e476828ec89f6837049ee2f489afb99fee0`,
+102 contiguous patches validated; the complete framebuffer source reconstructs
+from the patch series with fill before column mapping. Isolated fork branch
+`polaris-gpu-fixes-0102-0b160e47`, remote commit
+`43d98dab531e81913380c4b722bb5da1b90d89ec`, exact tree
+`f3145f594b47b81fda5ae6201033d8952f2b60f6`. CI `40677321846` has acquired a
+runner and passed `Verify GPU protocol regressions`; full kernel build is in
+progress, not yet a kernel success. The previous main run already failed, so no
+cancellation was performed by this session. Use the updated helpers
+`gpu-fix/package_0102.py` and `gpu-fix/device_0102.py` for this source record.
