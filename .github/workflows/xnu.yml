@@ -41,6 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify GPU protocol regressions
+        run: python3 -m unittest discover -s tools -p 'test_polaris*.py' -q
+
       - name: Fetch build script
         run: |
           git init -q dxb

@@ -1,52 +1,57 @@
-"""Host tests for the ARC vote composer: pure data, no hardware."""
+"""ARC protocol regression tests, grounded in the Polaris vendor consumer."""
 import unittest
 
 import polaris_rpmh_vote as v
 
 
 class VoteTests(unittest.TestCase):
-    def test_levels_match_the_handset_dump(self):
-        self.assertEqual(v.levels('cx.lvl'), [0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x180])
-        self.assertEqual(v.levels('mx.lvl'), [0x10, 0x10, 0x100, 0x180])
-        self.assertEqual(v.levels('gfx.lvl'),
-                         [0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x140, 0x180, 0x1a0])
+    def test_off_keeps_hardware_selector_zero(self):
+        self.assertEqual(v.levels('gfx.lvl')[0], 0)
+        self.assertEqual(v.compose('gfx.lvl', 0), (0x30050, 0))
+        self.assertEqual(v.compose_level('gfx.lvl', 0), (0x30050, 0))
 
-    def test_gfx_has_nine_levels_not_seven_frequencies(self):
-        # 7 KGSL frequencies, 9 ARC levels: the composer must not conflate them.
-        self.assertEqual(len(v.levels('gfx.lvl')), 9)
+    def test_request_uses_selector_not_aux_level(self):
+        self.assertEqual(v.compose('gfx.lvl', 1), (0x30050, 1))
+        self.assertEqual(v.compose_level('gfx.lvl', 0x10), (0x30050, 1))
+        self.assertEqual(v.compose_level('gfx.lvl', 0x1a0), (0x30050, 9))
+        self.assertEqual(v.compose('cx.lvl', 7), (0x30000, 7))
 
-    def test_compose_returns_pinned_address_and_value(self):
-        addr, data = v.compose('gfx.lvl', 0)
-        self.assertEqual(addr, 0x30050)
-        self.assertEqual(data, 0x10)
-        addr, data = v.compose('gfx.lvl', 8)
-        self.assertEqual(data, 0x1a0)
+    def test_duplicate_mx_entries_keep_both_indices(self):
+        self.assertEqual(v.levels('mx.lvl'), [0, 0x10, 0x10, 0x100, 0x180])
+        self.assertEqual(v.compose('mx.lvl', 2), (0x30010, 2))
+        self.assertEqual(v.compose_level('mx.lvl', 0x10), (0x30010, 1))
+        self.assertEqual(v.compose_level('mx.lvl', 0x11), (0x30010, 3))
 
-    def test_corner_out_of_range_refused(self):
-        with self.assertRaisesRegex(v.VoteError, 'outside'):
-            v.compose('cx.lvl', 7)
-        with self.assertRaisesRegex(v.VoteError, 'outside'):
-            v.compose('mx.lvl', 4)
+    def test_in_between_level_rounds_up(self):
+        self.assertEqual(v.compose_level('gfx.lvl', 0x31), (0x30050, 3))
 
-    def test_bcm_rows_refused_until_layout_is_pinned(self):
-        for row in ('MC0', 'SH0', 'CN0'):
-            with self.assertRaisesRegex(v.VoteError, 'BCM row'):
-                v.compose(row, 0)
+    def test_all_gpu_selector_boundaries(self):
+        for row, address, count in (('cx.lvl', 0x30000, 8),
+                                    ('mx.lvl', 0x30010, 5),
+                                    ('gfx.lvl', 0x30050, 10)):
+            self.assertEqual(len(v.levels(row)), count)
+            for selector in range(count):
+                self.assertEqual(v.compose(row, selector), (address, selector))
+            for selector in (-1, count, 1.0, True, '1'):
+                with self.assertRaises(v.VoteError):
+                    v.compose(row, selector)
 
-    def test_unknown_row_and_rail_refused(self):
-        with self.assertRaisesRegex(v.VoteError, 'unknown ARC level row'):
-            v.compose('lcx.lvl', 0)
-        with self.assertRaisesRegex(v.VoteError, 'unknown rail'):
-            v.rail_vote('vrm.ebi', 0)
+    def test_unsupported_consumer_level_refused(self):
+        for level in (-1, 0x1a1, True, 1.5):
+            with self.assertRaises(v.VoteError):
+                v.compose_level('gfx.lvl', level)
 
-    def test_rail_vote_uses_pinned_rail_address(self):
-        self.assertEqual(v.rail_vote('vrm.cx', 0), (0x40800, 0x10))
-        self.assertEqual(v.rail_vote('vrm.gfx', 8), (0x42700, 0x1a0))
+    def test_vrm_and_old_rail_api_refused(self):
+        for rail in ('vrm.cx', 'vrm.mx', 'vrm.gfx'):
+            with self.assertRaisesRegex(v.VoteError, 'VRM'):
+                v.compose(rail, 1)
+            with self.assertRaisesRegex(v.VoteError, 'VRM'):
+                v.rail_vote(rail, 1)
 
-    def test_no_write_api_exists(self):
-        # Guard against a future "convenience" that actually sends the vote.
-        for name in dir(v):
-            self.assertNotIn(name.lower(), ('write', 'send', 'submit', 'vote_now'))
+    def test_bcm_and_unknown_rows_refused(self):
+        for row in ('MC0', 'SH0', 'CN0', 'unknown'):
+            with self.assertRaises(v.VoteError):
+                v.compose(row, 1)
 
 
 if __name__ == '__main__':

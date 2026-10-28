@@ -23,9 +23,23 @@ class CmdDbTests(unittest.TestCase):
         self.assertEqual(rows['gfx.lvl'][0], 0x30050)
 
     def test_level_counts(self):
-        self.assertEqual(db.count_levels('00 00 10 00 30 00 40 00 80 00 c0 00 00 01 80 01'), 7)
-        self.assertEqual(db.count_levels('00 00 10 00 30 00 40 00 80 00 c0 00 00 01 40 01 80 01 a0 01'), 9)
+        self.assertEqual(db.count_levels('00 00 10 00 30 00 40 00 80 00 c0 00 00 01 80 01'), 8)
+        self.assertEqual(db.count_levels('00 00 10 00 30 00 40 00 80 00 c0 00 00 01 40 01 80 01 a0 01'), 10)
         self.assertEqual(db.count_levels(''), 0)
+
+    def test_duplicates_and_off_count_as_selectors(self):
+        self.assertEqual(db.count_levels('00 00 10 00 10 00 00 01 80 01 00 00'), 5)
+
+    def test_changed_level_after_old_prefix_rejected(self):
+        bad = GOOD.replace('00 01 40 01 80 01 a0 01', '00 01 41 01 80 01 a0 01')
+        with self.assertRaisesRegex(ValueError, 'consumer levels'):
+            db.validate(bad)
+
+    def test_nonzero_after_padding_and_odd_aux_rejected(self):
+        for suffix in (' 00 00 10 00', ' ff'):
+            bad = GOOD.replace('80 01 a0 01\n', '80 01 a0 01' + suffix + '\n')
+            with self.assertRaises(ValueError):
+                db.validate(bad)
 
     def test_wrong_address_rejected(self):
         bad = GOOD.replace('0x30050, id: gfx.lvl', '0x30060, id: gfx.lvl')

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from polaris_arc_db import CommandDbError, NAMES, parse_arc
+from polaris_arc_db import CommandDbError, NAMES, decode_arc_levels, parse_arc
 
 
 def sample_db():
@@ -27,6 +27,20 @@ class ArcDbTests(unittest.TestCase):
         self.assertEqual(set(items), set(NAMES))
         self.assertEqual(items['gfx.lvl']['levels'], [16, 32, 48])
         self.assertEqual(items['mx.lvl']['address'], 0x30008)
+
+    def test_off_and_duplicate_mx_levels_preserve_selector_positions(self):
+        aux = struct.pack('<8H', 0, 0x10, 0x10, 0x100, 0x180, 0, 0, 0)
+        self.assertEqual(decode_arc_levels(aux), [0, 0x10, 0x10, 0x100, 0x180])
+
+    def test_leading_off_is_not_padding_in_binary_database(self):
+        data = sample_db()
+        struct.pack_into('<4H', data, 144 + 72, 0, 0x10, 0x10, 0x20)
+        self.assertEqual(parse_arc(data)['gfx.lvl']['levels'], [0, 0x10, 0x10, 0x20])
+
+    def test_invalid_aux_lengths_and_empty_table(self):
+        for aux in (b'', b'\0' * 3, b'\0' * 34, b'\0' * 4):
+            with self.assertRaises(CommandDbError):
+                decode_arc_levels(aux)
 
     def test_truncated_aux(self):
         data = sample_db()

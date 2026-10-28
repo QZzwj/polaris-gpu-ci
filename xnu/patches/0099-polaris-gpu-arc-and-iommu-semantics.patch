@@ -1,0 +1,371 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 44c7058..4c1934f 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -143,15 +143,15 @@ polaris_gpu_init(void)
+ 	    polaris_gpu_handoff.dram_base, polaris_gpu_handoff.dram_size,
+ 	    polaris_gpu_handoff.blob[0].addr);
+ 	{
+-		unsigned int rows = 0, sids = 0;
++		unsigned int rows = 0, refs = 0;
+ 
+ 		(void)pg_arc_rows(&rows);
+-		(void)pg_arc_sid_map(&sids);
++		(void)pg_arc_iommu_refs(&refs);
+ 		/* Pinned facts only: no command-DB access, no MMIO, no vote. */
+-		printf("POLARIS GPU: pinned cmd-db rows=%u (gfx.lvl=9 indices), "
+-		    "SID maps=%u; nothing mapped or voted\n", rows, sids);
++		printf("POLARIS GPU: pinned cmd-db rows=%u (gfx.lvl=10 selectors including OFF), "
++		    "IOMMU references=%u (not CB assignments); nothing mapped or voted\n", rows, refs);
+ 	}
+-	/* Compose the rail votes so the encoding is exercised without any write. */
++	/* Compose ARC selector requests so the encoding is exercised without any write. */
+ 	(void)pg_arc_vote_dry_run();
+ 	/* Read-only: report the GPUCC power state ABL left behind. Needs its own opt-in. */
+ 	polaris_gpu_pwr_probe();
+diff --git a/bsd/dev/polaris_gpu_arc.c b/bsd/dev/polaris_gpu_arc.c
+index decc40b..213eeaa 100644
+--- a/bsd/dev/polaris_gpu_arc.c
++++ b/bsd/dev/polaris_gpu_arc.c
+@@ -1,23 +1,19 @@
+ /*
+- * Polaris A630 command-DB facts as compiled-in data (read-only observation,
+- * 2026-10-28, /sys/kernel/debug/cmd_db on this handset's recovery kernel).
+- *
+- * This is deliberately inert: it powers nothing, maps nothing and votes nothing.
+- * It exists so later stages have the ARC/BCM addresses and the SID->context-bank
+- * routing in one place, and so a diagnostic line can state what was pinned.
++ * Compiled-in command-DB facts and raw recovery DT references.
++ * Inert data only: no register access, mapping or request transport.
++ * Provider phandles are local to a DT; resolve them before deriving SIDs.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <dev/polaris_gpu_arc.h>
+ 
+ static const struct pg_arc_row pg_arc_rows_data[] = {
+-	{ "cx.lvl",  0x30000, 7 },
+-	{ "mx.lvl",  0x30010, 4 },
+-	{ "gfx.lvl", 0x30050, 9 },	/* 9 indices vs 7 KGSL frequencies */
+-	{ "ddr.lvl", 0x30070, 3 },
+-	{ "xo.lvl",  0x30080, 3 },
++	{ "cx.lvl",  0x30000, 8 },
++	{ "mx.lvl",  0x30010, 5 },
++	{ "gfx.lvl", 0x30050, 10 }, /* includes OFF; not KGSL frequency count */
++	{ "ddr.lvl", 0x30070, 4 },
++	{ "xo.lvl",  0x30080, 4 },
+ 	{ "vrm.cx",  0x40800, 0 },
+ 	{ "vrm.mx",  0x40700, 0 },
+ 	{ "vrm.gfx", 0x42700, 0 },
+@@ -25,10 +21,10 @@ static const struct pg_arc_row pg_arc_rows_data[] = {
+ 	{ "MC0",     0x50000, 0 },
+ };
+ 
+-static const struct pg_sid_map pg_arc_sids_data[] = {
++static const struct pg_iommu_ref pg_iommu_refs_data[] = {
+ 	{ 0x208, 0x0, "gfx3d_user" },
+-	{ 0x208, 0x1, "gfx3d_secure" },
+ 	{ 0x208, 0x2, "gfx3d_secure" },
++	{ 0x208, 0x1, "gfx3d_secure" },
+ 	{ 0x208, 0x4, "gmu_user" },
+ 	{ 0x208, 0x5, "gmu_kernel" },
+ };
+@@ -42,13 +38,12 @@ pg_arc_rows(unsigned int *count)
+ 	return pg_arc_rows_data;
+ }
+ 
+-const struct pg_sid_map *
+-pg_arc_sid_map(unsigned int *count)
++const struct pg_iommu_ref *
++pg_arc_iommu_refs(unsigned int *count)
+ {
+ 	if (count != NULL) {
+-		*count = sizeof(pg_arc_sids_data) / sizeof(pg_arc_sids_data[0]);
++		*count = sizeof(pg_iommu_refs_data) / sizeof(pg_iommu_refs_data[0]);
+ 	}
+-	return pg_arc_sids_data;
++	return pg_iommu_refs_data;
+ }
+-
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif
+diff --git a/bsd/dev/polaris_gpu_arc.h b/bsd/dev/polaris_gpu_arc.h
+index 6d29553..cd687f9 100644
+--- a/bsd/dev/polaris_gpu_arc.h
++++ b/bsd/dev/polaris_gpu_arc.h
+@@ -1,34 +1,27 @@
+-/*
+- * Polaris A630 command-DB facts, as compiled-in data. No MMIO, no blob mapping,
+- * no clock or rail votes: this file only carries what we observed read-only on
+- * this handset and answers questions about it.
+- *
+- * The command DB itself is data captured from /sys/kernel/debug/cmd_db (0444) on
+- * the recovery kernel (2026-10-28). Content validation lives at packaging time in
+- * tools/polaris_cmddb.py, because XNU would otherwise have to map the payload blob,
+- * and 0092 was withdrawn precisely for mapping command-DB memory on an unproven
+- * ownership claim.
+- */
++/* Polaris command-DB and raw DT references. No resource ownership implied. */
+ #ifndef _BSD_DEV_POLARIS_GPU_ARC_H_
+ #define _BSD_DEV_POLARIS_GPU_ARC_H_
+ 
+ #include <sys/types.h>
+ 
+-/* One command-DB row we pinned from the handset. */
+ struct pg_arc_row {
+ 	const char *id;
+ 	uint32_t addr;
+-	uint32_t levels;	/* non-zero VLVL indices the dump showed */
++	uint32_t levels; /* ARC selector count including OFF; zero for non-ARC */
+ };
+ 
+-/* SID -> context bank, from the vendor device tree on this handset. */
+-struct pg_sid_map {
+-	uint32_t sid;
+-	uint32_t mask;
++/*
++ * Raw iommus tuples captured in recovery. The provider phandle is NOT a SID;
++ * arg0 is interpreted only after resolving that provider and #iommu-cells.
++ * No context-bank mapping or runtime SMMU ownership is represented here.
++ */
++struct pg_iommu_ref {
++	uint32_t provider_phandle;
++	uint32_t arg0;
+ 	const char *role;
+ };
+ 
+ const struct pg_arc_row *pg_arc_rows(unsigned int *count);
+-const struct pg_sid_map *pg_arc_sid_map(unsigned int *count);
++const struct pg_iommu_ref *pg_arc_iommu_refs(unsigned int *count);
+ 
+-#endif /* _BSD_DEV_POLARIS_GPU_ARC_H_ */
++#endif
+diff --git a/bsd/dev/polaris_gpu_arc_vote.c b/bsd/dev/polaris_gpu_arc_vote.c
+index 6a9526a..91afccd 100644
+--- a/bsd/dev/polaris_gpu_arc_vote.c
++++ b/bsd/dev/polaris_gpu_arc_vote.c
+@@ -1,106 +1,119 @@
+ /*
+- * Polaris A630 ARC level-vote composition. Data and arithmetic only: no MMIO, no
+- * TCS write, no clock, no regulator. Values are the level indices this handset's
+- * command DB printed for cx.lvl / mx.lvl / gfx.lvl, and the rail addresses are the
+- * vrm.* resources from the same dump.
+- *
+- * The semantic being relied on: for an ARC level row, the aux data lists the
+- * allowed level values and a vote writes the chosen value to the resource address.
+- * That is how the vendor dump is structured; it has NOT been confirmed against an
+- * RPMh consumer on this board, so this file must not grow a write path until it is.
++ * Polaris ARC request encoding, independently implemented from the interface
++ * semantics in MiCode polaris-o-oss rpmh-regulator.c. AUX entries are consumer
++ * levels; their original indices are selectors. ARC data is that selector.
++ * VRM voltage requests instead use millivolts and cannot share this API.
++ * This file only composes data. No RPMh/TCS transport or hardware access.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <dev/polaris_gpu_arc_vote.h>
+ 
+-struct pg_rail {
++struct pg_arc_resource {
+ 	const char *name;
+ 	uint32_t addr;
+ 	const uint16_t *levels;
+ 	unsigned int count;
+ };
+ 
+-/* Level values exactly as the handset's cmd_db rows listed them. */
++/* OFF and duplicate values keep their hardware positions. */
+ static const uint16_t pg_cx_levels[] = {
+-	0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x180,
++	0, 0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x180,
+ };
+ static const uint16_t pg_mx_levels[] = {
+-	0x10, 0x10, 0x100, 0x180,
++	0, 0x10, 0x10, 0x100, 0x180,
+ };
+ static const uint16_t pg_gfx_levels[] = {
+-	0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x140, 0x180, 0x1a0,
++	0, 0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x140, 0x180, 0x1a0,
+ };
+ 
+ #define PG_COUNT(a) (sizeof(a) / sizeof((a)[0]))
+ 
+-static const struct pg_rail pg_rails[] = {
+-	{ "vrm.cx",  0x40800, pg_cx_levels,  PG_COUNT(pg_cx_levels) },
+-	{ "vrm.mx",  0x40700, pg_mx_levels,  PG_COUNT(pg_mx_levels) },
+-	{ "vrm.gfx", 0x42700, pg_gfx_levels, PG_COUNT(pg_gfx_levels) },
++static const struct pg_arc_resource pg_resources[] = {
++	{ "cx.lvl",  0x30000, pg_cx_levels,  PG_COUNT(pg_cx_levels) },
++	{ "mx.lvl",  0x30010, pg_mx_levels,  PG_COUNT(pg_mx_levels) },
++	{ "gfx.lvl", 0x30050, pg_gfx_levels, PG_COUNT(pg_gfx_levels) },
+ };
+ 
+-static const struct pg_rail *
+-pg_rail_find(const char *rail)
++static const struct pg_arc_resource *
++pg_arc_find(const char *resource)
+ {
+ 	unsigned int i;
+ 
+-	if (rail == NULL) {
++	if (resource == NULL) {
+ 		return NULL;
+ 	}
+-	for (i = 0; i < PG_COUNT(pg_rails); i++) {
+-		if (strcmp(pg_rails[i].name, rail) == 0) {
+-			return &pg_rails[i];
++	for (i = 0; i < PG_COUNT(pg_resources); i++) {
++		if (strcmp(pg_resources[i].name, resource) == 0) {
++			return &pg_resources[i];
+ 		}
+ 	}
+ 	return NULL;
+ }
+ 
+ unsigned int
+-pg_arc_corner_count(const char *rail)
++pg_arc_selector_count(const char *resource)
+ {
+-	const struct pg_rail *entry = pg_rail_find(rail);
++	const struct pg_arc_resource *entry = pg_arc_find(resource);
+ 
+ 	return entry != NULL ? entry->count : 0;
+ }
+ 
+ bool
+-pg_arc_compose_level(const char *rail, unsigned int corner, struct pg_vote *out)
++pg_arc_compose_selector(const char *resource, unsigned int selector,
++    struct pg_vote *out)
+ {
+-	const struct pg_rail *entry = pg_rail_find(rail);
++	const struct pg_arc_resource *entry = pg_arc_find(resource);
+ 
+-	if (entry == NULL || out == NULL || corner >= entry->count) {
++	if (entry == NULL || out == NULL || selector >= entry->count) {
+ 		return false;
+ 	}
+-	out->rail = entry->name;
+-	out->corner = corner;
++	out->resource = entry->name;
++	out->selector = selector;
+ 	out->addr = entry->addr;
+-	out->data = entry->levels[corner];
++	out->data = selector;
++	out->consumer_level = entry->levels[selector];
+ 	return true;
+ }
+ 
++bool
++pg_arc_compose_level(const char *resource, uint32_t consumer_level,
++    struct pg_vote *out)
++{
++	const struct pg_arc_resource *entry = pg_arc_find(resource);
++	unsigned int selector;
++
++	if (entry == NULL || out == NULL) {
++		return false;
++	}
++	for (selector = 0; selector < entry->count; selector++) {
++		if (entry->levels[selector] >= consumer_level) {
++			return pg_arc_compose_selector(resource, selector, out);
++		}
++	}
++	return false;
++}
++
+ bool
+ pg_arc_vote_dry_run(void)
+ {
+ 	unsigned int i;
+ 
+-	for (i = 0; i < PG_COUNT(pg_rails); i++) {
+-		const struct pg_rail *entry = &pg_rails[i];
++	for (i = 0; i < PG_COUNT(pg_resources); i++) {
++		const struct pg_arc_resource *entry = &pg_resources[i];
+ 		struct pg_vote low, high;
+ 
+-		if (!pg_arc_compose_level(entry->name, 0, &low) ||
+-		    !pg_arc_compose_level(entry->name, entry->count - 1, &high)) {
+-			printf("POLARIS GPU: %s composition failed\n", entry->name);
+-			continue;
++		if (!pg_arc_compose_selector(entry->name, 0, &low) ||
++		    !pg_arc_compose_selector(entry->name, entry->count - 1, &high)) {
++			printf("POLARIS GPU: %s ARC composition failed\n", entry->name);
++			return false;
+ 		}
+-		printf("POLARIS GPU: dry-run vote %s corner %u -> addr 0x%x data 0x%x; "
+-		    "corner %u -> data 0x%x (nothing written)\n",
+-		    entry->name, low.corner, low.addr, low.data,
+-		    high.corner, high.data);
++		printf("POLARIS GPU: dry-run ARC %s addr=0x%x OFF selector=%u data=%u; "
++		    "max level=0x%x selector=%u data=%u (nothing written)\n",
++		    entry->name, low.addr, low.selector, low.data,
++		    (unsigned int)high.consumer_level, high.selector, high.data);
+ 	}
+-	/* No backend owns the TCS; composition is not permission. */
+ 	return false;
+ }
+-
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif
+diff --git a/bsd/dev/polaris_gpu_arc_vote.h b/bsd/dev/polaris_gpu_arc_vote.h
+index 07220c6..eabe8a6 100644
+--- a/bsd/dev/polaris_gpu_arc_vote.h
++++ b/bsd/dev/polaris_gpu_arc_vote.h
+@@ -1,11 +1,4 @@
+-/*
+- * Polaris A630 ARC level-vote composition, dry run only.
+- *
+- * This file can compose a vote -- "write this ARC resource address with this level
+- * value" -- and print it. It has no way to send one: XNU has no RPMh/TCS write
+- * backend for Polaris yet, and inventing one before the CX/GX power sequence has an
+- * owned, reversible implementation is exactly what this project forbids.
+- */
++/* Polaris ARC selector composition. No transport, MMIO or regulator writes. */
+ #ifndef _BSD_DEV_POLARIS_GPU_ARC_VOTE_H_
+ #define _BSD_DEV_POLARIS_GPU_ARC_VOTE_H_
+ 
+@@ -14,26 +7,20 @@
+ 
+ struct pg_vote {
+ 	uint32_t addr;
+-	uint32_t data;
+-	const char *rail;
+-	unsigned int corner;
++	uint32_t data;           /* ARC hardware selector, NOT AUX consumer level */
++	const char *resource;   /* *.lvl ARC resource, never vrm.* */
++	unsigned int selector;
++	uint16_t consumer_level;
+ };
+ 
+-/*
+- * Compose one vote for `rail` ("vrm.cx", "vrm.mx", "vrm.gfx") at `corner`.
+- * Returns false for an unknown rail or a corner outside the pinned level list.
+- * Nothing is written anywhere.
+- */
+-bool pg_arc_compose_level(const char *rail, unsigned int corner, struct pg_vote *out);
+-
+-/* Number of pinned corners for a rail, or 0 if the rail is unknown. */
+-unsigned int pg_arc_corner_count(const char *rail);
+-
+-/*
+- * Print the composed votes at the lowest and highest corner for every rail and
+- * state that nothing was written. Always returns false: this build has no write
+- * backend, and a caller must not treat composition as permission to vote.
+- */
++/* Selector positions include OFF and duplicate AUX levels. */
++unsigned int pg_arc_selector_count(const char *resource);
++bool pg_arc_compose_selector(const char *resource, unsigned int selector,
++    struct pg_vote *out);
++/* First supported consumer level >= requested; refuse above maximum. */
++bool pg_arc_compose_level(const char *resource, uint32_t consumer_level,
++    struct pg_vote *out);
++/* Always returns false: no TCS is owned and no request can be sent. */
+ bool pg_arc_vote_dry_run(void);
+ 
+-#endif /* _BSD_DEV_POLARIS_GPU_ARC_VOTE_H_ */
++#endif

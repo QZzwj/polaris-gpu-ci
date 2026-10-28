@@ -1,42 +1,19 @@
 #!/usr/bin/env python3
-"""Compose (never send) RPMh ARC level votes for the Polaris GPU rails.
+"""Compose ARC selector requests offline. This module has no transport.
 
-Why this exists: the first powered step needs CX/MX/GFX level votes whose *values*
-come from the handset's command DB, not from guesses. This module composes those
-votes from the dump we pinned (`tools/polaris_cmddb.py`) and refuses everything it
-cannot ground:
-
-  * only ARC level rows (`cx.lvl`, `mx.lvl`, `gfx.lvl`) are composed; a BCM row
-    (`MC0`, `SH0`, ...) raises, because the BCM vote word layout (commit/valid/
-    VCD/vote packing) is not pinned from a source yet;
-  * a requested corner must index a level value that actually appears in the dump;
-  * the address must equal the pinned ARC address for that row.
-
-Semantics being relied on (state it, do not bury it): for an ARC level row the aux
-data is the list of allowed level values as little-endian u16, and a vote is
-"write this resource address with the chosen level value". That matches how the
-vendor command DB encodes the level rows on this handset; it is **not** yet
-verified against an RPMh consumer on this board, so nothing here may be turned into
-a register write until it is.
-
-Everything in this file is pure arithmetic over data we captured read-only.
+MiCode polaris-o-oss rpmh-regulator.c sends a hardware selector to the *.lvl
+ARC resource. AUX data maps that selector to a consumer level. OFF and duplicate
+levels retain their array indices. VRM resources use a different protocol,
+including millivolt voltage requests, and are deliberately rejected here.
+Resource ownership is not established by composing a request.
 """
-import struct
 import sys
 
-# ARC level rows exactly as the handset dump printed them: id -> (address, aux hex)
-POURED_LEVELS = {
-    'cx.lvl': (0x30000, '00 00 10 00 30 00 40 00 80 00 c0 00 00 01 80 01'),
-    'mx.lvl': (0x30010, '00 00 10 00 10 00 00 01 80 01'),
-    'gfx.lvl': (0x30050, '00 00 10 00 30 00 40 00 80 00 c0 00 00 01 40 01 80 01 a0 01'),
-}
+from polaris_cmddb import ARC_LEVELS, PINNED
 
-# Rows we know exist but must not compose yet.
 BCM_ROWS = ('MC0', 'MC1', 'MC2', 'SH0', 'SH1', 'SH2', 'SH3', 'SH4', 'SH5', 'SH6',
             'SH7', 'MM0', 'MM1', 'MM2', 'MM3', 'SN0', 'CE0', 'IP0', 'CN0', 'QUP0')
-
-# Regulator rows: the ARC address of the rail a BCM vote would ride on.
-RAIL_ROWS = {'vrm.cx': 0x40800, 'vrm.mx': 0x40700, 'vrm.gfx': 0x42700}
+GPU_ROWS = ('cx.lvl', 'mx.lvl', 'gfx.lvl')
 
 
 class VoteError(ValueError):
@@ -44,53 +21,57 @@ class VoteError(ValueError):
 
 
 def levels(row):
-    """Return the ordered level values (u16) for an ARC level row."""
-    if row not in POURED_LEVELS:
+    """Consumer levels in hardware-selector order, including OFF."""
+    if row not in GPU_ROWS:
+        if isinstance(row, str) and row.startswith('vrm.'):
+            raise VoteError('VRM voltage resources cannot use ARC selectors')
+        if row in BCM_ROWS:
+            raise VoteError(f'{row} is a BCM row: its vote word layout is not pinned yet')
         raise VoteError(f'unknown ARC level row: {row}')
-    _addr, aux = POURED_LEVELS[row]
-    raw = bytes(int(b, 16) for b in aux.split())
-    values = [struct.unpack_from('<H', raw, i)[0] for i in range(0, len(raw) - 1, 2)]
-    return [v for v in values if v]
+    return list(ARC_LEVELS[row])
 
 
-def compose(row, corner):
-    """Compose one (address, data) vote. Never sends anything."""
-    if row in BCM_ROWS:
-        raise VoteError(f'{row} is a BCM row: its vote word layout is not pinned yet')
+def compose(row, selector):
+    """Return (ARC resource address, hardware selector); never send it."""
     values = levels(row)
-    if not 0 <= corner < len(values):
-        raise VoteError(f'{row}: corner {corner} outside 0..{len(values) - 1}')
-    addr, _aux = POURED_LEVELS[row]
-    return addr, values[corner]
+    if type(selector) is not int or not 0 <= selector < len(values):
+        raise VoteError(f'{row}: selector {selector!r} outside 0..{len(values) - 1}')
+    return PINNED[row][0], selector
 
 
-def rail_vote(rail, corner):
-    """Compose a vote for a rail name (vrm.*) using the level row it belongs to.
+def compose_level(row, consumer_level):
+    """Choose the first supported level >= request, preserving original indices.
 
-    The rail's ARC address is the resource the vote is written to; the level row
-    supplies the data value. Both are pinned; nothing is inferred.
+    Refuse unsupported requests rather than silently clamp their level. This
+    offline composer is not a power policy or a regulator enable callback.
     """
-    if rail not in RAIL_ROWS:
-        raise VoteError(f'unknown rail: {rail}')
-    row = {'vrm.cx': 'cx.lvl', 'vrm.mx': 'mx.lvl', 'vrm.gfx': 'gfx.lvl'}[rail]
-    _addr, data = compose(row, corner)
-    return RAIL_ROWS[rail], data
+    values = levels(row)
+    if type(consumer_level) is not int or consumer_level < 0:
+        raise VoteError('consumer level must be a nonnegative integer')
+    for selector, value in enumerate(values):
+        if value >= consumer_level:
+            return compose(row, selector)
+    raise VoteError(f'{row}: consumer level {consumer_level:#x} exceeds supported maximum')
+
+
+def rail_vote(rail, selector):
+    """Reject the old API which mixed VRM addresses with ARC level data."""
+    raise VoteError('VRM/rail votes are unsupported; use compose() with a *.lvl ARC row')
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == '--list':
-        for row in POURED_LEVELS:
-            vals = levels(row)
-            print(f'{row}: {len(vals)} levels '
-                  f'{[hex(v) for v in vals]} (addr 0x{POURED_LEVELS[row][0]:05x})')
-        return 0
-    print('composed votes (dry run, nothing is written):')
-    for rail in RAIL_ROWS:
-        for corner in (0, len(levels({'vrm.cx': 'cx.lvl', 'vrm.mx': 'mx.lvl',
-                                      'vrm.gfx': 'gfx.lvl'}[rail])) - 1):
-            addr, data = rail_vote(rail, corner)
-            print(f'  {rail:<8} corner {corner} -> addr 0x{addr:05x} data 0x{data:04x}')
-    print('no MMIO, no TCS write, no firmware: dry run only')
+    list_only = sys.argv[1:] == ['--list']
+    print('ARC requests (offline; no hardware access):')
+    for row in GPU_ROWS:
+        values = levels(row)
+        print(f'  {row}: {len(values)} selectors (including OFF), '
+              f'consumer levels={[hex(v) for v in values]}')
+        if not list_only:
+            for selector in (0, len(values) - 1):
+                address, data = compose(row, selector)
+                print(f'    selector={selector} level={values[selector]:#x} '
+                      f'-> address={address:#x} data={data:#x}')
+    print('No RPMh/TCS write backend; GPU remains disabled.')
     return 0
 
 

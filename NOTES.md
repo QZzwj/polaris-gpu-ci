@@ -777,3 +777,48 @@ already computes X and Y steps independently, so a "fill" mode is a small change
 an opt-in boot argument that sets `fContentW=fWidth`, `fContentH=fHeight`,
 `fOffX=fOffY=0`, `fScale=1` (stretch, ~8% vertical). Do not make it the default
 without the owner's say-so, and do not confuse it with GPU composition.
+
+### 2026-10-28 active repair: 0099 corrects ARC and IOMMU semantics in code
+
+User requested code repair and flashing, then confirmed the phone is connected
+in FASTBOOT. Read-only fastboot query with official platform-tools 37.0.1 confirms
+one device, `product=polaris`. No device reboot, write or new boot in this repair.
+
+- Added forward patch `0099-polaris-gpu-arc-and-iommu-semantics.patch` after 0098,
+  preserving both existing power probes. ARC requests now use
+  `cx.lvl`/`mx.lvl`/`gfx.lvl` addresses
+  and selector data, retaining OFF and duplicate MX entries; C API rejects VRM
+  names and unsupported requests. Selector counts including OFF are 8/5/10.
+- Removed the false SID/context-bank API. C stores the captured recovery tuples
+  as provider phandle + raw arg0 only; no runtime bank assignment is claimed.
+  New `tools/polaris_iommu.py` resolves provider phandles and #iommu-cells from a
+  bounded offline FDT, then derives ARM SMMU SID/mask. The local `pkg-dtb.bin`
+  resolves provider `/soc/arm,smmu-kgsl@5040000`, phandle **0x18f** (different from
+  recovery's 0x208), SID 0/2/1/4/5, mask zero, bank unassigned. This independently
+  demonstrates why a hardcoded phandle is not a SID. Device DT/dumps stay local.
+- `polaris_arc_db.py` now accepts the actual leading OFF/duplicate MX table;
+  the earlier decoder rejected it. Text command-db validation checks full ARC
+  level vectors, not only a prefix and nonzero count. All 116 local command-db
+  rows parse, with 10 pinned resources validated.
+- Validation so far: 82 Python tests pass; another 4 tests compile and execute
+  the **actual reconstructed C patch** on Windows via Zig 0.13.0, checking all
+  selectors, every consumer level through each maximum, duplicate levels, VRM
+  refusal, null/boundary handling and raw IOMMU references. 0099 verified by
+  apply/reverse/apply over reconstructed 0093-0098 source. Workflow now runs the
+  regressions before spending a full XNU build. Combined run: 86 tests passed,
+  including all 4 native C tests; 99 unique contiguous patches validate. Full
+  XNU build not yet run.
+- Reviewed concurrent committed changes 0097 (read-only GPUCC probe) and 0098
+  (CX SW_COLLAPSE write). They are preserved. The 0099 image must explicitly
+  disable `polarisgpuon`: 0098 does not establish rail/clock ownership or a
+  complete power backend, and its iteration budget is not a measured timeout.
+  Existing shared `staging/build_gpu_test_img.py` was concurrently changed to
+  enable that switch; do not run it. Use isolated packaging under `gpu-fix`.
+
+These corrections supersede the earlier claim that the 0096 device printouts
+establish correct composition: execution was proven, the old encoding was wrong.
+Still no RPMh/TCS write backend, rails/clocks/bandwidth ownership, SMMU runtime
+setup, GMU/HFI, PAS13, CP fence or GPU-backed iOS composition. This is a real
+protocol/decoder correction, not a GPU acceleration or performance fix. Next
+build the corrected XNU kernel on the authorized QZzwj fork and inspect results;
+do not claim a usable GPU or flash a diagnostic as a performance solution.

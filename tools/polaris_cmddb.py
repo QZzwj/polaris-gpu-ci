@@ -11,24 +11,30 @@ recovery kernel. Output: exit 0 only if every pinned row matches.
 import re
 import sys
 
-# id -> (address, level count, aux prefix as the vendor kernel prints it)
+from polaris_arc_db import decode_arc_levels
+
+# Ordered AUX consumer levels. Position, including OFF, is the ARC selector.
+ARC_LEVELS = {
+    'cx.lvl': (0, 0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x180),
+    'mx.lvl': (0, 0x10, 0x10, 0x100, 0x180),
+    'gfx.lvl': (0, 0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x140, 0x180, 0x1a0),
+    'ddr.lvl': (0, 0x20, 0x80, 0xa0),
+    'xo.lvl': (0, 0x20, 0x50, 0x80),
+}
+
+# id -> (address, selector count including OFF, AUX prefix)
 PINNED = {
-    'cx.lvl': (0x30000, 7, '00 00 10 00 30 00 40 00'),
-    'mx.lvl': (0x30010, 4, '00 00 10 00 10 00 00 01'),
-    'gfx.lvl': (0x30050, 9, '00 00 10 00 30 00 40 00'),
-    'ddr.lvl': (0x30070, 3, '00 00 20 00 80 00 a0 00'),
-    'xo.lvl': (0x30080, 3, '00 00 20 00 50 00 80 00'),
+    'cx.lvl': (0x30000, 8, '00 00 10 00 30 00 40 00'),
+    'mx.lvl': (0x30010, 5, '00 00 10 00 10 00 00 01'),
+    'gfx.lvl': (0x30050, 10, '00 00 10 00 30 00 40 00'),
+    'ddr.lvl': (0x30070, 4, '00 00 20 00 80 00 a0 00'),
+    'xo.lvl': (0x30080, 4, '00 00 20 00 50 00 80 00'),
     'vrm.cx': (0x40800, 0, ''),
     'vrm.mx': (0x40700, 0, ''),
     'vrm.gfx': (0x42700, 0, ''),
     'vrm.ebi': (0x40400, 0, ''),
     'MC0': (0x50000, 0, '80 84 1e 00 10 00 00 00'),
 }
-
-# SID -> context bank, from the vendor DT (documentation, not used for routing yet)
-SID_MAP = ((0x208, 0x0, 'gfx3d_user'), (0x208, 0x1, 'gfx3d_secure'),
-           (0x208, 0x2, 'gfx3d_secure'), (0x208, 0x4, 'gmu_user'),
-           (0x208, 0x5, 'gmu_kernel'))
 
 ROW = re.compile(r'Address:\s*0x([0-9a-fA-F]+),\s*id:\s*([^,\s]+)'
                  r'(?:,\s*aux data:\s*((?:[0-9a-fA-F]{2}\s*)+))?')
@@ -52,9 +58,8 @@ def parse(text):
 
 
 def count_levels(aux):
-    values = [int(b, 16) for b in aux.split()]
-    pairs = [(values[i] | (values[i + 1] << 8)) for i in range(0, len(values) - 1, 2)]
-    return sum(1 for v in pairs if v)
+    """Count hardware selectors, including OFF; omit only trailing padding."""
+    return len(decode_arc_levels(bytes.fromhex(aux))) if aux else 0
 
 
 def validate(text):
@@ -68,8 +73,12 @@ def validate(text):
         if aux:
             if not got_aux.startswith(aux):
                 raise ValueError(f'{rid}: aux prefix {got_aux[:len(aux)]!r} != {aux!r}')
-            if levels and count_levels(got_aux) != levels:
-                raise ValueError(f'{rid}: {count_levels(got_aux)} levels != {levels}')
+            if levels:
+                decoded = tuple(decode_arc_levels(bytes.fromhex(got_aux)))
+                if len(decoded) != levels:
+                    raise ValueError(f'{rid}: {len(decoded)} levels != {levels}')
+                if decoded != ARC_LEVELS[rid]:
+                    raise ValueError(f'{rid}: ARC consumer levels differ from pinned table')
     return rows
 
 
@@ -85,11 +94,9 @@ def main():
         return 1
     print(f'command-db gate OK: {len(rows)} rows parsed, {len(PINNED)} pinned rows matched')
     for rid, (addr, levels, _aux) in PINNED.items():
-        extra = f' ({levels} levels)' if levels else ''
+        extra = f' ({levels} selectors including OFF)' if levels else ''
         print(f'  {rid:<8} 0x{addr:05x}{extra}')
-    print('SID -> context bank (vendor DT, informational):')
-    for sid, mask, role in SID_MAP:
-        print(f'  0x{sid:x} & {mask:#x} -> {role}')
+    print('IOMMU routing is resolved separately from provider phandles by polaris_iommu.py.')
     print('No MMIO, no vote, no firmware: this is a data check only.')
     return 0
 
