@@ -690,3 +690,38 @@ RPMh/TCS write backend for Polaris in XNU, and composition is not permission to
 vote. Unknown rails and out-of-range corners are refused. Same refusals, same data
 and the same "no write API" rule as the host tool `tools/polaris_rpmh_vote.py`,
 which has 8 tests including a scan for any write/send helper.
+
+### 2026-10-28 GPU diagnostic review: correct the premises before a powered backend
+
+User confirmed the failing target is MIX 2S iOS/XNU and supplied
+`D:\ios\adreno-630-gpu-driver`. Inspection confirmed that checkout is an Android
+9/10 Magisk userspace-library package (v331/v415); sampled GLES libraries are ELF
+AArch64, and there are no C/H sources or fw/bin/mdt firmware files. The saved
+`D:\ios\ring-decoded.txt` lines 94-96 stop after handoff validation at the missing
+rails backend. That earlier ring does not validate 0096; 0096 still sends nothing.
+
+**New source-backed corrections; supersede the earlier composition/routing claims:**
+
+- 0096 and `tools/polaris_rpmh_vote.py` conflate ARC consumer levels, hardware
+  selectors and VRM voltage requests. MiCode Polaris `rpmh-regulator.c` uses the
+  ARC selector as the request data and preserves AUX array indices including OFF;
+  VRM voltage data is in millivolts. The current combination of `vrm.*` addresses
+  and `*.lvl` consumer-level values must not become a write path. Existing
+  composer tests encode this same mistaken assumption and do not validate it.
+- The first cell in DT `iommus = <0x208 0x0>` is a provider **phandle**, not SID
+  0x208. `SID_MAP`, 0095's table and the handset facts document incorrectly label
+  these cells as SID/context-bank. The remaining specifier must be interpreted
+  through the referenced provider's `#iommu-cells` and the vendor SMMU binding;
+  no context-bank assignment is established by the tuple alone.
+
+Evidence, pinned primary-source references and the ordered implementation plan are
+in `docs/POLARIS-GPU-NEXT-STEPS.md`. Vendor source revision:
+`c7cb50c18f812629b9620b2b8fa684bc40d82080`; upstream Linux cross-check:
+`65ba8f34ec886ec72b2c07ddc8cf3d815c32869d`. No source code was copied from Linux.
+
+Next concrete work: correct the offline request model and phandle/specifier
+parsing with semantic regression tests; then implement the owned RPMh/TCS,
+rails/clocks/bandwidth backend. Subsequently validate restricted SMMU, GMU/HFI,
+PAS13, a changed sentinel plus completed fence, and only then userspace graphics.
+This review changes documentation only: no runtime/driver fix, CI dispatch, device
+test, reboot, flash or MMIO. GPU acceleration remains unavailable.
