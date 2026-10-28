@@ -486,3 +486,60 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## 2026-10-28 (Windows workspace): cpus=7/8 verified on device; A630 handoff gate 0094
+
+Evidence levels are kept separate: "device" = temporary or permanent boot on the
+handset, "host" = offline tooling/tests, "source" = patch written but not compiled.
+
+- **CPU, device: 8/8 cores reach the iOS lock screen.** Only the `cpus=` digit of
+  the installed, owner-tested 0090 boot image was changed; kernel, DTB and ADT stay
+  byte-identical. `fastboot boot` of `cpus=7` then `cpus=8` both reached the lock
+  screen with touch working (user-confirmed), then `cpus=8` was flashed to `boot`
+  (`Sending OKAY 0.401s`, `Writing 'boot' OKAY 0.087s`, `reboot OKAY`). Artifacts:
+  `boot-cpus7.img` SHA256 `a2d27914101ae278a9aacf73e6eacbfdafa30489da422f86951f0d7829b143e2`,
+  `boot-cpus8.img` SHA256 `f14888eb8bfc56492a94e574b6b7dd08c2294d9b57f8795ee5822684294a4c3a`;
+  the single differing byte is `0x602060` in the payload cmdline. This supersedes
+  the earlier "no evidence for CPU4-7" rows. **No ring log was captured**, so the
+  evidence is behavioural (lock screen + touch), not the `8/8 CPUs initialized`
+  console line; a recovery read-back is still outstanding. Rollback is the package's
+  `images/boot.img` (SHA256 `897ee85c292c22291652d4a06dfe12bdd880d97143650adabd00d06d44259b86`).
+- **A630 firmware from an official ROM (host, not device).** The MIUI
+  `V12.5.1.0.QDGCNXM` fastboot package's `images/vendor.img` is Android sparse;
+  a new read-only sparse+ext4 extractor pulled `/firmware/a630_*` without mounting
+  or writing the image. These files are **older than this handset's vendor
+  partition**: GMU is 20,480 B (handset 32,768 B) and SQE is 31,980 B (handset
+  32,136 B), MDT hash differs. Hashes: GMU `894ae555...`, SQE `34edacb6...`,
+  MDT `1882b214...`, B00 `b2975f6a...`, B01 `c94da0d6...`, B02 `519b5538...`.
+  Do not describe them as "the phone's firmware", and re-extract from the handset
+  when recovery ADB works again. Recovery ADB failed in this session with both the
+  bundled adb 1.0.39 (protocol fault) and adb 1.0.41 (no device); the phone was not
+  written to.
+- **Preflight now registers firmware sets instead of one length vector (host).**
+  `tools/polaris_gpu_preflight.py` accepts only enumerated sets
+  (`device-2026-10-22`, `miui-v12.5.1.0-qdgcnxm-20210707`), verifies structure and
+  then hashes for every file whose hash was recorded, and refuses unknown vectors.
+  The 20 KiB GMU length is a per-set property, not a hardware constant; the
+  undefined ITCM tail is reported as a warning. Against the 0090 kernel/ADT the
+  MIUI set packs a payload of 11,253,328 B, leaving 3,336,624 B below the ABL
+  DTB boundary.
+- **0094 `xnu/patches/0094-polaris-gpu-handoff-validation.patch` (source only, not
+  compiled).** Implements the "conservative viable next change" from
+  `research/polaris/gmu-secure-implementation.md`: a pure, no-MMIO
+  `pg_validate_handoff()` in new `bsd/dev/polaris_gpu_validate.{c,h}` that checks
+  both ADT identities, `/chosen` DRAM, the six `/chosen/memory-map` blobs against a
+  registered length vector, page alignment, overflow-safe bounds, zap/splash
+  exclusion and blob-vs-blob overlap. `polaris_gpu.c` now calls it at the firmware
+  stage and still refuses at `rails`; no backend, no marker, no ownership change.
+  Hashes stay at packaging time because the kernel has no digest, and a validated
+  handoff is still not permission to power anything. Verified by reconstructing the
+  post-0093 tree from the 0093 patch and running `git apply --check`, apply,
+  reverse-check and re-apply; **no XNU build, no CI run, no phone test**.
+- **Host tests: 47 pass** (`tools/test_polaris_gpu_handoff.py` adds the handoff and
+  ledger model; preflight tests split structural vs hash-gate cases). On this Windows
+  box `tempfile.mkdtemp()`'s 0o700 ACL is refused by the file sandbox, so the suite
+  needs a `makedirs`-based substitute; that is an environment workaround, not a repo
+  change.
+- **Still open:** no power/GMU/HFI/PAS13/SMMU/CP code, no acceleration, no
+  command-DB or GPU-SMMU ownership evidence, and the device's own firmware set has
+  not been re-extracted.

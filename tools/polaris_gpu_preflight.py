@@ -22,22 +22,75 @@ BLOBS = (
     ('GPU-ZAP-MDT', 'a630_zap.mdt'), ('GPU-ZAP-B00', 'a630_zap.b00'),
     ('GPU-ZAP-B01', 'a630_zap.b01'), ('GPU-ZAP-B02', 'a630_zap.b02'),
 )
-# Sizes observed from this phone; do not silently accept another firmware set.
-BLOB_SIZES = dict(zip((name for name, _ in BLOBS),
-                      (32136, 32768, 6684, 148, 6536, 1968)))
+# Every accepted firmware set is listed explicitly: unknown combinations are
+# refused, never inferred from sizes alone when a hash is known.
+#   device-2026-10-22 : read-only copy taken from this handset's /vendor in
+#     recovery. Hash recorded for SQE/GMU/MDT only; the three ZAP segments were
+#     logged by size, so they stay size-only here and must not be treated as
+#     identity.
+#   miui-v12.5.1.0-qdgcnxm-20210707 : extracted from the official fastboot ROM
+#     images/vendor.img (a630_* in /firmware). All six files bound by hash.
+#     This set is OLDER than this handset's vendor partition, so it is a second
+#     variable in any bring-up result and cannot be described as "the phone's
+#     firmware".
+FIRMWARE_SETS = {
+    'device-2026-10-22': {
+        'provenance': 'recovery read-only copy from this handset /vendor/firmware',
+        'files': {
+            'a630_sqe.fw': (32136, '36298bd53ea3666413d288a3a3f5266f67fcb6db038a0a481af5869d1c17859c'),
+            'a630_gmu.bin': (32768, 'b07f90299ff2ae33948fcfd6ed67f53fbd287b5bf85ff2d43db11d4d32c1621f'),
+            'a630_zap.mdt': (6684, 'e1e11d7f124b53efe73c2b03fab613fc1075d4caa5f41f6a19dc2ac56ea736dd'),
+            'a630_zap.b00': (148, None),
+            'a630_zap.b01': (6536, None),
+            'a630_zap.b02': (1968, None),
+        },
+    },
+    'miui-v12.5.1.0-qdgcnxm-20210707': {
+        'provenance': 'official fastboot ROM images/vendor.img /firmware (older than device vendor)',
+        'files': {
+            'a630_sqe.fw': (31980, '34edacb6fdedfbfc07ed5cd1d29b0b57a3543ef5be6ab34a43bd64686826fa1e'),
+            'a630_gmu.bin': (20480, '894ae5550352d2d12596dc6d4b65af628307cf2c6adc5d112e6f5c9ffcd4ec11'),
+            'a630_zap.mdt': (6684, '1882b214d24c13eae4ffc39ba5456d5e61c80b089fb77e8b15f7bdd04bc9c831'),
+            'a630_zap.b00': (148, 'b2975f6a4c28a98197c1d694f6e275e71b23ec7e31e32ff5d1f83fdb80a94282'),
+            'a630_zap.b01': (6536, 'c94da0d6edf4820885b814ecda2f91c89b9d766126c3574c05d580c418815b5f'),
+            'a630_zap.b02': (1968, '519b5538809f54ee566246b0520746a8ea82ca9384ea6bddb0b0e0d3c2de520c'),
+        },
+    },
+}
 
 
-def check_firmware(folder):
+def _match_sizes(sizes):
+    """Return the registered set whose length vector equals `sizes`, else None."""
+    key = tuple(sizes)
+    for set_name, entry in FIRMWARE_SETS.items():
+        if tuple(entry['files'][filename][0] for _, filename in BLOBS) == key:
+            return set_name
+    return None
+
+
+def check_firmware(folder, verify_hashes=True):
+    """Stage 1: registered length vector, structure, then recorded hashes."""
     files = {}
+    digests = {}
     for name, filename in BLOBS:
         path = folder / filename
         if not path.is_file() or path.is_symlink():
             raise ValueError(f'missing or nonregular firmware: {filename}')
         data = path.read_bytes()
-        if len(data) != BLOB_SIZES[name]:
-            raise ValueError(f'unexpected device firmware size: {filename}')
         files[name] = (path, data)
-    check_flat_a630_gmu(files['GPU-GMU'][1])
+        digests[filename] = (len(data), hashlib.sha256(data).hexdigest())
+    set_name = _match_sizes([digests[filename][0] for _, filename in BLOBS])
+    if set_name is None:
+        detail = ', '.join(f'{fn}={size}B/{digest[:12]}'
+                           for fn, (size, digest) in digests.items())
+        raise ValueError(f'firmware length vector is not registered; refusing ({detail})')
+    provenance = FIRMWARE_SETS[set_name]['provenance']
+    print(f'firmware set: {set_name} ({provenance})')
+    gmu_size = FIRMWARE_SETS[set_name]['files']['a630_gmu.bin'][0]
+    if gmu_size != 32768:
+        print(f'  WARNING: GMU image is {gmu_size} bytes, not the 32 KiB image '
+              f'this handset ships; the undefined ITCM tail is unproven')
+    check_flat_a630_gmu(files['GPU-GMU'][1], expected_size=gmu_size)
     meta = files['GPU-ZAP-MDT'][1]
     if len(meta) < 52 or meta[:6] != b'\x7fELF\x01\x01':
         raise ValueError('zap metadata is not little-endian ELF32')
@@ -57,6 +110,16 @@ def check_firmware(folder):
     if addr != 0x5000 or file_size != len(files['GPU-ZAP-B02'][1]) or \
             mem_size < file_size or mem_size > ZAP_SIZE:
         raise ValueError('zap load segment does not match this Polaris reservation')
+    # Stage 3: content identity. Structure alone never pins a firmware version.
+    if verify_hashes:
+        for name, filename in BLOBS:
+            want = FIRMWARE_SETS[set_name]['files'][filename][1]
+            if want is None:
+                print(f'  WARNING: {filename} has no recorded hash for this set; '
+                      f'the match is size-only')
+            elif digests[filename][1] != want:
+                raise ValueError(f'{filename} content does not match the recorded '
+                                 f'hash for {set_name}')
     return files
 
 

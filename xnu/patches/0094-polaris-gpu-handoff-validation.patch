@@ -1,0 +1,328 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -2,4 +2,5 @@ bsd/dev/polaris_touch_i2c.c		standard
+ bsd/dev/polaris_touch_i2c.c		standard
+ bsd/dev/polaris_gpu_diag.c		standard
+ bsd/dev/polaris_gpu.c			standard
++bsd/dev/polaris_gpu_validate.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 72974fc..587400f 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -7,6 +7,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
++#include <dev/polaris_gpu_validate.h>
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+@@ -41,6 +42,9 @@ struct polaris_gpu_context {
+ 
+ static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
+ 
++/* Written once by the firmware stage; read-only afterwards. */
++static struct pg_handoff polaris_gpu_handoff;
++
+ static const char *const polaris_gpu_stage_name[POLARIS_GPU_STAGE_COUNT] = {
+ 	"board", "firmware", "rails", "clocks", "bus", "GMU",
+ 	"HFI", "SMMU", "PAS13", "CP", "fence"
+@@ -59,6 +63,19 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 	    stage >= POLARIS_GPU_STAGE_COUNT) {
+ 		return false;
+ 	}
++	if (stage == POLARIS_GPU_FIRMWARE) {
++		const char *reason = "unset";
++
++		/* Pure ADT arithmetic: verifies, never acquires. */
++		if (!pg_validate_handoff(&polaris_gpu_handoff, &reason)) {
++			printf("POLARIS GPU: handoff refused (%s); no hardware access\n",
++			    reason);
++			return false;
++		}
++		ctx->completed++;
++		/* Validation acquires nothing; owned stays zero. */
++		return true;
++	}
+ 	if (stage != POLARIS_GPU_BOARD) {
+ 		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
+ 		    polaris_gpu_stage_name[stage]);
+@@ -110,6 +127,19 @@ polaris_gpu_init(void)
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_FIRMWARE)) {
+ 		goto fail;
+ 	}
++	/*
++	 * The handoff is now fully described: board identity, managed DRAM, the six
++	 * firmware blobs and their page-rounded reservations all matched one
++	 * registered set. Nothing has been powered, mapped or executed, and the next
++	 * stage still has no backend, so the gate refuses below.
++	 */
++	printf("POLARIS GPU: handoff validated set=%s (%s) dram=0x%llx+0x%llx sqe@0x%llx\n",
++	    polaris_gpu_handoff.set_name, polaris_gpu_handoff.set_note,
++	    polaris_gpu_handoff.dram_base, polaris_gpu_handoff.dram_size,
++	    polaris_gpu_handoff.blob[0].addr);
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_RAILS)) {
++		goto fail;
++	}
+ 	/* Unreachable until individually owned, bounded backends are installed. */
+ 	polaris_gpu.state = POLARIS_GPU_IDLE;
+ 	return;
+diff --git a/bsd/dev/polaris_gpu_validate.c b/bsd/dev/polaris_gpu_validate.c
+new file mode 100644
+index 0000000..201c5fd
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_validate.c
+@@ -0,0 +1,207 @@
++/*
++ * Polaris A630 handoff validation. Read-only by construction: this file only
++ * looks at the ADT the shim handed over and compares numbers. It does not map
++ * GPU, GMU, SMMU or PAS registers, does not vote rails or clocks, and does not
++ * load firmware. tools/polaris_gpu_handoff.py is the host-side reference model
++ * for the same rules; keep the two in step.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <dev/polaris_gpu_validate.h>
++
++extern bool polaris_touch_i2c_board(void);
++
++#define PG_ZAP_BASE    0x8c415000ull
++#define PG_ZAP_SIZE    0x2000ull
++#define PG_SPLASH_BASE 0x9d400000ull
++#define PG_SPLASH_SIZE 0x2400000ull
++
++static const char *const pg_blob_name[PG_BLOB_COUNT] = {
++	"GPU-SQE", "GPU-GMU", "GPU-ZAP-MDT",
++	"GPU-ZAP-B00", "GPU-ZAP-B01", "GPU-ZAP-B02",
++};
++
++/*
++ * Registered firmware length vectors. Hashes are checked at packaging time
++ * (tools/polaris_gpu_preflight.py) because the kernel has no digest and must not
++ * grow one to gate a bring-up experiment. An unregistered vector is refused.
++ */
++static const struct pg_size_set {
++	const char *name;
++	const char *note;
++	uint32_t size[PG_BLOB_COUNT];
++} pg_size_sets[] = {
++	{ "device-2026-10-22",
++	  "handset /vendor readback",
++	  { 32136, 32768, 6684, 148, 6536, 1968 } },
++	{ "miui-v12.5.1.0-qdgcnxm-20210707",
++	  "official ROM vendor.img, older than device vendor",
++	  { 31980, 20480, 6684, 148, 6536, 1968 } },
++};
++
++static bool
++pg_pair(DTEntry node, const char *key, uint64_t *base, uint64_t *size)
++{
++	const void *value = NULL;
++	unsigned int length = 0;
++
++	if (SecureDTGetProperty(node, key, &value, &length) != kSuccess ||
++	    value == NULL || length != 16) {
++		return false;
++	}
++	memcpy(base, value, sizeof(*base));
++	memcpy(size, (const uint8_t *)value + sizeof(*base), sizeof(*size));
++	return true;
++}
++
++static bool
++pg_u64(DTEntry node, const char *key, uint64_t *value)
++{
++	const void *data = NULL;
++	unsigned int length = 0;
++
++	if (SecureDTGetProperty(node, key, &data, &length) != kSuccess ||
++	    data == NULL || length != sizeof(*value)) {
++		return false;
++	}
++	memcpy(value, data, sizeof(*value));
++	return true;
++}
++
++/* Callers must reject overflow before using this comparison. */
++static bool
++pg_overlap(uint64_t a, uint64_t n, uint64_t b, uint64_t m)
++{
++	return a < b + m && b < a + n;
++}
++
++static bool
++pg_round_up(uint64_t value, uint64_t *out)
++{
++	if (value > UINT64_MAX - (PG_PAGE - 1u)) {
++		return false;
++	}
++	*out = (value + PG_PAGE - 1u) & ~(PG_PAGE - 1u);
++	return *out != 0;
++}
++
++static const struct pg_size_set *
++pg_match_set(const struct pg_handoff *handoff)
++{
++	unsigned int i, j;
++
++	for (i = 0; i < sizeof(pg_size_sets) / sizeof(pg_size_sets[0]); ++i) {
++		for (j = 0; j < PG_BLOB_COUNT; ++j) {
++			if (handoff->blob[j].size != pg_size_sets[i].size[j]) {
++				break;
++			}
++		}
++		if (j == PG_BLOB_COUNT) {
++			return &pg_size_sets[i];
++		}
++	}
++	return NULL;
++}
++
++bool
++pg_validate_handoff(struct pg_handoff *out, const char **reason)
++{
++	DTEntry chosen, mmap;
++	const struct pg_size_set *set;
++	unsigned int i, j;
++
++	if (out == NULL || reason == NULL) {
++		return false;
++	}
++	memset(out, 0, sizeof(*out));
++	*reason = "unset";
++
++	/* The shim's board predicate already requires BOTH exact ADT identities. */
++	if (!polaris_touch_i2c_board()) {
++		*reason = "not a polaris/sdm845 ADT";
++		return false;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
++		*reason = "no /chosen";
++		return false;
++	}
++	if (!pg_u64(chosen, "dram-base", &out->dram_base) ||
++	    !pg_u64(chosen, "dram-size", &out->dram_size) ||
++	    out->dram_size == 0) {
++		*reason = "no usable dram-base/dram-size";
++		return false;
++	}
++	if (out->dram_base > UINT64_MAX - out->dram_size) {
++		*reason = "DRAM range overflows 64 bits";
++		return false;
++	}
++	if (pg_overlap(out->dram_base, out->dram_size, PG_ZAP_BASE, PG_ZAP_SIZE) ||
++	    pg_overlap(out->dram_base, out->dram_size, PG_SPLASH_BASE, PG_SPLASH_SIZE)) {
++		*reason = "managed RAM overlaps zap or splash reservation";
++		return false;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mmap) != kSuccess) {
++		*reason = "no /chosen/memory-map";
++		return false;
++	}
++	for (i = 0; i < PG_BLOB_COUNT; ++i) {
++		uint64_t addr = 0, size = 0;
++
++		out->blob[i].name = pg_blob_name[i];
++		if (!pg_pair(mmap, pg_blob_name[i], &addr, &size)) {
++			*reason = "firmware blob missing from memory-map";
++			return false;
++		}
++		if (size == 0 || size > UINT32_MAX) {
++			*reason = "firmware blob has an impossible length";
++			return false;
++		}
++		out->blob[i].addr = addr;
++		out->blob[i].size = (uint32_t)size;
++	}
++	set = pg_match_set(out);
++	if (set == NULL) {
++		*reason = "firmware lengths match no registered set";
++		return false;
++	}
++	out->set_name = set->name;
++	out->set_note = set->note;
++
++	for (i = 0; i < PG_BLOB_COUNT; ++i) {
++		struct pg_handoff_blob *blob = &out->blob[i];
++
++		if (!pg_round_up(blob->size, &blob->reserve)) {
++			*reason = "firmware reservation overflows";
++			return false;
++		}
++		if (blob->addr & (PG_PAGE - 1u)) {
++			*reason = "firmware blob is not page aligned";
++			return false;
++		}
++		if (blob->addr < out->dram_base ||
++		    blob->addr > out->dram_base + out->dram_size ||
++		    blob->reserve > out->dram_base + out->dram_size - blob->addr) {
++			*reason = "firmware blob lies outside managed RAM";
++			return false;
++		}
++		if (pg_overlap(blob->addr, blob->reserve, PG_ZAP_BASE, PG_ZAP_SIZE) ||
++		    pg_overlap(blob->addr, blob->reserve, PG_SPLASH_BASE, PG_SPLASH_SIZE)) {
++			*reason = "firmware blob collides with a reservation";
++			return false;
++		}
++		for (j = 0; j < i; ++j) {
++			if (pg_overlap(blob->addr, blob->reserve,
++			    out->blob[j].addr, out->blob[j].reserve)) {
++				*reason = "firmware blobs overlap each other";
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/polaris_gpu_validate.h b/bsd/dev/polaris_gpu_validate.h
+new file mode 100644
+index 0000000..d7da8fd
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_validate.h
+@@ -0,0 +1,38 @@
++/*
++ * Polaris A630 handoff validation: pure arithmetic over what the boot loader
++ * handed us. No MMIO, no regulator or clock vote, no firmware execution.
++ * Keep the CPU framebuffer and the 0090 touch path as the default.
++ */
++#ifndef _BSD_DEV_POLARIS_GPU_VALIDATE_H_
++#define _BSD_DEV_POLARIS_GPU_VALIDATE_H_
++
++#include <sys/types.h>
++#include <stdbool.h>
++
++#define PG_BLOB_COUNT 6u
++#define PG_PAGE       0x4000ull
++
++struct pg_handoff_blob {
++	const char *name;
++	uint32_t size;
++	uint64_t addr;
++	uint64_t reserve;	/* page-rounded, never smaller than size */
++};
++
++struct pg_handoff {
++	const char *set_name;	/* registered firmware set that matched */
++	const char *set_note;	/* provenance, for the console line only */
++	uint64_t dram_base;
++	uint64_t dram_size;
++	struct pg_handoff_blob blob[PG_BLOB_COUNT];
++};
++
++/*
++ * Returns true only when every check passes; out is then a complete, immutable
++ * description of the handoff. On false, *reason points at a static string.
++ * A true result is still not authority to power the GPU: it only says the
++ * firmware blobs and reserved-memory layout agree with a registered set.
++ */
++bool pg_validate_handoff(struct pg_handoff *out, const char **reason);
++
++#endif /* _BSD_DEV_POLARIS_GPU_VALIDATE_H_ */
