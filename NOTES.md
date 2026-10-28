@@ -646,3 +646,35 @@ dump: `vrm.cx` 0x40800, `vrm.mx` 0x40700, `vrm.gfx` 0x42700. Host tests now 62.
 Assumption stated in the module docstring and NOT yet verified on this board: for an
 ARC level row the aux data is the allowed level values and a vote writes the chosen
 value to the resource address. Confirm against an RPMh consumer before any write.
+### 2026-10-28 (correction): the firmware set entry was wrong; extractor bug fixed
+
+The user asked to flash the ROM's `vendor.img` back to the handset (its vendor
+partition had been empty). `fastboot flash vendor` succeeded on `/dev/block/sde47`
+(2/2 sparse chunks, 21.8 s), and a read-only recovery check then showed
+`a630_gmu.bin` = **32,768 B / `b07f9029…`** — not the 20,480 B / `894ae555…` this
+session had extracted from the very same image.
+
+Root cause: the ext4 reader appended extents in order and truncated to the inode
+size, so a **sparse file with a hole** came back short. `a630_gmu.bin` declares
+32,768 bytes but only its first 5 blocks have an extent; the remaining 3 are a hole
+that must read as zeros. Fixed by allocating the full size and writing each extent
+at its logical offset.
+
+Corrected facts (verified against the device after the flash):
+
+| file | size | sha256 |
+| --- | --- | --- |
+| `a630_sqe.fw` | 31,980 | `34edacb6…826fa1e` |
+| `a630_gmu.bin` | 32,768 | `b07f9029…4ec11` |
+| `a630_zap.mdt` | 6,684 | `1882b214…c9c831` |
+| `a630_zap.b00` | 148 | `b2975f6a…94282` |
+| `a630_zap.b01` | 6,536 | `c94da0d6…15b5f` |
+| `a630_zap.b02` | 1,968 | `519b5538…520c` |
+
+So `miui-v12.5.1.0-qdgcnxm-20210707` is not "an older set": it is exactly what the
+handset's vendor now holds, and it is the only set a payload may carry. The
+`device-2026-10-22` row is historical (its SQE hash 36298bd5… no longer exists
+anywhere) and is kept only so old logs resolve. `tools/polaris_gmu_firmware.py` no
+longer accepts a 20 KiB image, and 0094/0095 were regenerated with the corrected
+vector. Repacked temporary image: payload 11,839,184 B, ABR gap remaining
+2,750,768 B, image sha256 `8d2eb66a…52131`.

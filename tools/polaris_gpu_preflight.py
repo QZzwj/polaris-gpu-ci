@@ -24,18 +24,28 @@ BLOBS = (
 )
 # Every accepted firmware set is listed explicitly: unknown combinations are
 # refused, never inferred from sizes alone when a hash is known.
-#   device-2026-10-22 : read-only copy taken from this handset's /vendor in
-#     recovery. Hash recorded for SQE/GMU/MDT only; the three ZAP segments were
-#     logged by size, so they stay size-only here and must not be treated as
-#     identity.
-#   miui-v12.5.1.0-qdgcnxm-20210707 : extracted from the official fastboot ROM
-#     images/vendor.img (a630_* in /firmware). All six files bound by hash.
-#     This set is OLDER than this handset's vendor partition, so it is a second
-#     variable in any bring-up result and cannot be described as "the phone's
-#     firmware".
+#   miui-v12.5.1.0-qdgcnxm-20210707 : the official fastboot ROM's
+#     images/vendor.img, and (verified 2026-10-28) exactly what this handset's
+#     vendor partition holds after that image was flashed back. All six files are
+#     hash-bound. This is the only set a payload may carry.
+#   device-2026-10-22 : historical /vendor readback whose SQE hash was
+#     36298bd5.... That content no longer exists on the device and cannot be
+#     re-extracted; kept so old logs still resolve. Hashes for the three ZAP
+#     segments were never recorded for it, so they stay size-only.
 FIRMWARE_SETS = {
+    'miui-v12.5.1.0-qdgcnxm-20210707': {
+        'provenance': 'official ROM vendor.img /firmware; matches the device after flashing it back',
+        'files': {
+            'a630_sqe.fw': (31980, '34edacb6fdedfbfc07ed5cd1d29b0b57a3543ef5be6ab34a43bd64686826fa1e'),
+            'a630_gmu.bin': (32768, 'b07f90299ff2ae33948fcfd6ed67f53fbd287b5bf85ff2d43db11d4d32c1621f'),
+            'a630_zap.mdt': (6684, '1882b214d24c13eae4ffc39ba5456d5e61c80b089fb77e8b15f7bdd04bc9c831'),
+            'a630_zap.b00': (148, 'b2975f6a4c28a98197c1d694f6e275e71b23ec7e31e32ff5d1f83fdb80a94282'),
+            'a630_zap.b01': (6536, 'c94da0d6edf4820885b814ecda2f91c89b9d766126c3574c05d580c418815b5f'),
+            'a630_zap.b02': (1968, '519b5538809f54ee566246b0520746a8ea82ca9384ea6bddb0b0e0d3c2de520c'),
+        },
+    },
     'device-2026-10-22': {
-        'provenance': 'recovery read-only copy from this handset /vendor/firmware',
+        'provenance': 'historical /vendor readback; content no longer present on the device',
         'files': {
             'a630_sqe.fw': (32136, '36298bd53ea3666413d288a3a3f5266f67fcb6db038a0a481af5869d1c17859c'),
             'a630_gmu.bin': (32768, 'b07f90299ff2ae33948fcfd6ed67f53fbd287b5bf85ff2d43db11d4d32c1621f'),
@@ -43,17 +53,6 @@ FIRMWARE_SETS = {
             'a630_zap.b00': (148, None),
             'a630_zap.b01': (6536, None),
             'a630_zap.b02': (1968, None),
-        },
-    },
-    'miui-v12.5.1.0-qdgcnxm-20210707': {
-        'provenance': 'official fastboot ROM images/vendor.img /firmware (older than device vendor)',
-        'files': {
-            'a630_sqe.fw': (31980, '34edacb6fdedfbfc07ed5cd1d29b0b57a3543ef5be6ab34a43bd64686826fa1e'),
-            'a630_gmu.bin': (20480, '894ae5550352d2d12596dc6d4b65af628307cf2c6adc5d112e6f5c9ffcd4ec11'),
-            'a630_zap.mdt': (6684, '1882b214d24c13eae4ffc39ba5456d5e61c80b089fb77e8b15f7bdd04bc9c831'),
-            'a630_zap.b00': (148, 'b2975f6a4c28a98197c1d694f6e275e71b23ec7e31e32ff5d1f83fdb80a94282'),
-            'a630_zap.b01': (6536, 'c94da0d6edf4820885b814ecda2f91c89b9d766126c3574c05d580c418815b5f'),
-            'a630_zap.b02': (1968, '519b5538809f54ee566246b0520746a8ea82ca9384ea6bddb0b0e0d3c2de520c'),
         },
     },
 }

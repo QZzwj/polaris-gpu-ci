@@ -8,11 +8,11 @@ feed an A630 flat image to that block loader or turn these checks into writes.
 import struct
 
 A630_GMU_SIZE = 32768
-# The MIUI V12.5.1.0 (QDGCNXM) vendor image ships a 20 KiB flat image; the
-# handset's own /vendor file is 32 KiB. Both parse as the same flat ITCM dump
-# (stack vector in range, Thumb reset vector, zero tail), so the length is a
-# per-firmware-set property, not a hardware constant. Anything else is refused.
-A630_GMU_ACCEPTED_SIZES = (32768, 20480)
+# 32768 bytes = 0x2000 u32 writes, matching the vendor TCM_BOOT loop. A 20 KiB
+# figure was recorded earlier from a truncated reader (ext4 sparse-hole bug); the
+# device image, read back after flashing the ROM's vendor.img, is 32 KiB with
+# sha256 b07f9029.... Do not reintroduce a shorter length as "another set".
+A630_GMU_ACCEPTED_SIZES = (32768,)
 ITCM_WORDS = 0x2000
 ITCM_IMAGE_BYTES = ITCM_WORDS * 4
 STACK_MIN = 0x40000

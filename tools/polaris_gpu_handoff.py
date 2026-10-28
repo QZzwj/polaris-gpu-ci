@@ -31,10 +31,10 @@ BLOB_NAMES = ('GPU-SQE', 'GPU-GMU', 'GPU-ZAP-MDT', 'GPU-ZAP-B00', 'GPU-ZAP-B01',
 # Lengths only. Hash binding stays in tools/polaris_gpu_preflight.py because the
 # kernel has no SHA-256 and must not grow one just to gate a bring-up.
 FIRMWARE_SETS = {
+    'miui-v12.5.1.0-qdgcnxm-20210707': ((31980, 32768, 6684, 148, 6536, 1968),
+                                        'official ROM vendor.img, read back from the device'),
     'device-2026-10-22': ((32136, 32768, 6684, 148, 6536, 1968),
-                          'this handset /vendor readback'),
-    'miui-v12.5.1.0-qdgcnxm-20210707': ((31980, 20480, 6684, 148, 6536, 1968),
-                                        'official ROM vendor.img (older)'),
+                          'historical readback, content no longer present'),
 }
 
 

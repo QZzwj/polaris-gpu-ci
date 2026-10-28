@@ -71,10 +71,10 @@ index 72974fc..587400f 100644
  	return;
 diff --git a/bsd/dev/polaris_gpu_validate.c b/bsd/dev/polaris_gpu_validate.c
 new file mode 100644
-index 0000000..201c5fd
+index 0000000..bdc9457
 --- /dev/null
 +++ b/bsd/dev/polaris_gpu_validate.c
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,212 @@
 +/*
 + * Polaris A630 handoff validation. Read-only by construction: this file only
 + * looks at the ADT the shim handed over and compares numbers. It does not map
@@ -112,12 +112,17 @@ index 0000000..201c5fd
 +	const char *note;
 +	uint32_t size[PG_BLOB_COUNT];
 +} pg_size_sets[] = {
-+	{ "device-2026-10-22",
-+	  "handset /vendor readback",
-+	  { 32136, 32768, 6684, 148, 6536, 1968 } },
++	/* What this handset's vendor partition now holds, verified read-back after
++	 * flashing the registered ROM image. */
 +	{ "miui-v12.5.1.0-qdgcnxm-20210707",
-+	  "official ROM vendor.img, older than device vendor",
-+	  { 31980, 20480, 6684, 148, 6536, 1968 } },
++	  "vendor.img of the official ROM, read back from the device",
++	  { 31980, 32768, 6684, 148, 6536, 1968 } },
++	/* Historical, from an earlier vendor read whose SQE hash was 36298bd5.... It
++	 * cannot be re-extracted (that vendor content is gone) and is kept only so a
++	 * log from that era still parses; do not treat it as current. */
++	{ "device-2026-10-22",
++	  "historical /vendor readback, content no longer present",
++	  { 32136, 32768, 6684, 148, 6536, 1968 } },
 +};
 +
 +static bool
