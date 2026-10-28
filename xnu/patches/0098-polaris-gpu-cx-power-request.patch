@@ -1,0 +1,145 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -7,3 +7,4 @@ bsd/dev/polaris_gpu_arc_vote.c		standard
+ bsd/dev/polaris_gpu_arc_vote.c		standard
+ bsd/dev/polaris_gpu_pwr_diag.c		standard
++bsd/dev/polaris_gpu_pwron.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 56a9066..44c7058 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -12,6 +12,7 @@
+ #include <dev/polaris_gpu_arc_vote.h>
+ 
+ extern void polaris_gpu_pwr_probe(void);
++extern void polaris_gpu_cx_on(void);
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+@@ -154,6 +155,8 @@ polaris_gpu_init(void)
+ 	(void)pg_arc_vote_dry_run();
+ 	/* Read-only: report the GPUCC power state ABL left behind. Needs its own opt-in. */
+ 	polaris_gpu_pwr_probe();
++	/* First hardware write: a single, reversible CX SW_COLLAPSE request. */
++	polaris_gpu_cx_on();
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_RAILS)) {
+ 		goto fail;
+ 	}
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+new file mode 100644
+index 0000000..3502c00
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -0,0 +1,110 @@
++/*
++ * Polaris A630 CX power-domain request -- the first step that writes hardware.
++ *
++ * Scope, deliberately narrow:
++ *   - only CX GDSCR at GPUCC+0x106c;
++ *   - only bit 0 (SW_COLLAPSE), cleared to request power, with every other bit
++ *     preserved by a read-modify-write;
++ *   - bounded polling of PWR_ON (bit 31) with a read iteration budget instead of a
++ *     timer, because there is no delay primitive in use anywhere in this driver set;
++ *   - on timeout the original register value is written back and the caller is told
++ *     the request failed;
++ *   - GX GDSCR is never touched: a630v2-bringup-contract.md requires GX to be
++ *     requested through the GMU.
++ *
++ * Bit semantics are from the vendor kernel, drivers/clk/qcom/gdsc.c:
++ *   PWR_ON_MASK = BIT(31), SW_COLLAPSE_MASK = BIT(0), HW_CONTROL_MASK = BIT(1),
++ *   SW_OVERRIDE_MASK = BIT(2). gdsc_enable() clears SW_COLLAPSE and polls PWR_ON
++ *   with a 100 us budget; that is the sequence mirrored here.
++ *
++ * A PWR_ON bit that is already set is reported as foreign/unknown ownership. Per the
++ * contract, observing PWR_ON is not acquiring the domain, so nothing is claimed and
++ * no vote is recorded.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern bool polaris_touch_i2c_board(void);
++
++#define PG_GPUCC_BASE    0x05090000ull
++#define PG_GPUCC_WINDOW  0x9000ull
++#define PG_GPUCC_MAP     (PG_GPUCC_BASE + 0x1000ull)
++#define PG_GPUCC_MAP_SZ  0x2000ull
++#define PG_CX_GDSCR      0x006cu
++
++#define PG_GDSCR_PWR_ON       (1u << 31)
++#define PG_GDSCR_SW_COLLAPSE  (1u << 0)
++
++/* Bounded poll budget. The vendor driver allows 100 us; we count reads instead. */
++#define PG_POLL_READS 2000u
++
++static inline uint32_t
++pg_rd32(volatile uint8_t *base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++pg_wr32(volatile uint8_t *base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++}
++
++void
++polaris_gpu_cx_on(void)
++{
++	vm_offset_t virt;
++	volatile uint8_t *regs;
++	int optin = 0;
++	uint32_t before, after, restored;
++	unsigned int i;
++
++	if (!polaris_touch_i2c_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("polarisgpuon", &optin, sizeof(optin));
++	if (optin != 1) {
++		return;
++	}
++	if (PG_GPUCC_MAP + PG_GPUCC_MAP_SZ > PG_GPUCC_BASE + PG_GPUCC_WINDOW) {
++		printf("POLARIS PWR: mapping would leave the GPUCC window; skipped\n");
++		return;
++	}
++	virt = ml_io_map(PG_GPUCC_MAP, PG_GPUCC_MAP_SZ);
++	if (virt == 0) {
++		printf("POLARIS PWR: cannot map GPUCC; power request skipped\n");
++		return;
++	}
++	regs = (volatile uint8_t *)virt;
++	before = pg_rd32(regs, PG_CX_GDSCR);
++	printf("POLARIS PWR: CX GDSCR before=0x%08x (PWR_ON=%u)\n",
++	    before, (before & PG_GDSCR_PWR_ON) != 0);
++	if (before & PG_GDSCR_PWR_ON) {
++		/* Already powered by someone we cannot identify: observe, never claim. */
++		printf("POLARIS PWR: CX already on and not ours; no write, no ownership\n");
++		return;
++	}
++	/* Request power: clear only SW_COLLAPSE, keep every other bit as it was. */
++	pg_wr32(regs, PG_CX_GDSCR, before & ~PG_GDSCR_SW_COLLAPSE);
++	for (i = 0; i < PG_POLL_READS; i++) {
++		after = pg_rd32(regs, PG_CX_GDSCR);
++		if (after & PG_GDSCR_PWR_ON) {
++			printf("POLARIS PWR: CX PWR_ON after %u polls, GDSCR=0x%08x; "
++			    "rollback = write 0x%08x\n", i + 1, after, before);
++			return;
++		}
++	}
++	after = pg_rd32(regs, PG_CX_GDSCR);
++	pg_wr32(regs, PG_CX_GDSCR, before);
++	restored = pg_rd32(regs, PG_CX_GDSCR);
++	printf("POLARIS PWR: CX power request timed out after %u polls "
++	    "(last=0x%08x); original restored=0x%08x, domain not claimed\n",
++	    PG_POLL_READS, after, restored);
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
