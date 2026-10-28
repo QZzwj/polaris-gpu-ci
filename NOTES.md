@@ -876,3 +876,29 @@ runner and passed `Verify GPU protocol regressions`; full kernel build is in
 progress, not yet a kernel success. The previous main run already failed, so no
 cancellation was performed by this session. Use the updated helpers
 `gpu-fix/package_0102.py` and `gpu-fix/device_0102.py` for this source record.
+
+### 2026-10-28 11:24 UTC: 0102 built and temporarily booted; runtime unverified
+
+CI `40677321846` concluded **success**, including regressions and full XNU
+compile/link. Kernel 12,269,256 B, SHA256
+`1a89190056f70c7fa8a835d0c0201d26e50185c675ec370c8d0227bc21109e3e`, matching
+the artifact's `SHA256SUMS`. Whole-archive `gh run download` stalled; kernel and
+checksums were extracted via official Azure HTTPS ranges, with ZIP CRC and the
+extracted SHA256 verified (the full 53 MB archive digest was NOT verified).
+`gh` full-log retrieval is still pending; do not claim log diagnostics reviewed.
+
+Repacked image `D:\ios\gpu-fix\boot-polaris-0102-temporary.img`, 18,141,184 B,
+SHA256 `18e45bc35e41791ed4e9dcd308a01ec9eb09333e6fe4909b783dfc9e060e4fb5`.
+Payload 11,839,376 B with 2,750,576 B remaining below the ABL boundary. Independent
+unpack verifies Android header, exact boot command line, six firmware memory-map
+allocations/content hashes and final image hash. Uses `polarisgpuon=0`,
+`polarisgpupwr=1`, eight CPUs and existing display/touch settings; fill remains
+opt-in and unset. No permanent partition flashing.
+
+At **11:24:09 UTC**, checked a unique `product=polaris` and ran only temporary
+`fastboot boot`: Sending and Booting both **OKAY**. That proves bootloader
+acceptance, not successful XNU startup or graphics. User has been asked to report
+the screen and hold ~3 minutes for persistent log flush. Next have the user return
+to FASTBOOT, temporarily boot the pinned local recovery with `device_0102.py
+recovery`, read the ring with `ring`, and establish fresh 0099/0102 markers before
+making runtime claims. Local serial-bearing device record/dumps stay out of git.
