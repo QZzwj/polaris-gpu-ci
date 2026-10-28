@@ -543,3 +543,53 @@ handset, "host" = offline tooling/tests, "source" = patch written but not compil
 - **Still open:** no power/GMU/HFI/PAS13/SMMU/CP code, no acceleration, no
   command-DB or GPU-SMMU ownership evidence, and the device's own firmware set has
   not been re-extracted.
+### 2026-10-28 (later): 0094 gate and 8/8 CPUs proven on the handset
+
+Recovery ADB finally works on this host (it was a Windows driver binding problem,
+not the phone): the composite node `USB\VID_18D1&PID_D001\3522792c` had been bound to
+Google `android_winusb.inf` as *Android Composite ADB Interface* on the parent node,
+so adb could never open the ADB child. Re-binding that node to **Android ADB
+Interface** made `adb devices` report `3522792c recovery product:fox_polaris`,
+after which the ring could be read read-only again (`dd if=/dev/block/by-name/userdata
+bs=4096 skip=<blocks-1025> count=1025`, pipe straight to a file; never through a
+PowerShell redirect). userdata on this handset is `/dev/block/sda21`, 57,453,555,712 B.
+
+Two temporary `fastboot boot` runs, nothing flashed:
+
+1. `boot-gpu-handoff-test.img` (18,128,896 B, sha256 `65cb8de4a913d3ea1bc8d4b784987542c37c5770b6b1a9d1490c561f80a01780`)
+   = CI kernel from run 40647031350 + payload 11,826,896 B carrying the six MIUI
+   A630 blobs, cmdline `cpus=8 … polarisgpudiag=1 polarisgpu=1`, and **without**
+   `sweetfb_noconsole` so the framebuffer console would draw.
+2. The first attempt reused the shipped cmdline including `sweetfb_noconsole=1`,
+   which patch 0067 documents as "stops drawing the console from the beginning";
+   nothing was visible on screen. The gate had most likely run, but there was no
+   evidence either way: treat "no console output" as unproven, not as failure.
+
+Recovered ring (`ring 4194304, total 199320 B, flush #11`, decoded with
+`tools/sweet-log.py`; the raw dump and decoded text stay out of Git):
+
+```
+POLARIS GPU: invalid GPU-SQE range; no GPU access                     (0091, see below)
+POLARIS GPU: handoff validated set=miui-v12.5.1.0-qdgcnxm-20210707
+  (official ROM vendor.img, older than device vendor)
+  dram=0x100000000+0x7cc00000 sqe@0x101ffc000                        (0094)
+POLARIS GPU: rails backend not implemented; no hardware access
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+- **0094 is now device-validated**: the gate identified the registered firmware set,
+  recomputed the SQE reservation from `/chosen/memory-map`, and refused at the rails
+  stage. It powered, mapped and executed nothing; this is not GPU progress.
+- **0091 still refuses with this set** (`invalid GPU-SQE range`) because its blob
+  lengths are the handset's, not a registered set. That is a known inconsistency:
+  0091 is superseded by 0094 for layout checks. Do not "fix" it by loosening sizes;
+  either register sets in 0091 as well or drop the duplicate check.
+- **CPU: 8/8 with log-level proof**, from the same ring:
+  `requested=8 selected=8 (limit=8)`, `cpu=4..7 CPU_ON target=0x400..0x700`,
+  `PSCI CPU_ON rc=0`, `mpidr=0x400..0x700 came alive; SGI1 OK`,
+  `8/8 CPUs initialized, SGI1 verified`. This closes the earlier "no evidence for
+  CPU4-7" gap; the A75 cluster's MPIDR layout is confirmed as `core<<8`.
+- Touch path behaved: `POLARIS I2C: RESET99 before cfg=0x201 io=0x0`, then
+  `RESET99 released cfg=0x201 io=0x3`. Userspace came up (`bluetoothd`, `fairplayd`
+  exec) with no panic. The handset is still slow because display composition is
+  CPU-side; that is expected without a GPU backend.

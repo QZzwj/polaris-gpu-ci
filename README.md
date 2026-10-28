@@ -15,7 +15,7 @@
 | 功能 | 已验证或已完成 | 未验证／限制 |
 | --- | --- | --- |
 | 启动和触摸 | 0090 RELEASE 临时启动到 iOS 锁屏；用户确认 **单指、双指**触摸。S3330 使用 GPIO33/34 实验性软件 I²C、GPIO99 复位释放、连续 F12 帧。 | 未取得完整 0090 ring；十指、正式 SE14 硬件 I²C、长期稳定性未验证。用户表示自行刷入过工作镜像，代理未读回 boot 分区确认。 |
-| CPU | Polaris ADT 有八个 MPIDR `0x000`–`0x700` 节点，XNU 上限为 8。**已测试镜像指定 `cpus=4`**；CPU1–3 的 PSCI CPU_ON／SGI 成功，最终 `4/4`。 | **没有 CPU4–7 四个 A75 在 MIX 2S 上运行的证据**。八核设备树和内核上限不等于八核已启动。 |
+| CPU | **八核已在真机验证**（2026-10-28，临时启动 `cpus=8` 镜像并回读 console ring）：`requested=8 selected=8 (limit=8)`，cpu=4–7 `PSCI CPU_ON rc=0`、`mpidr=0x400–0x700 came alive; SGI1 OK`，`8/8 CPUs initialized, SGI1 verified`。 | 仍按单一 SMP 簇处理（无 big.LITTLE 调度），性能收益未测。 |
 | 存储、界面和显示 | 复用 XNU UFS／HFS+ `userdata` 根和 iPhone X 用户态链路；CPU 软件合成／缩放到 ABL 遗留 framebuffer。 | 完整应用稳定性、独立面板初始化和 GPU 屏幕呈现未验证。 |
 | GPU | Recovery Linux 只读报告 A630v2、257–710 MHz；本机六个固件组件通过离线预检。可选只读**固件元数据** XNU 0091/0092 在 [CI 39739222780](https://github.com/luuu20309/ios16_on_polaris_mix2s/actions/runs/39739222780) 编译／链接通过；26 个 GPU 主机测试通过。 | **没有 XNU GPU 上电、GMU/HFI、PAS13、SMMU、CP fence、GPU 渲染、Mesa/EAGL 或 Metal。** 0093 是默认关闭的初始化门槛，尚未 XNU 编译或真机执行，不能算 GPU 驱动。 |
 
@@ -55,7 +55,7 @@ This repository highlights the **Polaris/SDM845** board port of the XNU/iPhone X
 | Area | Evidence | Missing or unproven |
 | --- | --- | --- |
 | Boot/touch | Temporary 0090 RELEASE boot reached the lock screen; the user confirmed one- and two-finger S3330 input. | Full ten-contact reliability, hardware SE14 I²C, long-term stability, permanent-boot readback. |
-| CPUs | Eight ADT nodes and an XNU limit of eight. The observed `cpus=4` image started four A55s; PSCI and SGI passed for CPUs1–3. | No log proves CPU4–7 (the A75s) boot on this Polaris phone. Four selected CPUs follow the boot argument, **not** an observed A75 failure. |
+| CPUs | **Eight cores proven on the handset** (2026-10-28, temporary `cpus=8` boot plus a read-only console-ring readback): `requested=8 selected=8 (limit=8)`, `cpu=4..7 PSCI CPU_ON rc=0`, `mpidr=0x400..0x700 came alive; SGI1 OK`, `8/8 CPUs initialized, SGI1 verified`. | Still one homogeneous SMP cluster (no big.LITTLE scheduling); the performance gain is unmeasured. |
 | Display | Software composition/scaling into the bootloader-inherited framebuffer. | GPU composition or independent panel initialization. |
 | GPU | Recovery Linux identified A630v2. Device firmware was screened **locally** and excluded from Git. Read-only XNU firmware-metadata diagnostics compiled/linked in [CI 39739222780](https://github.com/luuu20309/ios16_on_polaris_mix2s/actions/runs/39739222780); 26 host GPU tests passed. | **No XNU GPU power, GMU/HFI, secure PAS13, SMMU mappings, CP fence, rendering, Mesa/EAGL, or Metal.** 0093 is an uncompiled, default-off gate that refuses at its first missing backend. |
 
