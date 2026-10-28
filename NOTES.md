@@ -632,3 +632,17 @@ interfaces answered part of the first two GPU blockers
   board-gated, read-only XNU probe of GPUCC vote/halt state plus a hash-pinned
   command-DB table check, *after* the stream-ID routing is derived from the DT.
   Do not start from a powered patch.
+### 2026-10-28 (GPU goal): ARC vote composition, dry run only
+
+`tools/polaris_rpmh_vote.py` composes RPMh ARC level votes from the pinned command-DB
+dump and refuses anything it cannot ground: BCM rows (`MC*`, `SH*`, `CN0`, ...) raise
+because the commit/valid/VCD/vote packing is not pinned from a source yet, corners
+outside the pinned level list raise, and there is deliberately no write/send API.
+Pinned level values: `cx.lvl` {0x10,0x30,0x40,0x80,0xc0,0x100,0x180}, `mx.lvl`
+{0x10,0x10,0x100,0x180}, `gfx.lvl` {0x10,0x30,0x40,0x80,0xc0,0x100,0x140,0x180,0x1a0}
+(9 levels for 7 KGSL frequencies — do not conflate them). Rail addresses from the
+dump: `vrm.cx` 0x40800, `vrm.mx` 0x40700, `vrm.gfx` 0x42700. Host tests now 62.
+
+Assumption stated in the module docstring and NOT yet verified on this board: for an
+ARC level row the aux data is the allowed level values and a vote writes the chosen
+value to the resource address. Confirm against an RPMh consumer before any write.
