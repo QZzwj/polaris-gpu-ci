@@ -822,3 +822,16 @@ setup, GMU/HFI, PAS13, CP fence or GPU-backed iOS composition. This is a real
 protocol/decoder correction, not a GPU acceleration or performance fix. Next
 build the corrected XNU kernel on the authorized QZzwj fork and inspect results;
 do not claim a usable GPU or flash a diagnostic as a performance solution.
+
+0099 milestone: committed code as `5222f4f862b869b3f0778775030893b6c59084a7`.
+Published an exact committed-tree snapshot to the existing authorized fork's
+isolated branch `polaris-gpu-semantics-0099-5222f4f8`, remote commit
+`ade5c78d03011eaf00e9dded32f113ea2a34c564`, tree
+`67322d350a630d3ca4087a182e80291f5368f3a3`. RELEASE/SWEET CI run
+`40673733146` dispatched; currently queued (no build result yet). No fork-main
+update or hardware action by this repair. Isolated packaging/device helpers and
+source record are under `D:\ios\gpu-fix`; native device tool invocations require
+the existing sandbox escalation. Use `ci.py detail` / `download`,
+`package_0099.py`, then explicit `device_0099.py` actions; never run the old
+unattended `staging/auto_0097.py`. Recovery was copied locally, SHA256
+`a7800ebe2393531b4484ba2a17f123d19b0c9cd842cab269c4205079f8f5b83b`.
