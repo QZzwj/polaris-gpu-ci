@@ -593,3 +593,42 @@ POLARIS GPU: acceleration unavailable; CPU display unchanged
   `RESET99 released cfg=0x201 io=0x3`. Userspace came up (`bluetoothd`, `fairplayd`
   exec) with no panic. The handset is still slow because display composition is
   CPU-side; that is expected without a GPU backend.
+### 2026-10-28 (later still): read-only GPU reconnaissance succeeded; vendor firmware is gone
+
+With recovery ADB working, a pure read-only sweep of the vendor kernel's own
+interfaces answered part of the first two GPU blockers
+(full write-up: `research/polaris/handset-cmd-db-and-domain-facts.md`).
+
+- **RPMh command DB is readable here.** `/sys/kernel/debug/cmd_db` is 0444 in this
+  recovery (earlier sessions found it absent); a 5,600-byte text dump gives the ARC
+  and BCM resource table: `cx.lvl` 0x30000 (7 indices), `mx.lvl` 0x30010 (4),
+  `gfx.lvl` 0x30050 (**9**), `ddr.lvl` 0x30070 (3), `xo.lvl` 0x30080 (3), plus
+  `vrm.cx` 0x40800 / `vrm.mx` 0x40700 / `vrm.gfx` 0x42700 and the MC/SH/MM/SN BCM
+  resources. Consequence: the table can be shipped as a hash-pinned blob and
+  validated offline instead of mapping fixed physical memory, which is exactly why
+  0092 was withdrawn. Note `gfx.lvl`'s 9 indices versus 7 KGSL frequencies: the HFI
+  bandwidth table is not 1:1 with the pwrlevels.
+- **GPU SMMU domains confirmed.** `arm-smmu 5040000.arm,smmu-kgsl`: 5 context banks,
+  mask 0x7, dma-coherent CTTW. `/sys/kernel/iommu_groups` shows 16 `gmu_user`,
+  17 `gmu_kernel`, 18 `gfx3d_user`, 19 `gfx3d_secure` — the distinct GMU and 3D
+  domains the contract demands exist on this board. Stream IDs are still to be
+  derived from the device tree; do not invent them.
+- **Rails/clocks.** `gpu_cx_gdsc` supplied by `pm8998_s9_level`, `gpu_gx_gdsc` by
+  `pm8005_s1_level`; GPUCC at 5090000 registers GFX3D OPPs 180/710 MHz and GMU
+  19.2/500 MHz; `kgsl-hyp` owns `gpu_region@0x8c415000`. `/proc/iomem`:
+  `05000000-0503ffff kgsl-3d0`, `05040000-0504ffff arm,smmu-kgsl`,
+  `85fe0000-85fe0dc0 cmd-db`.
+- **The handset's own A630 firmware no longer exists.** `vendor` = `/dev/block/sde47`
+  (1 GiB) mounts read-only and `df` claims ~798 MiB used, but a raw `dd` of the whole
+  partition is **0.018% non-zero (~190 KB)**: superblock, group descriptors and inode
+  tables survive while data blocks — including the root directory — read as zeros,
+  and the image contains no `a630` string. So the `device-2026-10-22` firmware set
+  cannot be re-extracted; payloads must use the registered
+  `miui-v12.5.1.0-qdgcnxm-20210707` set, and 0091 will keep printing
+  `invalid GPU-SQE range` on it — expected, not a fault, and not a reason to loosen
+  its sizes.
+- **Still nothing powered or programmed.** No GMU load, no HFI, no SMMU
+  programming, no PAS13, no CP ring, no rendering. The next honest step is a
+  board-gated, read-only XNU probe of GPUCC vote/halt state plus a hash-pinned
+  command-DB table check, *after* the stream-ID routing is derived from the DT.
+  Do not start from a powered patch.
