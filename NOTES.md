@@ -902,3 +902,12 @@ the screen and hold ~3 minutes for persistent log flush. Next have the user retu
 to FASTBOOT, temporarily boot the pinned local recovery with `device_0102.py
 recovery`, read the ring with `ring`, and establish fresh 0099/0102 markers before
 making runtime claims. Local serial-bearing device record/dumps stay out of git.
+
+11:32 UTC handoff: still no FASTBOOT target after the temporary boot; no runtime
+ring has been read. Two asynchronous requests are pending (screen state and
+manual Power+VolumeDown return to FASTBOOT). Do not infer either successful iOS
+startup or a crash from the absent USB target. GH metadata confirms the successful
+build, but full log downloads via `gh run view --log`, `gh api .../logs` and the
+official signed log service stalled/timed out; compile diagnostics have not been
+reviewed. Kernel/image integrity checks above did succeed. No permanent flashing
+is appropriate while runtime remains unverified, and GPU acceleration is absent.
