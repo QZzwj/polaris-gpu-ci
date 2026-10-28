@@ -1,0 +1,187 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -5,4 +5,5 @@ bsd/dev/polaris_gpu.c			standard
+ bsd/dev/polaris_gpu.c			standard
+ bsd/dev/polaris_gpu_validate.c		standard
+ bsd/dev/polaris_gpu_arc.c		standard
++bsd/dev/polaris_gpu_arc_vote.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 214e011..c43deee 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -9,6 +9,7 @@
+ #include <pexpert/pexpert.h>
+ #include <dev/polaris_gpu_validate.h>
+ #include <dev/polaris_gpu_arc.h>
++#include <dev/polaris_gpu_arc_vote.h>
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+@@ -147,6 +148,8 @@ polaris_gpu_init(void)
+ 		printf("POLARIS GPU: pinned cmd-db rows=%u (gfx.lvl=9 indices), "
+ 		    "SID maps=%u; nothing mapped or voted\n", rows, sids);
+ 	}
++	/* Compose the rail votes so the encoding is exercised without any write. */
++	(void)pg_arc_vote_dry_run();
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_RAILS)) {
+ 		goto fail;
+ 	}
+diff --git a/bsd/dev/polaris_gpu_arc_vote.c b/bsd/dev/polaris_gpu_arc_vote.c
+new file mode 100644
+index 0000000..6a9526a
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_arc_vote.c
+@@ -0,0 +1,106 @@
++/*
++ * Polaris A630 ARC level-vote composition. Data and arithmetic only: no MMIO, no
++ * TCS write, no clock, no regulator. Values are the level indices this handset's
++ * command DB printed for cx.lvl / mx.lvl / gfx.lvl, and the rail addresses are the
++ * vrm.* resources from the same dump.
++ *
++ * The semantic being relied on: for an ARC level row, the aux data lists the
++ * allowed level values and a vote writes the chosen value to the resource address.
++ * That is how the vendor dump is structured; it has NOT been confirmed against an
++ * RPMh consumer on this board, so this file must not grow a write path until it is.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <dev/polaris_gpu_arc_vote.h>
++
++struct pg_rail {
++	const char *name;
++	uint32_t addr;
++	const uint16_t *levels;
++	unsigned int count;
++};
++
++/* Level values exactly as the handset's cmd_db rows listed them. */
++static const uint16_t pg_cx_levels[] = {
++	0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x180,
++};
++static const uint16_t pg_mx_levels[] = {
++	0x10, 0x10, 0x100, 0x180,
++};
++static const uint16_t pg_gfx_levels[] = {
++	0x10, 0x30, 0x40, 0x80, 0xc0, 0x100, 0x140, 0x180, 0x1a0,
++};
++
++#define PG_COUNT(a) (sizeof(a) / sizeof((a)[0]))
++
++static const struct pg_rail pg_rails[] = {
++	{ "vrm.cx",  0x40800, pg_cx_levels,  PG_COUNT(pg_cx_levels) },
++	{ "vrm.mx",  0x40700, pg_mx_levels,  PG_COUNT(pg_mx_levels) },
++	{ "vrm.gfx", 0x42700, pg_gfx_levels, PG_COUNT(pg_gfx_levels) },
++};
++
++static const struct pg_rail *
++pg_rail_find(const char *rail)
++{
++	unsigned int i;
++
++	if (rail == NULL) {
++		return NULL;
++	}
++	for (i = 0; i < PG_COUNT(pg_rails); i++) {
++		if (strcmp(pg_rails[i].name, rail) == 0) {
++			return &pg_rails[i];
++		}
++	}
++	return NULL;
++}
++
++unsigned int
++pg_arc_corner_count(const char *rail)
++{
++	const struct pg_rail *entry = pg_rail_find(rail);
++
++	return entry != NULL ? entry->count : 0;
++}
++
++bool
++pg_arc_compose_level(const char *rail, unsigned int corner, struct pg_vote *out)
++{
++	const struct pg_rail *entry = pg_rail_find(rail);
++
++	if (entry == NULL || out == NULL || corner >= entry->count) {
++		return false;
++	}
++	out->rail = entry->name;
++	out->corner = corner;
++	out->addr = entry->addr;
++	out->data = entry->levels[corner];
++	return true;
++}
++
++bool
++pg_arc_vote_dry_run(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < PG_COUNT(pg_rails); i++) {
++		const struct pg_rail *entry = &pg_rails[i];
++		struct pg_vote low, high;
++
++		if (!pg_arc_compose_level(entry->name, 0, &low) ||
++		    !pg_arc_compose_level(entry->name, entry->count - 1, &high)) {
++			printf("POLARIS GPU: %s composition failed\n", entry->name);
++			continue;
++		}
++		printf("POLARIS GPU: dry-run vote %s corner %u -> addr 0x%x data 0x%x; "
++		    "corner %u -> data 0x%x (nothing written)\n",
++		    entry->name, low.corner, low.addr, low.data,
++		    high.corner, high.data);
++	}
++	/* No backend owns the TCS; composition is not permission. */
++	return false;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/polaris_gpu_arc_vote.h b/bsd/dev/polaris_gpu_arc_vote.h
+new file mode 100644
+index 0000000..07220c6
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_arc_vote.h
+@@ -0,0 +1,39 @@
++/*
++ * Polaris A630 ARC level-vote composition, dry run only.
++ *
++ * This file can compose a vote -- "write this ARC resource address with this level
++ * value" -- and print it. It has no way to send one: XNU has no RPMh/TCS write
++ * backend for Polaris yet, and inventing one before the CX/GX power sequence has an
++ * owned, reversible implementation is exactly what this project forbids.
++ */
++#ifndef _BSD_DEV_POLARIS_GPU_ARC_VOTE_H_
++#define _BSD_DEV_POLARIS_GPU_ARC_VOTE_H_
++
++#include <sys/types.h>
++#include <stdbool.h>
++
++struct pg_vote {
++	uint32_t addr;
++	uint32_t data;
++	const char *rail;
++	unsigned int corner;
++};
++
++/*
++ * Compose one vote for `rail` ("vrm.cx", "vrm.mx", "vrm.gfx") at `corner`.
++ * Returns false for an unknown rail or a corner outside the pinned level list.
++ * Nothing is written anywhere.
++ */
++bool pg_arc_compose_level(const char *rail, unsigned int corner, struct pg_vote *out);
++
++/* Number of pinned corners for a rail, or 0 if the rail is unknown. */
++unsigned int pg_arc_corner_count(const char *rail);
++
++/*
++ * Print the composed votes at the lowest and highest corner for every rail and
++ * state that nothing was written. Always returns false: this build has no write
++ * backend, and a caller must not treat composition as permission to vote.
++ */
++bool pg_arc_vote_dry_run(void);
++
++#endif /* _BSD_DEV_POLARIS_GPU_ARC_VOTE_H_ */

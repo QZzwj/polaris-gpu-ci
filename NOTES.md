@@ -678,3 +678,15 @@ anywhere) and is kept only so old logs resolve. `tools/polaris_gmu_firmware.py` 
 longer accepts a 20 KiB image, and 0094/0095 were regenerated with the corrected
 vector. Repacked temporary image: payload 11,839,184 B, ABR gap remaining
 2,750,768 B, image sha256 `8d2eb66a…52131`.
+### 2026-10-28 (GPU goal): 0096 composes rail votes, still writes nothing
+
+`xnu/patches/0096-polaris-gpu-arc-vote-dry-run.patch` adds
+`bsd/dev/polaris_gpu_arc_vote.{c,h}`: the pinned level values (`cx.lvl`
+{0x10,0x30,0x40,0x80,0xc0,0x100,0x180}, `mx.lvl` {0x10,0x10,0x100,0x180}, `gfx.lvl`
+{0x10,0x30,0x40,0x80,0xc0,0x100,0x140,0x180,0x1a0}) and a composer that returns
+`(addr, data)` for `vrm.cx` 0x40800 / `vrm.mx` 0x40700 / `vrm.gfx` 0x42700. The gate
+prints the lowest and highest corner of each rail and returns false: there is no
+RPMh/TCS write backend for Polaris in XNU, and composition is not permission to
+vote. Unknown rails and out-of-range corners are refused. Same refusals, same data
+and the same "no write API" rule as the host tool `tools/polaris_rpmh_vote.py`,
+which has 8 tests including a scan for any write/send helper.
