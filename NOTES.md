@@ -835,3 +835,33 @@ the existing sandbox escalation. Use `ci.py detail` / `download`,
 `package_0099.py`, then explicit `device_0099.py` actions; never run the old
 unattended `staging/auto_0097.py`. Recovery was copied locally, SHA256
 `a7800ebe2393531b4484ba2a17f123d19b0c9cd842cab269c4205079f8f5b83b`.
+
+### 2026-10-28 follow-up: concurrent power-offset regression and patch collision
+
+User confirmed this session should own device operations and will pause the other
+session. This session still has not booted, rebooted or flashed the handset.
+
+- Isolated CI `40673733146` attempt 1 never acquired a hosted runner; annotations
+  report capacity constraints. Attempt 2 was explicitly cancelled by `QZzwj`.
+  Concurrent main run `40675373989` snapshots remote `4e033828...`, equivalent
+  to local `f0c7b13`; that snapshot must not be booted as the repaired image.
+- Concurrent commit `fceae97` introduced a second **0099** for framebuffer fill.
+  Kept all framebuffer changes and their dependency order, renaming fill to
+  **0100** and column map to **0101**; GPU protocol remains **0099**.
+- Concurrent warning cleanup `f0c7b13` changed register constants from mapped-page
+  offsets to GPUCC-base offsets but kept mapping at GPUCC+0x1000. This would
+  read/write the wrong registers (+0x1000 twice), including the CX power request.
+  New **0102** forward patch derives every offset as documented GPUCC offset
+  minus the mapped-page offset: effective CX 0x0509106c, HW_CTRL 0x05091540,
+  GX 0x0509100c. It does not change power opt-ins or establish ownership.
+- Added 3 native-C RAM-window tests to the existing shipped-patch fixture.
+  Two failed before the fix, reading poison `0x5a5a5a5a` and taking the timeout
+  path instead of detecting foreign-powered CX. After 0102, all **89** tests
+  pass (82 Python + 7 compiled C). Checks cover exact mapping, all three
+  physical register values, unchanged memory for read-only/foreign-owned state,
+  and no mapping without both the board gate and separate opt-in. No actual
+  GPUCC MMIO was used by these tests. Forward/reverse/forward of 0102 verifies.
+
+Next build the full 0001-0102 tree. Keep `polarisgpuon=0`; a real GPU execution
+and iOS renderer are still missing. The isolated packaging/device helpers remain
+usable after replacing their recorded CI source with the new exact snapshot.

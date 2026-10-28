@@ -4,7 +4,9 @@
 0095 的错误 SID/context-bank 表改为原始 phandle/specifier 引用。主机工具
 现在能解析完整 DTB，先解析 provider 和 `#iommu-cells`，再得到 SID/mask，
 context bank 保持未分配。二进制 command-db 解码器也保留 OFF 和重复档位。
-82 项 Python 测试和 4 项实际 C 补丁执行测试通过。完整 XNU 构建与新的
+82 项 Python 测试和 7 项实际 C 补丁执行测试通过。0102 还修复了并发修改
+引入的 GPUCC 映射起点与寄存器偏移重复相加问题；模拟 RAM 测试先复现
+错误，再验证修复，没有访问真实 MMIO。完整 XNU 构建与新的
 真机测试尚待完成；仍缺 GPU 硬件后端，卡顿不会因这次修正而消失。
 
 以下诊断记录描述修复前的 0095/0096；运行时由 0099 覆盖这些错误解释。

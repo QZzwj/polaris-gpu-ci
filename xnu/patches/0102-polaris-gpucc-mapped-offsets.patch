@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/polaris_gpu_pwr_diag.c b/bsd/dev/polaris_gpu_pwr_diag.c
+index 4052fe8..518a873 100644
+--- a/bsd/dev/polaris_gpu_pwr_diag.c
++++ b/bsd/dev/polaris_gpu_pwr_diag.c
+@@ -26,20 +26,22 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern bool polaris_touch_i2c_board(void);
+ 
++/* Register constants below are relative to this mapped page. */
++#define PG_GPUCC_PAGE_OFFSET 0x1000u
+ #define PG_GPUCC_BASE   0x05090000ull
+ #define PG_GPUCC_WINDOW 0x9000ull
+ 
+ /* One mapping covering 0x100c, 0x106c and 0x1540. */
+-#define PG_GPUCC_MAP    (PG_GPUCC_BASE + 0x1000ull)
++#define PG_GPUCC_MAP    (PG_GPUCC_BASE + PG_GPUCC_PAGE_OFFSET)
+ #define PG_GPUCC_MAP_SZ 0x2000ull
+ 
+ #if (PG_GPUCC_MAP + PG_GPUCC_MAP_SZ) > (PG_GPUCC_BASE + PG_GPUCC_WINDOW)
+ #error "the GPUCC probe mapping would leave the documented window"
+ #endif
+ 
+-#define PG_CX_GDSCR     0x106cu
+-#define PG_CX_HW_CTRL   0x1540u
+-#define PG_GX_GDSCR     0x100cu
++#define PG_CX_GDSCR     (0x106cu - PG_GPUCC_PAGE_OFFSET)
++#define PG_CX_HW_CTRL   (0x1540u - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_GDSCR     (0x100cu - PG_GPUCC_PAGE_OFFSET)
+ 
+ static inline uint32_t
+ pg_read32(volatile uint32_t *base, uint32_t off)
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index b61d829..c690660 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -32,11 +32,13 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern bool polaris_touch_i2c_board(void);
+ 
++/* Register constants below are relative to this mapped page. */
++#define PG_GPUCC_PAGE_OFFSET 0x1000u
+ #define PG_GPUCC_BASE    0x05090000ull
+ #define PG_GPUCC_WINDOW  0x9000ull
+-#define PG_GPUCC_MAP     (PG_GPUCC_BASE + 0x1000ull)
++#define PG_GPUCC_MAP     (PG_GPUCC_BASE + PG_GPUCC_PAGE_OFFSET)
+ #define PG_GPUCC_MAP_SZ  0x2000ull
+-#define PG_CX_GDSCR      0x106cu
++#define PG_CX_GDSCR      (0x106cu - PG_GPUCC_PAGE_OFFSET)
+ 
+ #if (PG_GPUCC_MAP + PG_GPUCC_MAP_SZ) > (PG_GPUCC_BASE + PG_GPUCC_WINDOW)
+ #error "the GPUCC power mapping would leave the documented window"
