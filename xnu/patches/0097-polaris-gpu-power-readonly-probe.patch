@@ -1,0 +1,114 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -6,3 +6,4 @@ bsd/dev/polaris_gpu_arc.c		standard
+ bsd/dev/polaris_gpu_arc.c		standard
+ bsd/dev/polaris_gpu_arc_vote.c		standard
++bsd/dev/polaris_gpu_pwr_diag.c		standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index c43deee..56a9066 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -11,6 +11,8 @@
+ #include <dev/polaris_gpu_arc.h>
+ #include <dev/polaris_gpu_arc_vote.h>
+ 
++extern void polaris_gpu_pwr_probe(void);
++
+ extern bool polaris_touch_i2c_board(void);
+ 
+ enum polaris_gpu_stage {
+@@ -150,6 +152,8 @@ polaris_gpu_init(void)
+ 	}
+ 	/* Compose the rail votes so the encoding is exercised without any write. */
+ 	(void)pg_arc_vote_dry_run();
++	/* Read-only: report the GPUCC power state ABL left behind. Needs its own opt-in. */
++	polaris_gpu_pwr_probe();
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_RAILS)) {
+ 		goto fail;
+ 	}
+diff --git a/bsd/dev/polaris_gpu_pwr_diag.c b/bsd/dev/polaris_gpu_pwr_diag.c
+new file mode 100644
+index 0000000..ff06f43
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_pwr_diag.c
+@@ -0,0 +1,78 @@
++/*
++ * Polaris A630 GPUCC read-only power-state probe.
++ *
++ * Reads three documented registers inside the shared GPUCC/GFXCC window
++ * (0x05090000..0x05098fff) and prints them. No write, no vote, no GDSC transition,
++ * no firmware load. research/polaris/a630v2-bringup-contract.md requires read-only
++ * evidence of this kind before anything may be powered, and forbids flipping GX
++ * GDSCR by hand at all: GX must be requested through the GMU.
++ *
++ * Offsets are the documented ones, not guesses:
++ *   CX GDSCR   +0x106c
++ *   CX HW_CTRL +0x1540
++ *   GX GDSCR   +0x100c
++ *
++ * The mapping is deliberately kept for the life of the boot: this repository has no
++ * `ml_io_unmap` in use anywhere, and inventing an unmap call here would be a guess.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern bool polaris_touch_i2c_board(void);
++
++#define PG_GPUCC_BASE   0x05090000ull
++#define PG_GPUCC_WINDOW 0x9000ull
++
++/* One mapping covering 0x100c, 0x106c and 0x1540. */
++#define PG_GPUCC_MAP    (PG_GPUCC_BASE + 0x1000ull)
++#define PG_GPUCC_MAP_SZ 0x2000ull
++
++#define PG_CX_GDSCR     0x006cu
++#define PG_CX_HW_CTRL   0x0540u
++#define PG_GX_GDSCR     0x000cu
++
++static inline uint32_t
++pg_read32(volatile uint8_t *base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++void
++polaris_gpu_pwr_probe(void)
++{
++	vm_offset_t virt;
++	volatile uint8_t *regs;
++	int optin = 0;
++	uint32_t cx_gdscr, cx_ctrl, gx_gdscr;
++
++	if (!polaris_touch_i2c_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("polarisgpupwr", &optin, sizeof(optin));
++	if (optin != 1) {
++		return;
++	}
++	if (PG_GPUCC_MAP + PG_GPUCC_MAP_SZ > PG_GPUCC_BASE + PG_GPUCC_WINDOW) {
++		printf("POLARIS PWR: mapping would leave the GPUCC window; skipped\n");
++		return;
++	}
++	virt = ml_io_map(PG_GPUCC_MAP, PG_GPUCC_MAP_SZ);
++	if (virt == 0) {
++		printf("POLARIS PWR: cannot map GPUCC; no values reported\n");
++		return;
++	}
++	regs = (volatile uint8_t *)virt;
++	/* Read-only: report what the boot loader left behind. */
++	cx_gdscr = pg_read32(regs, PG_CX_GDSCR);
++	cx_ctrl = pg_read32(regs, PG_CX_HW_CTRL);
++	gx_gdscr = pg_read32(regs, PG_GX_GDSCR);
++	printf("POLARIS PWR: read-only GPUCC cx_gdscr=0x%08x cx_hw_ctrl=0x%08x "
++	    "gx_gdscr=0x%08x (no vote, no GDSC write)\n", cx_gdscr, cx_ctrl, gx_gdscr);
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
