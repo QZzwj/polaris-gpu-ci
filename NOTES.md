@@ -1076,3 +1076,13 @@ DRV2 is not hardware: these tests prove the command/ACK state machine and
 cleanup logic, not that the phone accepts a vote. The CI kernel and temporary
 image still need device validation, again via `fastboot boot` only; no partition
 is written.
+
+The first 0105 CI run **40827204460** failed at the real XNU compile:
+`polaris_rpmh.c:83: too few arguments to function call, expected 2, have 1`.
+The host fixture had declared `absolutetime_to_nanoseconds(uint64_t)` returning
+a value, while the kernel API is
+`void absolutetime_to_nanoseconds(uint64_t, uint64_t *)`. The adapter now calls
+the real API and the fixture declares the same prototype, so this mismatch can
+no longer pass host tests. Patch 0105 was regenerated (LF, 8,903 bytes) and all
+122 regressions pass. A new CI build is required before any 0105 image is
+packaged; GPU acceleration remains off.

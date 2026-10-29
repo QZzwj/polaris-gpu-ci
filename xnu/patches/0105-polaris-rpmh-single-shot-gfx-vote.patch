@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/polaris_rpmh.c b/bsd/dev/polaris_rpmh.c
-index 18a7e2d..c40878c 100644
+index 18a7e2d..01ce739 100644
 --- a/bsd/dev/polaris_rpmh.c
 +++ b/bsd/dev/polaris_rpmh.c
 @@ -1,9 +1,12 @@
@@ -53,7 +53,7 @@ index 18a7e2d..c40878c 100644
  	if ((offset & 3u) || offset > PG_RH_MAP_SIZE - 4) {
  		return UINT32_MAX;
  	}
-@@ -30,13 +55,137 @@ rh_kernel_read(void *cookie, uint32_t offset)
+@@ -30,13 +55,140 @@ rh_kernel_read(void *cookie, uint32_t offset)
  	return value;
  }
  
@@ -81,8 +81,11 @@ index 18a7e2d..c40878c 100644
 +static uint64_t
 +rh_kernel_now_us(void *cookie)
 +{
++	uint64_t now_ns;
++
 +	(void)cookie;
-+	return absolutetime_to_nanoseconds(mach_absolute_time()) / 1000ull;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++	return now_ns / 1000ull;
 +}
 +
 +static void
@@ -192,7 +195,7 @@ index 18a7e2d..c40878c 100644
  
  	if (!polaris_touch_i2c_board()) {
  		return;
-@@ -64,7 +213,8 @@ polaris_rpmh_probe(void)
+@@ -64,7 +216,8 @@ polaris_rpmh_probe(void)
  		printf("POLARIS RPMH: unsupported/inconsistent snapshot; no transaction\n");
  		return;
  	}
@@ -202,7 +205,7 @@ index 18a7e2d..c40878c 100644
  	    snapshot.irq_enabled, snapshot.irq_status);
  	for (bank = 0; bank < PG_RH_BANKS; bank++) {
  		const struct pg_rh_slot *slot = &snapshot.slot[bank];
-@@ -78,6 +228,38 @@ polaris_rpmh_probe(void)
+@@ -78,6 +231,38 @@ polaris_rpmh_probe(void)
  			}
  		}
  	}

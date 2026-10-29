@@ -80,7 +80,7 @@ class GpuCTests(unittest.TestCase):
         (root / 'include/kern/clock.h').write_text(
             '#include <stdint.h>\n'
             'uint64_t mach_absolute_time(void);\n'
-            'uint64_t absolutetime_to_nanoseconds(uint64_t);\n')
+            'void absolutetime_to_nanoseconds(uint64_t, uint64_t *);\n')
         (root / 'include/machine').mkdir()
         (root / 'include/machine/machine_routines.h').write_text(
             'void DELAY(unsigned);\n')
@@ -243,7 +243,7 @@ static unsigned rh_sent_selector, rh_sent_level;
 static int rh_freeze_time, rh_fail_verify;
 static struct pg_rh_transport rh_ctx;
 uint64_t mach_absolute_time(void) { return rh_now * 1000ull; }
-uint64_t absolutetime_to_nanoseconds(uint64_t value) { return value; }
+void absolutetime_to_nanoseconds(uint64_t value, uint64_t *ns) { *ns = value; }
 void DELAY(unsigned us) {
     rh_pauses++;
     if (!rh_freeze_time) rh_now += us;
