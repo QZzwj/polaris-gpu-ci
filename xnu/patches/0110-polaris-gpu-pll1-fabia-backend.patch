@@ -1,0 +1,512 @@
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index 8f588d5..9c1c376 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -17,10 +17,11 @@ int polaris_gpu_rails_enter(void);
+ void polaris_gpu_rails_exit(void);
+ 
+ /*
+- * Clocks stage: bring up the GMU clock source root and the CX GMU branch.
+- * Requires the CX domain owned above; returns true only when every step
+- * completed and was read back. exit() restores the three saved registers and
+- * is a no-op unless enter() succeeded.
++ * Clocks stage: bring up Fabia GPUCC PLL1, then the GMU clock source root and
++ * the CX GMU branch. Requires the CX domain owned above; falls back to
++ * GPLL0_OUT_MAIN_DIV when PLL1 cannot be locked. Returns true only when every
++ * step completed and was read back. exit() restores the three clock registers,
++ * then PLL1, and is a no-op unless enter() succeeded.
+  */
+ int polaris_gpu_clocks_enter(void);
+ void polaris_gpu_clocks_exit(void);
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index e642174..87840a2 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -36,12 +36,16 @@
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern bool polaris_touch_i2c_board(void);
+ 
+-/* Register constants below are relative to this mapped page. */
++/* Register constants below are relative to their mapped page. */
+ #define PG_GPUCC_PAGE_OFFSET 0x1000u
+ #define PG_GPUCC_BASE    0x05090000ull
+ #define PG_GPUCC_WINDOW  0x9000ull
+ #define PG_GPUCC_MAP     (PG_GPUCC_BASE + PG_GPUCC_PAGE_OFFSET)
+ #define PG_GPUCC_MAP_SZ  0x2000ull
++#define PG_PLL1_MAP      PG_GPUCC_BASE
++#define PG_PLL1_MAP_SZ   0x1000ull
++/* gpu_cc_pll1.offset in the vendor gpucc-sdm845 driver. */
++#define PG_PLL1_OFFSET   0x100u
+ #define PG_CX_GDSCR      (0x106cu - PG_GPUCC_PAGE_OFFSET)
+ #define PG_CX_GMU_CBCR   (0x1098u - PG_GPUCC_PAGE_OFFSET)
+ #define PG_GMU_CLK_CMD   (0x1120u - PG_GPUCC_PAGE_OFFSET)
+@@ -50,6 +54,9 @@ extern bool polaris_touch_i2c_board(void);
+ #if (PG_GPUCC_MAP + PG_GPUCC_MAP_SZ) > (PG_GPUCC_BASE + PG_GPUCC_WINDOW)
+ #error "the GPUCC power mapping would leave the documented window"
+ #endif
++#if (PG_PLL1_MAP + PG_PLL1_MAP_SZ) > (PG_GPUCC_BASE + PG_GPUCC_WINDOW)
++#error "the GPUCC PLL1 mapping would leave the documented window"
++#endif
+ 
+ #define PG_GDSCR_PWR_ON       (1u << 31)
+ #define PG_GDSCR_SW_COLLAPSE  (1u << 0)
+@@ -63,8 +70,9 @@ extern bool polaris_touch_i2c_board(void);
+  *   - gmu_clk_src RCG (+0x1120 cmd, +0x1124 cfg): bit 1 requests the root,
+  *     bit 31 reports ROOT_OFF while the root is off, bit 0 is UPDATE and
+  *     self-clears; SRC_SEL is bits 8..10 and selects parent 3 (PLL1 main).
+- * PLL1 itself lives at GPUCC+0x0100, outside this mapping (which starts at
+- * +0x1000), so this stage must never write it.
++ * PLL1 itself lives at GPUCC+0x0100, in the lower page. It has its own
++ * mapping in this revision; the register layout is the Fabia layout used by
++ * the vendor gpucc-sdm845 driver.
+  */
+ #define PG_CBCR_CLK_OFF        (1u << 31)
+ #define PG_CBCR_GMU_MASK       (0x0ff0u)
+@@ -75,13 +83,52 @@ extern bool polaris_touch_i2c_board(void);
+ #define PG_RCG_CMD_ROOT_EN     (1u << 1)
+ #define PG_RCG_CMD_ROOT_OFF    (1u << 31)
+ #define PG_RCG_CFG_PLL1        (3u << 8)
++#define PG_RCG_CFG_GPLL0_200M  (6u << 8 | 2u)
++
++/*
++ * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
++ * mainline agree on the Fabia table). PLL_MODE carries PLL_OUTCTRL(0),
++ * PLL_RESET_N(2), PLL_FSM_ENA(20), PLL_UPDATE_BYPASS(23) and
++ * PLL_LOCK_DET(31). PLL_OPMODE is 0 for standby and 1 for run.
++ */
++#define PG_PLL_MODE            0x00u
++#define PG_PLL_L_VAL           0x04u
++#define PG_PLL_USER_CTL        0x0cu
++#define PG_PLL_USER_CTL_U      0x10u
++#define PG_PLL_CONFIG_CTL      0x14u
++#define PG_PLL_CONFIG_CTL_U    0x18u
++#define PG_PLL_TEST_CTL        0x1cu
++#define PG_PLL_TEST_CTL_U      0x20u
++#define PG_PLL_STATUS          0x24u
++#define PG_PLL_OPMODE          0x2cu
++#define PG_PLL_FRAC_VAL        0x38u
++
++#if (PG_PLL1_OFFSET + PG_PLL_FRAC_VAL + 4u) > PG_PLL1_MAP_SZ
++#error "the Fabia PLL1 registers would leave the mapped page"
++#endif
++
++#define PG_PLL_OUTCTRL         (1u << 0)
++#define PG_PLL_RESET_N         (1u << 2)
++#define PG_PLL_FSM_ENA         (1u << 20)
++#define PG_PLL_UPDATE_BYPASS   (1u << 23)
++#define PG_PLL_LOCK_DET        (1u << 31)
++#define PG_PLL_OUT_MASK        0x7u
++#define PG_PLL_STANDBY         0u
++#define PG_PLL_RUN             1u
++
++/* gpu_cc_pll1_config: L=26, alpha=0xaab -> 19.2 MHz * 26.04167 = 500 MHz. */
++#define PG_PLL1_L_VAL          0x1au
++#define PG_PLL1_FRAC_VAL       0xaabu
+ 
+ /* Bounded poll budget: 200 iterations of a 1 us delay. */
+ #define PG_POLL_US 200u
+ /* RCG root/update budget: 500 iterations of a 1 us delay, as clk-rcg2 uses. */
+ #define PG_RCG_POLL_US 500u
++/* PLL lock budget: the vendor driver uses 100 us; keep a wider margin. */
++#define PG_PLL_POLL_US 500u
+ 
+ static volatile uint32_t *pg_cx_regs;
++static volatile uint32_t *pg_pll_regs;
+ static uint32_t pg_cx_saved;
+ static int pg_cx_owned;
+ 
+@@ -90,8 +137,24 @@ static uint32_t pg_cbcr_saved;
+ static uint32_t pg_cmd_saved;
+ static uint32_t pg_cfg_saved;
+ 
++struct pg_pll_state {
++	uint32_t mode;
++	uint32_t l;
++	uint32_t user_ctl;
++	uint32_t user_ctl_u;
++	uint32_t config_ctl;
++	uint32_t config_ctl_u;
++	uint32_t test_ctl;
++	uint32_t test_ctl_u;
++	uint32_t opmode;
++	uint32_t frac;
++};
++
++static struct pg_pll_state pg_pll_saved;
++static int pg_pll_owned;
++
+ #ifdef PG_PWR_TEST
+-extern void pg_pwr_test_after_write(uint32_t, uint32_t);
++extern void pg_pwr_test_after_write(unsigned, uint32_t, uint32_t);
+ void pg_pwr_test_reset(void);
+ #endif
+ 
+@@ -102,11 +165,12 @@ pg_rd32(volatile uint32_t *base, uint32_t off)
+ }
+ 
+ static inline void
+-pg_wr32(volatile uint32_t *base, uint32_t off, uint32_t value)
++pg_wr32(volatile uint32_t *base, uint32_t off, uint32_t value, unsigned page)
+ {
++	(void)page;
+ 	base[off / 4u] = value;
+ #ifdef PG_PWR_TEST
+-	pg_pwr_test_after_write(off, value);
++	pg_pwr_test_after_write(page, off, value);
+ #endif
+ }
+ 
+@@ -127,6 +191,24 @@ pg_cx_map(void)
+ 	return true;
+ }
+ 
++static bool
++pg_pll_map(void)
++{
++	vm_offset_t virt;
++
++	if (pg_pll_regs != NULL) {
++		return true;
++	}
++	virt = ml_io_map(PG_PLL1_MAP, PG_PLL1_MAP_SZ);
++	if (virt == 0) {
++		printf("POLARIS PWR: cannot map GPUCC PLL1 page; "
++		    "falling back to GPLL0\n");
++		return false;
++	}
++	pg_pll_regs = (volatile uint32_t *)(virt + PG_PLL1_OFFSET);
++	return true;
++}
++
+ int
+ polaris_gpu_rails_enter(void)
+ {
+@@ -157,7 +239,7 @@ polaris_gpu_rails_enter(void)
+ 		return 0;
+ 	}
+ 	/* Request power: clear only SW_COLLAPSE, keep every other bit as it was. */
+-	pg_wr32(pg_cx_regs, PG_CX_GDSCR, before & ~PG_GDSCR_SW_COLLAPSE);
++	pg_wr32(pg_cx_regs, PG_CX_GDSCR, before & ~PG_GDSCR_SW_COLLAPSE, 0);
+ 	for (i = 0; i < PG_POLL_US; i++) {
+ 		after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
+ 		if (after & PG_GDSCR_PWR_ON) {
+@@ -171,7 +253,7 @@ polaris_gpu_rails_enter(void)
+ 		DELAY(1);
+ 	}
+ 	after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
+-	pg_wr32(pg_cx_regs, PG_CX_GDSCR, before);
++	pg_wr32(pg_cx_regs, PG_CX_GDSCR, before, 0);
+ 	restored = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
+ 	printf("POLARIS PWR: rails enter timed out after %u polls "
+ 	    "(last=0x%08x); original restored=0x%08x, domain not claimed\n",
+@@ -188,7 +270,7 @@ polaris_gpu_rails_exit(void)
+ 	if (!pg_cx_owned || pg_cx_regs == NULL) {
+ 		return;
+ 	}
+-	pg_wr32(pg_cx_regs, PG_CX_GDSCR, pg_cx_saved);
++	pg_wr32(pg_cx_regs, PG_CX_GDSCR, pg_cx_saved, 0);
+ 	for (i = 0; i < PG_POLL_US; i++) {
+ 		after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
+ 		if ((after & PG_GDSCR_PWR_ON) == 0) {
+@@ -206,14 +288,157 @@ polaris_gpu_rails_exit(void)
+ 	    pg_cx_saved, PG_POLL_US, after);
+ }
+ 
++static void
++pg_pll_read(struct pg_pll_state *s)
++{
++	s->mode = pg_rd32(pg_pll_regs, PG_PLL_MODE);
++	s->l = pg_rd32(pg_pll_regs, PG_PLL_L_VAL);
++	s->user_ctl = pg_rd32(pg_pll_regs, PG_PLL_USER_CTL);
++	s->user_ctl_u = pg_rd32(pg_pll_regs, PG_PLL_USER_CTL_U);
++	s->config_ctl = pg_rd32(pg_pll_regs, PG_PLL_CONFIG_CTL);
++	s->config_ctl_u = pg_rd32(pg_pll_regs, PG_PLL_CONFIG_CTL_U);
++	s->test_ctl = pg_rd32(pg_pll_regs, PG_PLL_TEST_CTL);
++	s->test_ctl_u = pg_rd32(pg_pll_regs, PG_PLL_TEST_CTL_U);
++	s->opmode = pg_rd32(pg_pll_regs, PG_PLL_OPMODE);
++	s->frac = pg_rd32(pg_pll_regs, PG_PLL_FRAC_VAL);
++}
++
++/*
++ * Return PLL1 to the exact state saved before this driver touched it.
++ * Disable the output and stop the PLL first so no consumer sees the
++ * intermediate L/FRAC writes, then restore the original registers in the
++ * reverse order of the enable sequence.
++ */
++static void
++pg_pll_restore(const char *why)
++{
++	uint32_t mode;
++
++	if (!pg_pll_owned || pg_pll_regs == NULL) {
++		return;
++	}
++	mode = pg_rd32(pg_pll_regs, PG_PLL_MODE);
++	pg_wr32(pg_pll_regs, PG_PLL_MODE, mode & ~PG_PLL_OUTCTRL, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_OPMODE, PG_PLL_STANDBY, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_L_VAL, pg_pll_saved.l, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_FRAC_VAL, pg_pll_saved.frac, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_USER_CTL, pg_pll_saved.user_ctl, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_USER_CTL_U, pg_pll_saved.user_ctl_u, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_CONFIG_CTL, pg_pll_saved.config_ctl, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_CONFIG_CTL_U, pg_pll_saved.config_ctl_u, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_TEST_CTL, pg_pll_saved.test_ctl, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_TEST_CTL_U, pg_pll_saved.test_ctl_u, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_OPMODE, pg_pll_saved.opmode, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_MODE, pg_pll_saved.mode, 1);
++	pg_pll_owned = 0;
++	printf("POLARIS PWR: PLL1 %s; restored mode=0x%08x opmode=0x%08x "
++	    "l=0x%08x frac=0x%08x\n", why,
++	    pg_rd32(pg_pll_regs, PG_PLL_MODE),
++	    pg_rd32(pg_pll_regs, PG_PLL_OPMODE),
++	    pg_rd32(pg_pll_regs, PG_PLL_L_VAL),
++	    pg_rd32(pg_pll_regs, PG_PLL_FRAC_VAL));
++}
++
++/*
++ * Configure the Fabia GPUCC PLL1 to 500 MHz and bring its main output up.
++ * This is the same sequence as clk_fabia_pll_configure() followed by
++ * clk_fabia_pll_enable() in the vendor clock driver: program L/FRAC, set
++ * UPDATE_BYPASS and RESET_N, move OPMODE from standby to run, wait for
++ * LOCK_DET, enable the main outputs and assert OUTCTRL.
++ *
++ * Returns 1 when PLL1 is locked at 500 MHz. Returns 0 when the page cannot
++ * be mapped, the FSM owns the PLL, or lock does not arrive; in the latter
++ * two cases every saved register is restored before returning so the caller
++ * can fall back to GPLL0 without leaving a half-programmed PLL behind.
++ */
++static int
++pg_pll1_enter(void)
++{
++	struct pg_pll_state st;
++	uint32_t mode, user;
++	unsigned int i;
++
++	if (!pg_pll_map()) {
++		return 0;
++	}
++	pg_pll_read(&st);
++	printf("POLARIS PWR: PLL1 enter mode=0x%08x opmode=0x%08x "
++	    "l=0x%08x frac=0x%08x user_ctl=0x%08x config_ctl=0x%08x\n",
++	    st.mode, st.opmode, st.l, st.frac, st.user_ctl, st.config_ctl);
++	if ((st.mode & PG_PLL_LOCK_DET) && (st.opmode & PG_PLL_RUN) &&
++	    (st.mode & PG_PLL_OUTCTRL) && st.l == PG_PLL1_L_VAL &&
++	    (st.frac & 0xffffu) == PG_PLL1_FRAC_VAL) {
++		printf("POLARIS PWR: PLL1 already running at 500 MHz; "
++		    "left untouched\n");
++		return 1;
++	}
++	if (st.mode & PG_PLL_FSM_ENA) {
++		printf("POLARIS PWR: PLL1 FSM is enabled but PLL is not at "
++		    "500 MHz; refusing to fight the FSM\n");
++		return 0;
++	}
++
++	pg_pll_saved = st;
++	pg_pll_owned = 1;
++
++	/* Stop the output, park in standby, then program the rate. */
++	mode = st.mode & ~PG_PLL_OUTCTRL;
++	pg_wr32(pg_pll_regs, PG_PLL_MODE, mode, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_OPMODE, PG_PLL_STANDBY, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_L_VAL, PG_PLL1_L_VAL, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_FRAC_VAL, PG_PLL1_FRAC_VAL, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_MODE,
++	    mode | PG_PLL_UPDATE_BYPASS | PG_PLL_RESET_N, 1);
++	pg_wr32(pg_pll_regs, PG_PLL_OPMODE, PG_PLL_RUN, 1);
++	for (i = 0; i < PG_PLL_POLL_US; i++) {
++		if (pg_rd32(pg_pll_regs, PG_PLL_MODE) & PG_PLL_LOCK_DET) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_PLL_POLL_US) {
++		printf("POLARIS PWR: PLL1 lock timeout after %u polls "
++		    "(mode=0x%08x opmode=0x%08x)\n", PG_PLL_POLL_US,
++		    pg_rd32(pg_pll_regs, PG_PLL_MODE),
++		    pg_rd32(pg_pll_regs, PG_PLL_OPMODE));
++		pg_pll_restore("lock timeout");
++		return 0;
++	}
++
++	/* Enable the three Fabia main outputs, then PLL_OUTCTRL. */
++	user = pg_rd32(pg_pll_regs, PG_PLL_USER_CTL);
++	pg_wr32(pg_pll_regs, PG_PLL_USER_CTL, user | PG_PLL_OUT_MASK, 1);
++	mode = pg_rd32(pg_pll_regs, PG_PLL_MODE);
++	pg_wr32(pg_pll_regs, PG_PLL_MODE, mode | PG_PLL_OUTCTRL, 1);
++	mode = pg_rd32(pg_pll_regs, PG_PLL_MODE);
++	if (!(mode & PG_PLL_LOCK_DET) || !(mode & PG_PLL_OUTCTRL)) {
++		printf("POLARIS PWR: PLL1 readback lost lock or output "
++		    "(mode=0x%08x)\n", mode);
++		pg_pll_restore("readback failure");
++		return 0;
++	}
++	printf("POLARIS PWR: PLL1 locked after %u polls; mode=0x%08x "
++	    "opmode=0x%08x l=0x%08x frac=0x%08x\n", i + 1,
++	    mode, pg_rd32(pg_pll_regs, PG_PLL_OPMODE),
++	    pg_rd32(pg_pll_regs, PG_PLL_L_VAL),
++	    pg_rd32(pg_pll_regs, PG_PLL_FRAC_VAL));
++	return 1;
++}
++
++static void
++pg_pll1_exit(void)
++{
++	pg_pll_restore("exit");
++}
++
+ static void
+ pg_clocks_rollback(uint32_t cbcr, uint32_t cmd, uint32_t cfg)
+ {
+ 	uint32_t rc, rm, rf;
+ 
+-	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr);
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd);
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, cfg);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr, 0);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd, 0);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, cfg, 0);
+ 	rc = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+ 	rm = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
+ 	rf = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
+@@ -224,7 +449,7 @@ pg_clocks_rollback(uint32_t cbcr, uint32_t cmd, uint32_t cfg)
+ int
+ polaris_gpu_clocks_enter(void)
+ {
+-	uint32_t cbcr, cmd, cfg, value;
++	uint32_t cbcr, cmd, cfg, value, cfg_value;
+ 	unsigned int i;
+ 
+ 	if (!pg_cx_owned || pg_cx_regs == NULL) {
+@@ -234,6 +459,21 @@ polaris_gpu_clocks_enter(void)
+ 	if (pg_clk_owned) {
+ 		return 1;
+ 	}
++
++	/*
++	 * gmu_clk_src parent 3 is PLL1_OUT_MAIN. Fabia PLL1 has to be locked
++	 * before the RCG can switch to it; when it cannot be brought up, run
++	 * the RCG from GPLL0_OUT_MAIN_DIV at 200 MHz instead so the branch
++	 * still has a valid parent.
++	 */
++	if (!pg_pll1_enter()) {
++		printf("POLARIS PWR: gmu clock parent gpll0 (PLL1 unavailable)\n");
++		cfg_value = PG_RCG_CFG_GPLL0_200M;
++	} else {
++		printf("POLARIS PWR: gmu clock parent pll1\n");
++		cfg_value = PG_RCG_CFG_PLL1;
++	}
++
+ 	cbcr = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+ 	cmd = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
+ 	cfg = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
+@@ -245,15 +485,16 @@ polaris_gpu_clocks_enter(void)
+ 
+ 	/* Assert WAKE and SLEEP without disturbing any other CBCR bit. */
+ 	value = (cbcr & ~PG_CBCR_GMU_MASK) | PG_CBCR_GMU_ON;
+-	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, value);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, value, 0);
+ 	if ((pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR) & PG_CBCR_GMU_MASK) !=
+ 	    PG_CBCR_GMU_ON) {
+ 		pg_clocks_rollback(cbcr, cmd, cfg);
++		pg_pll1_exit();
+ 		return 0;
+ 	}
+ 
+ 	/* Request the root and wait for ROOT_OFF to drop. */
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd | PG_RCG_CMD_ROOT_EN);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd | PG_RCG_CMD_ROOT_EN, 0);
+ 	for (i = 0; i < PG_RCG_POLL_US; i++) {
+ 		if ((pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD) & PG_RCG_CMD_ROOT_OFF)
+ 		    == 0) {
+@@ -263,20 +504,21 @@ polaris_gpu_clocks_enter(void)
+ 	}
+ 	if (i == PG_RCG_POLL_US) {
+ 		pg_clocks_rollback(cbcr, cmd, cfg);
++		pg_pll1_exit();
+ 		return 0;
+ 	}
+ 
+-	/* Parent 3 = PLL1_OUT_MAIN, divider 1, dual-edge mode off. */
+-	value = PG_RCG_CFG_PLL1;
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, value);
+-	if (pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG) != value) {
++	/* Parent 3 = PLL1_OUT_MAIN (or GPLL0_DIV fallback), divider 1. */
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, cfg_value, 0);
++	if (pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG) != cfg_value) {
+ 		pg_clocks_rollback(cbcr, cmd, cfg);
++		pg_pll1_exit();
+ 		return 0;
+ 	}
+ 
+ 	/* Commit the new configuration and wait for UPDATE to self-clear. */
+ 	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd | PG_RCG_CMD_ROOT_EN |
+-	    PG_RCG_CMD_UPDATE);
++	    PG_RCG_CMD_UPDATE, 0);
+ 	for (i = 0; i < PG_RCG_POLL_US; i++) {
+ 		if ((pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD) & PG_RCG_CMD_UPDATE)
+ 		    == 0) {
+@@ -286,12 +528,13 @@ polaris_gpu_clocks_enter(void)
+ 	}
+ 	if (i == PG_RCG_POLL_US) {
+ 		pg_clocks_rollback(cbcr, cmd, cfg);
++		pg_pll1_exit();
+ 		return 0;
+ 	}
+ 
+ 	/* Enable the branch and wait for the halt indication to clear. */
+ 	value = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+-	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, value | PG_CBCR_ENABLE);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, value | PG_CBCR_ENABLE, 0);
+ 	for (i = 0; i < PG_POLL_US; i++) {
+ 		if ((pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR) & PG_CBCR_CLK_OFF) == 0) {
+ 			break;
+@@ -300,14 +543,16 @@ polaris_gpu_clocks_enter(void)
+ 	}
+ 	if (i == PG_POLL_US) {
+ 		pg_clocks_rollback(pg_cbcr_saved, pg_cmd_saved, pg_cfg_saved);
++		pg_pll1_exit();
+ 		return 0;
+ 	}
+ 
+ 	/* Drop only the root request hint; ROOT_OFF must stay clear. */
+ 	value = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, value & ~PG_RCG_CMD_ROOT_EN);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, value & ~PG_RCG_CMD_ROOT_EN, 0);
+ 	if (pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD) & PG_RCG_CMD_ROOT_OFF) {
+ 		pg_clocks_rollback(pg_cbcr_saved, pg_cmd_saved, pg_cfg_saved);
++		pg_pll1_exit();
+ 		return 0;
+ 	}
+ 
+@@ -328,15 +573,16 @@ polaris_gpu_clocks_exit(void)
+ 		return;
+ 	}
+ 	cbcr = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+-	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr & ~PG_CBCR_ENABLE);
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, pg_cmd_saved);
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, pg_cfg_saved);
+-	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, pg_cbcr_saved);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr & ~PG_CBCR_ENABLE, 0);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, pg_cmd_saved, 0);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, pg_cfg_saved, 0);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, pg_cbcr_saved, 0);
+ 	rc = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+ 	rm = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
+ 	rf = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
+ 	printf("POLARIS PWR: clocks exit restored cbcr=0x%08x cmd=0x%08x "
+ 	    "cfg=0x%08x\n", rc, rm, rf);
++	pg_pll1_exit();
+ 	pg_clk_owned = 0;
+ }
+ 
+@@ -351,6 +597,9 @@ pg_pwr_test_reset(void)
+ 	pg_cbcr_saved = 0;
+ 	pg_cmd_saved = 0;
+ 	pg_cfg_saved = 0;
++	pg_pll_regs = NULL;
++	pg_pll_owned = 0;
++	memset(&pg_pll_saved, 0, sizeof(pg_pll_saved));
+ }
+ #endif
+ 

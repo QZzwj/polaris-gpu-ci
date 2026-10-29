@@ -1245,7 +1245,77 @@ Markers: `rails_stage_observed=true`, `clocks_state_read=true`,
 `rails_request_refused=true`. No PLL1, GX, SMMU or GMU register was written,
 `gfx.lvl` stayed at its boot value, and the display remained CPU-composited.
 
-Next is 0109: start the GMU clock source root and CX branch behind the same
-`polarisgpuon=1` gate, bounded and fully rolled back on any timeout. PLL1 at
-GPUCC+0x0100 is outside the current mapping and must not be written until a
-separate page is mapped and the first attempt's readback is understood.
+### 2026-10-29: 0109 GMU clock backend — UPDATE stalls with PLL1 unconfigured
+
+CI run **40863621435** succeeded for remote commit
+`c9a2fa8453f0e1b2af49d4b6b00f7ea0a2c60105` (local `64f5127`). The kernel is
+`kernel.release.sweet`, 12,318,448 B, SHA256
+`cf2a1c564d0591fcac8b833556b8b961beb35e09fa4bbd8bb661aedf038ea830`.
+Both images are 18,141,184 B and were only temporarily booted with
+`fastboot boot`; no partition was written:
+
+- `boot-polaris-0109-rails.img` SHA256
+  `97fb23c3522cdc941a5b80b8675cc71c7048802900491480048e2003629f33fb`
+- `boot-polaris-0109-regression.img` SHA256
+  `04493fd0c3be34a350cb71e78143099ef076c364085bd64c6d0627a8a19451d2`
+
+The rails ring (4,198,400 B, SHA256
+`a97ab71c010843924c8bebb802ce57433d0ad74e8d054abcc05386c6b61b7c32`) contains:
+
+```
+POLARIS PWR: rails enter CX GDSCR before=0x00222001 (PWR_ON=0)
+POLARIS PWR: rails enter PWR_ON after 2 polls GDSCR=0xf8222000; CX owned, rollback=0x00222001
+POLARIS PWR: clocks enter cx_gmu_cbcr=0x80004220 gmu_clk_cmd=0x80000000 cfg=0x00000000
+POLARIS PWR: GMU clock bring-up failed; rolled back (cbcr=0x80004220 cmd=0x80000010 cfg=0x00000000)
+POLARIS GPU: clocks request refused; no ownership claimed
+POLARIS PWR: rails exit collapsed after 2 polls GDSCR=0x00222001; CX released
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+The command reads back `0x80000010`: bit 4 is `CMD_DIRTY_CFG`. The RCG
+latched the new `CFG` (parent 3, `PLL1_OUT_MAIN`, divider 0) but the
+hardware `UPDATE` never completed, so the configuration stayed dirty and
+never took effect. `CBCR` and `CFG` rolled back exactly to `0x80004220`
+and `0`, and CX collapsed back to `0x00222001`. A dirty, never-applied
+update is consistent with the selected parent having no running clock:
+GPUCC PLL1 at `GPUCC+0x0100` had never been configured and was off. PLL1
+was outside the 0109 mapping and was deliberately not written there.
+
+### 2026-10-29: 0110 Fabia PLL1 backend (implementation, before CI)
+
+GPUCC PLL1 occupies `0x05090100` in the lower GPUCC page, so 0110 maps
+`0x05090000+0x1000` separately from the existing `0x05091000+0x2000`
+window. The mapping starts at the page base; `pg_pll_map()` advances the
+register pointer by `PG_PLL1_OFFSET=0x100`, so every offset below is
+relative to `0x05090100`, matching `gpu_cc_pll1.offset = 0x100` in the
+vendor driver. The register table is the Fabia table shared by the vendor
+`gpucc-sdm845` driver and mainline `clk-alpha-pll.c`:
+
+```
+MODE 0x00 (OUTCTRL bit0, RESET_N bit2, FSM_ENA bit20,
+           UPDATE_BYPASS bit23, LOCK_DET bit31)
+L_VAL 0x04, USER_CTL 0x0c, USER_CTL_U 0x10,
+CONFIG_CTL 0x14, CONFIG_CTL_U 0x18, TEST_CTL 0x1c, TEST_CTL_U 0x20,
+STATUS 0x24, OPMODE 0x2c (0=standby, 1=run), FRAC_VAL 0x38
+```
+
+`gpu_cc_pll1_config` is `L=26`, `alpha=0xaab`: `0xaab / 0x10000 = 0.04167`,
+so `19.2 MHz × 26.04167 = 500.0 MHz`. The enable sequence mirrors
+`clk_fabia_pll_configure()` + `clk_fabia_pll_enable()`: park in standby,
+write `L`/`FRAC`, set `UPDATE_BYPASS|RESET_N`, switch `OPMODE` to run,
+poll `LOCK_DET` for up to 500 us, set `USER_CTL` output mask `0x7`, then
+assert `OUTCTRL`. Every touched register is saved and restored on timeout,
+exit, or a later clock-stage failure.
+
+The GMU RCG now selects parent 3 (`CFG=0x300`) only after PLL1 locks. If
+the PLL page cannot be mapped, the FSM owns the PLL, or lock never
+arrives, the stage falls back to `GPLL0_OUT_MAIN_DIV` at 200 MHz
+(`CFG=0x602`) instead of leaving the RCG without a parent. `clocks_exit`
+restores `CBCR`/`CMD`/`CFG` first and then restores PLL1, so the mux never
+points at a stopped PLL. Host tests: 163 pass, including PLL lock, lock
+timeout, FSM busy, already-running, map failure, `CFG` write fault,
+`UPDATE` stuck, and exact PLL restore.
+
+PLL lock is still not GPU bring-up: BUS, GMU, HFI, SMMU and PAS backends
+remain absent, and the display stays CPU-composited. Next is CI and a
+`fastboot boot` rails run to capture PLL1 and RCG readback on the device.
