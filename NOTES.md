@@ -1319,3 +1319,89 @@ timeout, FSM busy, already-running, map failure, `CFG` write fault,
 PLL lock is still not GPU bring-up: BUS, GMU, HFI, SMMU and PAS backends
 remain absent, and the display stays CPU-composited. Next is CI and a
 `fastboot boot` rails run to capture PLL1 and RCG readback on the device.
+
+### 2026-10-29: 0110 device run — PLL1 locks, UPDATE stays dirty
+
+CI run `40871130921` passed and its kernel was packed into
+`boot-polaris-0110-rails.img` (18,141,184 B, SHA256
+`1eb7af06f42e4dc11eea60aa3bfb39eac98b1249d4f2298daf2e99945e81d734`;
+kernel SHA256 `877637c6e5fe1d84939a009359449e01561fa2ac3e649634798f891d6ef3f7ba`).
+The rails image was started with `fastboot boot` only; no partition was
+written. The ring (4,198,400 B, SHA256
+`e40d419e837cfdd38d79b9d1ad38d91f38af1c1e7bd3839a397d7e6a749c7438`)
+contains:
+
+```
+POLARIS PWR: rails enter CX GDSCR before=0x00222001 (PWR_ON=0)
+POLARIS PWR: rails enter PWR_ON after 2 polls GDSCR=0xf8222000; CX owned, rollback=0x00222001
+POLARIS PWR: PLL1 enter mode=0x00000000 opmode=0x00000000 l=0x00000000 frac=0x00000000 user_ctl=0x00000001 config_ctl=0x20485699
+POLARIS PWR: PLL1 locked after 2 polls; mode=0xd0800005 opmode=0x00000001 l=0x0000001a frac=0x00000aab
+POLARIS PWR: gmu clock parent pll1
+POLARIS PWR: clocks enter cx_gmu_cbcr=0x80004220 gmu_clk_cmd=0x80000000 cfg=0x00000000
+POLARIS PWR: gmu clock source root on; cfg=0x00000300
+POLARIS PWR: gmu branch enabled; CBCR=0x00004ff1
+POLARIS GPU: GMU clock running
+POLARIS GPU: bus backend not implemented; no hardware access
+POLARIS PWR: clocks exit restored cbcr=0x80004220 cmd=0x80000010 cfg=0x00000000
+POLARIS PWR: PLL1 exit; restored mode=0x00000000 opmode=0x00000000 l=0x00000000 frac=0x00000000
+POLARIS PWR: rails exit collapsed after 2 polls GDSCR=0x00222001; CX released
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+The Fabia PLL1 locks at `L=26`, `FRAC=0xaab` (500 MHz), the RCG accepts
+parent 3 (`CFG=0x300`) and the CX GMU branch unhalts. The exit path,
+however, leaves `CMD=0x80000010`: bit 4 is `CMD_DIRTY_CFG`. `clocks_exit`
+restored `CMD` before `CFG`, so the restore write latched a configuration
+that was never committed by `UPDATE`. Nothing panicked and the watchdog
+never fired; the ring ends normally with SpringBoard traffic. This is a
+restore-order defect, not a PLL or branch failure. `GMU clock running` is
+still not GPU bring-up: no GMU register, firmware or command was touched,
+and the display remained CPU-composited.
+
+### 2026-10-29: 0111 BUS backend device verification
+
+Commit `230962a` (`gpu: enable GCC AXI and memnoc branches for the GMU
+(0111)`) adds the BUS stage. CI run `40879048953` passed, including
+`Verify GPU protocol regressions`; the published branch
+`polaris-gpu-fixes-230962ac` points at `0a059c79`. Kernel SHA256
+`a82b46c632aab38a862d3c1276e6fee65d7f888bd6be456d952b2edb0d14ea98`,
+rails image SHA256
+`12afa4c923e32e9df4ecac6a4c720334727751bade8dafeb064f2101c4485d32`.
+The image was started with `fastboot boot` only and the ring was captured
+through the temporary recovery (ring 4,198,400 B, SHA256
+`f7ff5f29ee796ba4d2bd0420b6d0634d89c02b3285312cd5bac45003d58aaa00`):
+
+```
+POLARIS PWR: rails enter PWR_ON after 2 polls GDSCR=0xf8222000; CX owned, rollback=0x00222001
+POLARIS PWR: PLL1 locked after 2 polls; mode=0xd0800005 opmode=0x00000001 l=0x0000001a frac=0x00000aab
+POLARIS PWR: gmu clock parent pll1
+POLARIS PWR: gmu clock source root on; cfg=0x00000300
+POLARIS PWR: gmu branch enabled; CBCR=0x00004ff1
+POLARIS GPU: GMU clock running
+POLARIS PWR: bus enter axi=0x80000000 memnoc=0x80004220 cfg_ahb=0x00000001
+POLARIS PWR: bus axi enabled after 1 polls; CBCR=0x00000001
+POLARIS PWR: bus memnoc enabled after 1 polls; CBCR=0x00004221
+POLARIS GPU: GMU bus clocks running
+POLARIS GPU: GMU backend not implemented; no hardware access
+POLARIS PWR: bus exit restored axi=0x80000000 memnoc=0x80004220 cfg_ahb=0x00000001
+POLARIS PWR: clocks exit restored cbcr=0x80004220 cmd=0x80000000 cfg=0x00000000
+POLARIS PWR: PLL1 exit; restored mode=0x00000000 opmode=0x00000000 l=0x00000000 frac=0x00000000
+POLARIS PWR: rails exit collapsed after 2 polls GDSCR=0x00222001; CX released
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+Both GCC VOTED branches unhalt on the first poll. `memnoc` was not in the
+simple `0x80000000` state assumed during design: the saved value is
+`0x80004220` and the enabled value `0x00004221`, and the exit path puts
+the original back exactly. `clocks_exit` leaves `CMD=0x80000000` on both
+enter and exit, so the 0110 `CMD_DIRTY_CFG` bit does not reappear; the
+`CFG`-before-`CMD` restore order fixed it. The same ring contains the
+normal `SWEET FB:` display create/swap traffic and SpringBoard UI
+activity, confirming that the 0111 kernel reached iOS. It then returned
+to FASTBOOT; the ring contains no panic or watchdog record, and the ring
+alone does not explain the return.
+
+This verifies clock and bus gating only. The GMU register block, GX
+domain, firmware load, HFI, SMMU/PAS13, CP and fence remain untouched;
+`GMU backend not implemented` is the refusal at the next stage, and the
+UI is still composed by the CPU.
