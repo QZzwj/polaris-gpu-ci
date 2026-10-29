@@ -1,11 +1,11 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 415bdd0..9ce6a64 100644
+index 3781841..992bcbd 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -116,6 +116,8 @@ bsd/dev/polaris_touch_i2c.c		standard
- bsd/dev/polaris_gpu_diag.c		standard
- bsd/dev/polaris_gpu.c			standard
- bsd/dev/polaris_gpu_validate.c		standard
+@@ -120,6 +120,8 @@ bsd/dev/polaris_gpu_arc.c		standard
+ bsd/dev/polaris_gpu_arc_vote.c		standard
+ bsd/dev/polaris_gpu_pwr_diag.c		standard
+ bsd/dev/polaris_gpu_pwron.c		standard
 +bsd/dev/polaris_rpmh_core.c		standard
 +bsd/dev/polaris_rpmh.c			standard
  bsd/dev/mem.c				standard

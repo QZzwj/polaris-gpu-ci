@@ -46,6 +46,11 @@ class GpuCTests(unittest.TestCase):
         start = next(i for i, l in enumerate(lines) if l.startswith('+++ b/bsd/dev/polaris_gpu.c'))
         (dev / 'polaris_gpu.c').write_text(''.join(l[1:] for l in lines[start + 1:]
                                                 if l.startswith('+')), newline='\n')
+        # 0092 adds one line to the diagnostic; 0103 is generated against that
+        # exact text, so the fixture must include it before applying 0103.
+        subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
+                        str(next(PATCHES.glob('0092-*.patch')))],
+                       cwd=root, check=True, capture_output=True)
         for number in range(94, 105):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:

@@ -13,7 +13,7 @@ index 06fca90..f8150b7 100644
  		goto fail;
  	}
 diff --git a/bsd/dev/polaris_gpu_diag.c b/bsd/dev/polaris_gpu_diag.c
-index 2b46c63..8f84060 100644
+index 28f609c..8f84060 100644
 --- a/bsd/dev/polaris_gpu_diag.c
 +++ b/bsd/dev/polaris_gpu_diag.c
 @@ -1,75 +1,24 @@
@@ -98,7 +98,7 @@ index 2b46c63..8f84060 100644
  	if (!polaris_touch_i2c_board()) {
  		return;
  	}
-@@ -77,55 +26,17 @@ polaris_gpu_diag(void)
+@@ -77,56 +26,17 @@ polaris_gpu_diag(void)
  	if (optin != 1) {
  		return;
  	}
@@ -159,6 +159,7 @@ index 2b46c63..8f84060 100644
  	}
 -	printf("POLARIS GPU: %u/6 blobs missing; firmware metadata only; "
 -	    "GPU/GMU/SMMU registers untouched, CPU display unchanged\n", missing);
+-	printf("POLARIS GPU: ARC DB mapping deferred until XNU reservation ownership is proven\n");
 +	printf("POLARIS GPU: 6/6 blobs validated; firmware metadata only; "
 +		"GPU/GMU/SMMU registers untouched, CPU display unchanged\n");
  }
