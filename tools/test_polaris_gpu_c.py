@@ -51,7 +51,7 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 106):
+        for number in range(94, 107):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -279,6 +279,7 @@ static void rh_pause(void *cookie, unsigned us) {
 EXPORT void rh_reset(unsigned banks, unsigned ncpt, unsigned complete_after) {
     memset(rh_regs, 0, sizeof(rh_regs));
     rh_regs[3] = (banks << 12) | (ncpt << 27) | 0x104u;
+    rh_regs[0xd00 / 4] = 1;
     for (unsigned i = 0; i < 8; i++) rh_regs[RHOFF(i, 0x18)] = 1;
     memcpy(rh_other, rh_regs, sizeof(rh_regs));
     memset(&rh_ctx, 0, sizeof(rh_ctx));
@@ -304,6 +305,7 @@ EXPORT void rh_occupy(unsigned tcs, unsigned cmd, unsigned addr) {
     rh_regs[RHOFF(tcs, 0x34 + cmd * 0x14)] = addr;
 }
 EXPORT void rh_set_irq(unsigned status) { rh_regs[0xd00 / 4 + 1] = status; }
+EXPORT void rh_set_irq_en(unsigned value) { rh_regs[0xd00 / 4] = value; }
 EXPORT int rh_send_mock(const char *row, unsigned selector, unsigned timeout) {
     struct pg_vote v;
     if (!pg_arc_compose_selector(row, selector, &v)) return -100;
@@ -393,6 +395,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.rh_log.restype = ctypes.c_char_p
         cls.lib.rh_occupy.argtypes = [ctypes.c_uint] * 3
         cls.lib.rh_set_irq.argtypes = [ctypes.c_uint]
+        cls.lib.rh_set_irq_en.argtypes = [ctypes.c_uint]
         cls.lib.rh_set_config.argtypes = [ctypes.c_uint]
         cls.lib.rh_reset.argtypes = [ctypes.c_uint] * 3
         cls.lib.rh_bad.restype = ctypes.c_int
@@ -572,6 +575,7 @@ class RpmhTests(GpuCTests):
         self.assertEqual(self.lib.rh_write_count(), 0)
         # A stale IRQ on ACTIVE0 alone must not poison the clean ACTIVE1 slot.
         self.lib.rh_set_irq(1)
+        self.lib.rh_set_irq_en(3)
         self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 1000), 0)
         self.assertEqual(self.lib.rh_read_off(0xd00 + 0x2a0 + 0x34), 0)
         self.assertEqual(self.lib.rh_sleep_wake_unchanged(), 1)
@@ -586,6 +590,14 @@ class RpmhTests(GpuCTests):
             self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 7)
             self.assertEqual(self.lib.rh_write_count(), writes)
             break
+
+    def test_active_irq_must_already_be_enabled(self):
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.lib.rh_set_irq_en(0)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 5)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        self.assertEqual(self.lib.rh_quarantined(), 1)
 
     def test_frozen_clock_still_bounded_and_only_active_slot_changes(self):
         self.lib.rh_reset(8, 16, 0)
@@ -661,6 +673,8 @@ class RpmhTests(GpuCTests):
         self._adapter_probe(complete=0)
         self.assertEqual(self.lib.rh_adapter_vote(0), 4)
         self.assertEqual(self.lib.rh_adapter_quarantined(), 1)
+        self.assertIn(b'failure snapshot', self.lib.rh_log())
+        self.assertIn(b'TCS0 status=0x', self.lib.rh_log())
         writes = self.lib.rh_write_count()
         self.assertEqual(self.lib.rh_adapter_vote(0), 6)
         self.assertEqual(self.lib.rh_write_count(), writes)

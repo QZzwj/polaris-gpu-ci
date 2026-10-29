@@ -1,0 +1,95 @@
+diff --git a/bsd/dev/polaris_rpmh.c b/bsd/dev/polaris_rpmh.c
+index 01ce739..4f71f60 100644
+--- a/bsd/dev/polaris_rpmh.c
++++ b/bsd/dev/polaris_rpmh.c
+@@ -113,6 +113,33 @@ rh_quiescent(const struct pg_rh_snapshot *snapshot)
+ 	return true;
+ }
+ 
++static void
++rh_print_failure(const struct pg_rh_snapshot *snapshot)
++{
++	unsigned int bank, cmd;
++
++	printf("POLARIS RPMH: failure snapshot IRQ_EN=0x%x IRQ_STATUS=0x%x\n",
++	    snapshot->irq_enabled, snapshot->irq_status);
++	for (bank = 0; bank < PG_RH_ACTIVE; bank++) {
++		const struct pg_rh_slot *slot = &snapshot->slot[bank];
++
++		printf("POLARIS RPMH: TCS%u status=0x%x control=0x%x "
++		    "enable=0x%x wait=0x%x\n", bank, slot->idle, slot->control,
++		    slot->enabled, slot->wait);
++		for (cmd = 0; cmd < snapshot->commands; cmd++) {
++			if (!(slot->enabled & (1u << cmd)) &&
++			    !slot->cmd_status[cmd] && !slot->msgid[cmd] &&
++			    !slot->addr[cmd] && !slot->data[cmd]) {
++				continue;
++			}
++			printf("POLARIS RPMH: TCS%u cmd%u msg=0x%x addr=0x%x "
++			    "data=0x%x status=0x%x\n", bank, cmd,
++			    slot->msgid[cmd], slot->addr[cmd], slot->data[cmd],
++			    slot->cmd_status[cmd]);
++		}
++	}
++}
++
+ int
+ polaris_rpmh_vote_gfx(unsigned int selector)
+ {
+@@ -167,6 +194,11 @@ polaris_rpmh_vote_gfx(unsigned int selector)
+ 	if (result != PG_RH_OK) {
+ 		printf("POLARIS RPMH: vote did not ACK; transport quarantined=%d\n",
+ 		    rh_transport.quarantined);
++		if (pg_rh_snapshot(&io, &after) == PG_RH_OK) {
++			rh_print_failure(&after);
++		} else {
++			printf("POLARIS RPMH: failure snapshot unreadable\n");
++		}
+ 		return result;
+ 	}
+ 	result = pg_rh_snapshot(&io, &after);
+diff --git a/bsd/dev/polaris_rpmh.h b/bsd/dev/polaris_rpmh.h
+index e89c022..17967b6 100644
+--- a/bsd/dev/polaris_rpmh.h
++++ b/bsd/dev/polaris_rpmh.h
+@@ -49,6 +49,7 @@ struct pg_rh_io {
+ struct pg_rh_slot {
+ 	uint32_t idle, control, enabled, wait;
+ 	uint32_t msgid[PG_RH_COMMANDS], addr[PG_RH_COMMANDS], data[PG_RH_COMMANDS];
++	uint32_t cmd_status[PG_RH_COMMANDS];
+ };
+ 
+ struct pg_rh_snapshot {
+diff --git a/bsd/dev/polaris_rpmh_core.c b/bsd/dev/polaris_rpmh_core.c
+index 64a33a2..ae8a780 100644
+--- a/bsd/dev/polaris_rpmh_core.c
++++ b/bsd/dev/polaris_rpmh_core.c
+@@ -55,6 +55,11 @@ pg_rh_snapshot(const struct pg_rh_io *io, struct pg_rh_snapshot *out)
+ 			slot->msgid[cmd] = io->read(io->cookie, offset + PG_RH_MSGID);
+ 			slot->addr[cmd] = io->read(io->cookie, offset + PG_RH_ADDR);
+ 			slot->data[cmd] = io->read(io->cookie, offset + PG_RH_DATA);
++			slot->cmd_status[cmd] = io->read(io->cookie,
++			    offset + PG_RH_CMD_STATUS);
++			if (slot->cmd_status[cmd] == UINT32_MAX) {
++				return PG_RH_IO;
++			}
+ 		}
+ 	}
+ 	return PG_RH_OK;
+@@ -210,8 +215,14 @@ pg_rh_send(struct pg_rh_transport *ctx, const struct pg_vote *votes,
+ 		result = PG_RH_IO;
+ 		goto unlock;
+ 	}
+-	RH_STORE(PG_RH_IRQ_EN, irq & ~bit);
+-	/* Fresh inspection after IRQ masking, before touching the payload. */
++	/* The firmware enables the ACTIVE TCS completion IRQ. It gates the
++	 * completion status used below, so do not mask it while polling. A
++	 * target without its IRQ already enabled is not ours to claim. */
++	if (!(irq & bit)) {
++		result = PG_RH_IO;
++		goto unlock;
++	}
++	/* Fresh inspection before touching the payload. */
+ 	if (ctx->io.read(ctx->io.cookie, base + PG_RH_STATUS) != 1 ||
+ 	    ctx->io.read(ctx->io.cookie, base + PG_RH_CONTROL) != 0 ||
+ 	    ctx->io.read(ctx->io.cookie, base + PG_RH_ENABLE) != 0 ||
