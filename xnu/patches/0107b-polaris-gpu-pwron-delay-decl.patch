@@ -1,0 +1,21 @@
+From 0107b Mon Sep 17 00:00:00 2001
+Subject: [PATCH] bsd: declare delay() for polaris_gpu_pwron via kern/clock.h
+
+DELAY() in bsd/arm/param.h expands to delay(), which is declared in
+osfmk/kern/clock.h under XNU_KERNEL_PRIVATE.  bsd/dev/polaris_rpmh.c
+already includes that header in the same position for the same reason.
+Without it the arm64 kernel build stops with "call to undeclared
+function 'delay'".
+
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index e7f71c8..4fc9c36 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -29,6 +29,7 @@
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
++#include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <dev/polaris_gpu_pwr.h>
+ 
