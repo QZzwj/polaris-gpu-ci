@@ -1169,3 +1169,83 @@ display remained CPU-composited (`SWEET FB` swaps, no GPU acceleration).
 Next is 0107: replace the absent rails stage with one controlled, reversible CX
 GDSC request behind its own opt-in, with full readback and no retry. It must not
 raise `gfx.lvl` and must not touch GX/SMMU/GMU.
+
+### 2026-10-29: 0107 CX GDSC rails backend (power can be requested)
+
+CI run **40853440973** on branch `polaris-gpu-fixes-96f24e9b` succeeded for
+remote commit `6815bf26b1544deca99d892354a13042495ba9d6` (local `96f24e9`,
+which includes the 0107b `delay()` declaration fix). The kernel is
+`kernel.release.sweet`, 12,318,440 B, SHA256
+`9b0059fb8de9e7dd24b29eeeeabce38ab9d03e02976a0435eca0fe2650cdc0f8`.
+The rails image `boot-polaris-0107-rails.img` is 18,141,184 B, SHA256
+`5a7487c3f4f904ec434a107a09ecb40a04c6793e4a09c1be3a06a353bc6064cb`.
+It was only temporarily booted with `fastboot boot`; no partition was
+written, and `polarisgpuon=1` selected the single CX GDSC request.
+
+The rails ring (4,198,400 B, SHA256
+`0eecd47e32cce5267df5d07d1136fef18c9299adf13de11299c461c1be26be97`) contains:
+
+The rails ring contains:
+
+```
+POLARIS PWR: rails enter CX GDSCR before=0x00222001 (PWR_ON=0)
+POLARIS PWR: rails enter PWR_ON after 2 polls GDSCR=0xf8222000; CX owned, rollback=0x00222001
+POLARIS GPU: clocks backend not implemented; no hardware access
+POLARIS PWR: rails exit restored GDSCR=0xf8222001 (PWR_ON=1); CX released
+```
+
+`PWR_ON` cleared from `0x00222001` to `0xf8222000` after two 1 us polls, so the
+CX domain accepted the request. The exit path restored the original value but
+read `PWR_ON` immediately and reported it still set; 0107 therefore did not
+claim a confirmed collapse. No clock, bus, SMMU, GMU or GX register was
+touched, `gfx.lvl` stayed at its boot value, and the display remained
+CPU-composited (`SWEET FB` swaps, no GPU acceleration).
+
+### 2026-10-29: 0108 CX collapse confirmed and clock state read (still no GPU)
+
+CI run **40857880113** on branch `polaris-gpu-fixes-a858f2b0` succeeded for
+remote commit `5f0e17ecbc005e08d561507c00800c13e79a5b45` (local `a858f2b`).
+The kernel is `kernel.release.sweet`, 12,318,440 B, SHA256
+`8150f7eef87cb11f4c08766c694fe53dbb3a04a153628262107d597800d0bbae`.
+Both images are 18,141,184 B:
+
+- `boot-polaris-0108-rails.img` SHA256
+  `88c871699a79c81216df213f6334b23d9fa6d4d63b6ce217f1f9b2f36729b6e3`
+- `boot-polaris-0108-regression.img` SHA256
+  `cb61a1df18736e319e49f9ab15d4a80d5b80734515b87f4fc3d3a2acc0e605e2`
+
+Both were only temporarily booted with `fastboot boot`; no partition was
+written. The rails ring (4,198,400 B, SHA256
+`48eb67b0fea40e4ab8a35ec0c0cb75baf4c9c62653b0dfe1389676afd255ccbe`) contains:
+
+```
+POLARIS PWR: rails enter CX GDSCR before=0x00222001 (PWR_ON=0)
+POLARIS PWR: rails enter PWR_ON after 2 polls GDSCR=0xf8222000; CX owned, rollback=0x00222001
+POLARIS PWR: clocks read-only cx_gmu_cbcr=0x80004220 gmu_clk_cmd=0x80000000 cfg=0x00000000; nothing written
+POLARIS GPU: clocks backend not implemented; state read only
+POLARIS PWR: rails exit collapsed after 2 polls GDSCR=0x00222001; CX released
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+`CLK_OFF` was set in `CX_GMU_CBCR` (`0x80004220`), the RCG reported
+`ROOT_OFF` with `CFG=0`, and the branch was halted: the GMU clock had never
+been started. The collapse poll now confirms the CX domain returns to
+`0x00222001`. The regression ring (SHA256
+`bec65c7545d425cecf76a98db87bc1fad4cb037718c8ab7d21716595990f1317`) proves
+`polarisgpuon=0` leaves every GPUCC register untouched:
+
+```
+POLARIS PWR: read-only GPUCC cx_gdscr=0x00222001 cx_hw_ctrl=0x00005ff4 gx_gdscr=0x00222001 (no vote, no GDSC write)
+POLARIS PWR: rails write not opt-in; CX untouched
+POLARIS GPU: rails request refused; no ownership claimed
+```
+
+Markers: `rails_stage_observed=true`, `clocks_state_read=true`,
+`cpu_acceleration_unavailable=true`; regression `rails_write_not_optin=true`,
+`rails_request_refused=true`. No PLL1, GX, SMMU or GMU register was written,
+`gfx.lvl` stayed at its boot value, and the display remained CPU-composited.
+
+Next is 0109: start the GMU clock source root and CX branch behind the same
+`polarisgpuon=1` gate, bounded and fully rolled back on any timeout. PLL1 at
+GPUCC+0x0100 is outside the current mapping and must not be written until a
+separate page is mapped and the first attempt's readback is understood.
