@@ -1135,3 +1135,37 @@ vote: read back the target ACTIVE TCS `STATUS`, `CONTROL`, `ENABLE`, `WAIT`,
 the timeout, and compare the trigger/enable sequence with the documented
 AOSP RPMh RSC ordering. Do not switch to level 9 or touch GPUCC/GDSC until the
 completion path is understood.
+
+### 2026-10-29: 0106 device vote ACK (completion path works; still no GPU)
+
+CI run **40835278404** on branch `polaris-gpu-fixes-71a6659d` succeeded for
+remote commit `94bd55a7cda4d672303a3f84f2530f47a0404807` (local `71a6659`).
+The kernel is `kernel.release.sweet`, 12,318,384 B, SHA256
+`bdd9d118911e10abefd53ac3779f9c0e7f7c382b750017e1a67d8a22e9be3887`.
+The vote image `boot-polaris-0106-vote-lvl0.img` (18,141,184 B, SHA256
+`03c3156ef2188982a65201a8ff631dfc7f9a70e3e80c6e182492cdf7f290fd20`) was only
+temporarily booted with `fastboot boot`; no partition was written. It carried
+`polarisgpuon=0` and `polarisrpmhvote=1 polarisrpmhlevel=0`.
+
+The vote ring (4,198,400 B, SHA256
+`e24ac0813d561d1aabd7740b7f97de0777cebf7bd1f818cecd9492b549cbf403`) contains:
+
+```
+POLARIS RPMH: DRV2@0x179e0000 TCS+0xd00 config=0x80008104 banks=8 ncpt=16 result=0
+POLARIS RPMH: IRQ enable=0x1 status=0x0 (probe)
+POLARIS RPMH: vote opt-in level=0; single-shot gfx.lvl only
+POLARIS RPMH: gfx.lvl selector=0 addr=0x30050 data=0x0 result=0
+POLARIS RPMH: post-vote IRQ status=0x0 ACTIVE0 idle=0x1 control=0x0 enable=0x0 wait=0x0
+POLARIS RPMH: vote result=0; no GDSC/clock/SMMU/GPU access
+```
+
+`result=0` is an ACK: leaving the firmware-enabled ACTIVE completion IRQ alone
+fixes the 0105 timeout. The trigger, completion, payload cleanup and IRQ status
+clear all completed, and the TCS was left idle. This validates the transport only.
+Level 0 is the gfx OFF selector; `polarisgpuon=0` keeps every GPUCC/GDSC write
+disabled, `POLARIS GPU: rails backend not implemented` still follows, and the
+display remained CPU-composited (`SWEET FB` swaps, no GPU acceleration).
+
+Next is 0107: replace the absent rails stage with one controlled, reversible CX
+GDSC request behind its own opt-in, with full readback and no retry. It must not
+raise `gfx.lvl` and must not touch GX/SMMU/GMU.
