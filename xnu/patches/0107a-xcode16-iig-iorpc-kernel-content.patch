@@ -1,0 +1,21 @@
+From 0107a Mon Sep 17 00:00:00 2001
+Subject: [PATCH] iokit: add kernelContent to IORPC for newer iig
+
+Xcode 16's iig emits IORPC initializers/dispatch code that reference
+rpc.kernelContent.  macOS 15 xnu added this field under KERNEL; backport
+just the field so xnu-8796 can be built with the newer toolchain.
+
+diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -222,6 +222,9 @@ struct IORPC {
+ 	IORPCMessageMach * message;
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
