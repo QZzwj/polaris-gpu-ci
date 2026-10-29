@@ -51,7 +51,7 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 105):
+        for number in range(94, 106):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -76,6 +76,14 @@ class GpuCTests(unittest.TestCase):
         (root / 'include/vm/pmap.h').write_text(
             '#include <stdint.h>\n#include <stddef.h>\n'
             'typedef uintptr_t vm_offset_t;\ntypedef size_t vm_size_t;\n')
+        (root / 'include/kern').mkdir()
+        (root / 'include/kern/clock.h').write_text(
+            '#include <stdint.h>\n'
+            'uint64_t mach_absolute_time(void);\n'
+            'uint64_t absolutetime_to_nanoseconds(uint64_t);\n')
+        (root / 'include/machine').mkdir()
+        (root / 'include/machine/machine_routines.h').write_text(
+            'void DELAY(unsigned);\n')
         wrapper = root / 'wrapper.c'
         wrapper.write_text('''
 #include <dev/polaris_gpu_arc_vote.h>
@@ -110,6 +118,7 @@ EXPORT unsigned ref_arg(unsigned i) {
 static uint32_t power_regs[0x2000 / 4], power_snapshot[0x2000 / 4];
 static int power_enabled, power_board, power_bad_map;
 static unsigned power_maps;
+static int rh_diag_arg = 1, rh_vote_arg, rh_level_arg;
 static char power_text[8192];
 static size_t power_text_len;
 int pg_test_printf(const char *fmt, ...) {
@@ -123,8 +132,19 @@ int pg_test_printf(const char *fmt, ...) {
 }
 bool polaris_touch_i2c_board(void) { return power_board != 0; }
 int PE_parse_boot_argn(const char *name, void *out, int size) {
-    (void)name;
     if (size != sizeof(power_enabled)) return 0;
+    if (!strcmp(name, "polarisrpmhdiag")) {
+        memcpy(out, &rh_diag_arg, sizeof(rh_diag_arg));
+        return rh_diag_arg != 0;
+    }
+    if (!strcmp(name, "polarisrpmhvote")) {
+        memcpy(out, &rh_vote_arg, sizeof(rh_vote_arg));
+        return rh_vote_arg != 0;
+    }
+    if (!strcmp(name, "polarisrpmhlevel")) {
+        memcpy(out, &rh_level_arg, sizeof(rh_level_arg));
+        return rh_level_arg != 0;
+    }
     memcpy(out, &power_enabled, sizeof(power_enabled));
     return 1;
 }
@@ -222,6 +242,12 @@ static unsigned rh_seen_addr, rh_seen_data;
 static unsigned rh_sent_selector, rh_sent_level;
 static int rh_freeze_time, rh_fail_verify;
 static struct pg_rh_transport rh_ctx;
+uint64_t mach_absolute_time(void) { return rh_now * 1000ull; }
+uint64_t absolutetime_to_nanoseconds(uint64_t value) { return value; }
+void DELAY(unsigned us) {
+    rh_pauses++;
+    if (!rh_freeze_time) rh_now += us;
+}
 #define RHOFF(tcs, reg) ((0xd00u + (tcs) * 0x2a0u + (reg)) / 4)
 static uint32_t rh_read(void *cookie, uint32_t off) {
     (void)cookie;
@@ -252,7 +278,7 @@ static void rh_pause(void *cookie, unsigned us) {
 }
 EXPORT void rh_reset(unsigned banks, unsigned ncpt, unsigned complete_after) {
     memset(rh_regs, 0, sizeof(rh_regs));
-    rh_regs[3] = (banks << 12) | (ncpt << 27);
+    rh_regs[3] = (banks << 12) | (ncpt << 27) | 0x104u;
     for (unsigned i = 0; i < 8; i++) rh_regs[RHOFF(i, 0x18)] = 1;
     memcpy(rh_other, rh_regs, sizeof(rh_regs));
     memset(&rh_ctx, 0, sizeof(rh_ctx));
@@ -284,6 +310,18 @@ EXPORT int rh_send_mock(const char *row, unsigned selector, unsigned timeout) {
     rh_sent_selector = v.selector; rh_sent_level = v.consumer_level;
     return pg_rh_send(&rh_ctx, &v, 1, timeout);
 }
+EXPORT void rh_adapter_reset(void) { polaris_rpmh_test_reset(); }
+EXPORT void rh_adapter_set_io(void) { polaris_rpmh_test_set_io(rh_read, rh_write); }
+EXPORT void rh_boot_args(int diag, int vote, int level) {
+    rh_diag_arg = diag; rh_vote_arg = vote; rh_level_arg = level; power_board = 1;
+}
+EXPORT int rh_adapter_vote(unsigned level) {
+    return polaris_rpmh_vote_gfx(level);
+}
+EXPORT void rh_adapter_probe(void) { polaris_rpmh_probe(); }
+EXPORT int rh_adapter_quarantined(void) { return polaris_rpmh_test_quarantined(); }
+EXPORT void rh_log_reset(void) { power_text_len = 0; power_text[0] = 0; }
+EXPORT const char *rh_log(void) { return power_text; }
 EXPORT unsigned rh_write_count(void) { return rh_writes; }
 EXPORT unsigned rh_pause_count(void) { return rh_pauses; }
 EXPORT int rh_bad(void) { return rh_bad_write; }
@@ -300,7 +338,8 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         library = root / ('gpu.dll' if os.name == 'nt' else 'gpu.so')
         shared_flag = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
         argv = compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror', shared_flag,
-                           '-DARM64_BOARD_CONFIG_SWEET=1', '-I' + str(root / 'include'),
+                           '-DARM64_BOARD_CONFIG_SWEET=1', '-DPG_RH_TEST',
+                           '-I' + str(root / 'include'),
                            '-I' + str(root / 'bsd'), str(wrapper),
                            str(dev / 'polaris_gpu_arc_vote.c'),
                            str(dev / 'polaris_gpu_arc.c'),
@@ -347,6 +386,11 @@ EXPORT int rh_sleep_wake_unchanged(void) {
             fn.restype = ctypes.c_int if name not in ('rh_reset',) else None
         cls.lib.rh_claim_mock.argtypes = [ctypes.c_int] * 3
         cls.lib.rh_send_mock.argtypes = [ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint]
+        cls.lib.rh_boot_args.argtypes = [ctypes.c_int] * 3
+        cls.lib.rh_adapter_vote.argtypes = [ctypes.c_uint]
+        cls.lib.rh_adapter_vote.restype = ctypes.c_int
+        cls.lib.rh_adapter_quarantined.restype = ctypes.c_int
+        cls.lib.rh_log.restype = ctypes.c_char_p
         cls.lib.rh_occupy.argtypes = [ctypes.c_uint] * 3
         cls.lib.rh_set_irq.argtypes = [ctypes.c_uint]
         cls.lib.rh_set_config.argtypes = [ctypes.c_uint]
@@ -567,6 +611,59 @@ class RpmhTests(GpuCTests):
         self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 2)
         self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 6)
         self.assertEqual(self.lib.rh_write_count(), 0)
+
+    def _adapter_probe(self, banks=8, ncpt=16, complete=1):
+        self.lib.rh_reset(banks, ncpt, complete)
+        self.lib.rh_adapter_reset()
+        self.lib.rh_adapter_set_io()
+        self.lib.rh_log_reset()
+        self.lib.rh_boot_args(1, 0, 0)
+        self.lib.rh_adapter_probe()
+
+    def test_adapter_observation_path_never_writes(self):
+        self._adapter_probe()
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        self.assertIn(b'observation only', self.lib.rh_log())
+        self.assertIn(b'config=0x80008104', self.lib.rh_log())
+
+    def test_adapter_vote_refuses_before_geometry_and_level_checks(self):
+        self._adapter_probe(8, 15)
+        self.assertEqual(self.lib.rh_adapter_vote(0), 6)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        self._adapter_probe()
+        self.assertEqual(self.lib.rh_adapter_vote(10), 1)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+
+    def test_adapter_vote_refuses_dirty_or_stale_active_state(self):
+        self._adapter_probe()
+        self.lib.rh_occupy(0, 3, 0x30050)
+        self.assertEqual(self.lib.rh_adapter_vote(0), 3)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        self._adapter_probe()
+        self.lib.rh_set_irq(1)
+        self.assertEqual(self.lib.rh_adapter_vote(0), 3)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+
+    def test_adapter_single_shot_vote_acks_and_restores_tcs(self):
+        self._adapter_probe()
+        self.assertEqual(self.lib.rh_adapter_vote(0), 0)
+        self.assertGreater(self.lib.rh_write_count(), 0)
+        self.assertEqual(self.lib.rh_read_off(0xd00 + 0x14), 0)
+        self.assertEqual(self.lib.rh_read_off(0xd00 + 0x1c), 0)
+        self.assertEqual(self.lib.rh_read_off(0xd00 + 0x10), 0)
+        self.assertEqual(self.lib.rh_adapter_quarantined(), 0)
+        self.assertIn(b'post-vote IRQ status=0x0', self.lib.rh_log())
+        writes = self.lib.rh_write_count()
+        self.assertEqual(self.lib.rh_adapter_vote(0), 6)
+        self.assertEqual(self.lib.rh_write_count(), writes)
+
+    def test_adapter_timeout_quarantines_and_never_retries(self):
+        self._adapter_probe(complete=0)
+        self.assertEqual(self.lib.rh_adapter_vote(0), 4)
+        self.assertEqual(self.lib.rh_adapter_quarantined(), 1)
+        writes = self.lib.rh_write_count()
+        self.assertEqual(self.lib.rh_adapter_vote(0), 6)
+        self.assertEqual(self.lib.rh_write_count(), writes)
 
 
 if __name__ == '__main__':

@@ -1057,3 +1057,22 @@ helper `gpu-fix/device_0104.py` pinned the image hash, refused any write-path
 manifest, booted only temporarily, and wrote `ring-0104-summary-local.json`
 without putting serials in git. GPU acceleration remains off until a separately
 gated, owned rail vote is implemented and proven.
+
+### 2026-10-29: 0105 single-shot gfx.lvl vote (host validation)
+
+0105 adds a separately opted-in write path to the APPS DRV2 adapter. The default
+boot path still installs only a read callback. With `polarisrpmhdiag=1
+polarisrpmhvote=1 polarisrpmhlevel=0..9` the adapter claims the transport once,
+re-checks that all eight TCS banks are idle and empty with IRQ status clear,
+sends exactly one `gfx.lvl` command (never `cx.lvl`/`mx.lvl`), then takes a
+post-vote snapshot. Any timeout or uncertain mutation quarantines the transport
+until reboot and is never retried. Level 0 is the GPU-off selector; this path
+does not touch GPUCC, GDSC, SMMU or the GPU and is not GPU acceleration.
+
+The host fault-injection suite passes all **122** tests after adding adapter
+coverage for the observation path, dirty/stale state refusal, a successful
+single ACK with TCS cleanup, and timeout quarantine without retry. The simulated
+DRV2 is not hardware: these tests prove the command/ACK state machine and
+cleanup logic, not that the phone accepts a vote. The CI kernel and temporary
+image still need device validation, again via `fastboot boot` only; no partition
+is written.

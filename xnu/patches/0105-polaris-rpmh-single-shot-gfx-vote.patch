@@ -1,0 +1,275 @@
+diff --git a/bsd/dev/polaris_rpmh.c b/bsd/dev/polaris_rpmh.c
+index 18a7e2d..c40878c 100644
+--- a/bsd/dev/polaris_rpmh.c
++++ b/bsd/dev/polaris_rpmh.c
+@@ -1,9 +1,12 @@
+-/* Polaris APPS DRV2 read-only adapter. No write/time callbacks or authority
+- * certificate are installed: neither a boot argument nor an empty TCS proves
+- * ownership of inherited ARC votes. Send/rail policy is deliberately unwired. */
++/* Polaris APPS DRV2 adapter. The default path installs a read callback only.
++ * A separately opted-in, single-shot gfx.lvl vote is the 0105 experiment: it
++ * proves the TCS write/ACK path without touching GPUCC, GDSC, SMMU or the GPU.
++ * No boot argument can install a second claim or retry a failed transaction. */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+ #include <dev/polaris_rpmh.h>
+@@ -11,12 +14,34 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern bool polaris_touch_i2c_board(void);
+ static vm_offset_t rh_mapping;
++static struct pg_rh_transport rh_transport;
++static int rh_probe_ok;
++static int rh_claimed;
++
++#ifdef PG_RH_TEST
++static uint32_t (*rh_test_read)(void *, uint32_t);
++static void (*rh_test_write)(void *, uint32_t, uint32_t);
++
++void
++polaris_rpmh_test_set_io(uint32_t (*read_cb)(void *, uint32_t),
++    void (*write_cb)(void *, uint32_t, uint32_t))
++{
++	rh_test_read = read_cb;
++	rh_test_write = write_cb;
++}
++#endif
+ 
+ static uint32_t
+ rh_kernel_read(void *cookie, uint32_t offset)
+ {
+ 	vm_offset_t mapping = (vm_offset_t)cookie;
+ 	uint32_t value;
++
++#ifdef PG_RH_TEST
++	if (rh_test_read) {
++		return rh_test_read(cookie, offset);
++	}
++#endif
+ 	if ((offset & 3u) || offset > PG_RH_MAP_SIZE - 4) {
+ 		return UINT32_MAX;
+ 	}
+@@ -30,13 +55,137 @@ rh_kernel_read(void *cookie, uint32_t offset)
+ 	return value;
+ }
+ 
++static void
++rh_kernel_write(void *cookie, uint32_t offset, uint32_t value)
++{
++	vm_offset_t mapping = (vm_offset_t)cookie;
++
++#ifdef PG_RH_TEST
++	if (rh_test_write) {
++		rh_test_write(cookie, offset, value);
++		return;
++	}
++#endif
++	if ((offset & 3u) || offset > PG_RH_MAP_SIZE - 4) {
++		printf("POLARIS RPMH: refused write outside DRV2 offset=0x%x\n", offset);
++		return;
++	}
++	*(volatile uint32_t *)(mapping + offset) = value;
++#if defined(__aarch64__)
++	__asm__ volatile("dmb oshst" ::: "memory");
++#endif
++}
++
++static uint64_t
++rh_kernel_now_us(void *cookie)
++{
++	(void)cookie;
++	return absolutetime_to_nanoseconds(mach_absolute_time()) / 1000ull;
++}
++
++static void
++rh_kernel_pause_us(void *cookie, unsigned int us)
++{
++	(void)cookie;
++	DELAY(us);
++}
++
++/* A quiescent DRV is necessary but not sufficient evidence of ownership. */
++static bool
++rh_quiescent(const struct pg_rh_snapshot *snapshot)
++{
++	unsigned int bank;
++
++	if (snapshot->irq_status != 0) {
++		return false;
++	}
++	for (bank = 0; bank < PG_RH_BANKS; bank++) {
++		const struct pg_rh_slot *slot = &snapshot->slot[bank];
++
++		if (slot->idle != 1 || slot->control != 0 || slot->enabled != 0 ||
++		    slot->wait != 0) {
++			return false;
++		}
++	}
++	return true;
++}
++
++int
++polaris_rpmh_vote_gfx(unsigned int selector)
++{
++	struct pg_rh_snapshot before, after;
++	struct pg_rh_authority authority;
++	struct pg_rh_io io;
++	struct pg_vote vote;
++	int result;
++
++	if (!rh_mapping || !rh_probe_ok || rh_claimed) {
++		return PG_RH_DENIED;
++	}
++	if (!pg_arc_compose_selector("gfx.lvl", selector, &vote)) {
++		return PG_RH_INVALID;
++	}
++	memset(&io, 0, sizeof(io));
++	io.cookie = (void *)rh_mapping;
++	io.read = rh_kernel_read;
++	io.write = rh_kernel_write;
++	io.now_us = rh_kernel_now_us;
++	io.pause_us = rh_kernel_pause_us;
++	result = pg_rh_snapshot(&io, &before);
++	if (result != PG_RH_OK) {
++		return result;
++	}
++	if (!rh_quiescent(&before)) {
++		printf("POLARIS RPMH: DRV2 not quiescent; vote refused\n");
++		return PG_RH_BUSY;
++	}
++	/*
++	 * 0105 lease, deliberately narrow. This is a policy statement, not a
++	 * hardware readback: this kernel is the only OS on the phone, this
++	 * adapter is the only code in it that maps the APPS DRV2, all eight TCS
++	 * banks were just observed idle and empty with IRQ status clear, and
++	 * the only resource sent is gfx.lvl, whose only voter in this kernel is
++	 * the GPU stack that has not started. cx.lvl and mx.lvl are shared with
++	 * the CPU/memory fabric and remain denied. No inherited vote is assumed
++	 * to be cancelled; the request is additive and only affects gfx.lvl.
++	 */
++	memset(&authority, 0, sizeof(authority));
++	authority.exclusive_apps_drv = true;
++	authority.idle_inhibited = true;
++	authority.aggregate_votes_owned = true;
++	result = pg_rh_claim(&rh_transport, &io, &authority);
++	if (result != PG_RH_OK) {
++		return result;
++	}
++	rh_claimed = 1;
++	result = pg_rh_send(&rh_transport, &vote, 1, 10000u);
++	printf("POLARIS RPMH: gfx.lvl selector=%u addr=0x%x data=0x%x result=%d\n",
++	    vote.selector, vote.addr, vote.data, result);
++	if (result != PG_RH_OK) {
++		printf("POLARIS RPMH: vote did not ACK; transport quarantined=%d\n",
++		    rh_transport.quarantined);
++		return result;
++	}
++	result = pg_rh_snapshot(&io, &after);
++	if (result != PG_RH_OK || !rh_quiescent(&after)) {
++		printf("POLARIS RPMH: post-vote cleanup not quiescent; isolating\n");
++		rh_transport.quarantined = 1;
++		return result != PG_RH_OK ? result : PG_RH_IO;
++	}
++	printf("POLARIS RPMH: post-vote IRQ status=0x%x ACTIVE0 idle=0x%x "
++	    "control=0x%x enable=0x%x wait=0x%x\n", after.irq_status,
++	    after.slot[0].idle, after.slot[0].control, after.slot[0].enabled,
++	    after.slot[0].wait);
++	return PG_RH_OK;
++}
++
+ void
+ polaris_rpmh_probe(void)
+ {
+ 	struct pg_rh_snapshot snapshot;
+ 	struct pg_rh_io io;
+ 	unsigned int bank, cmd;
+-	int optin = 0, result;
++	int optin = 0, vote = 0, level = 0, result;
+ 
+ 	if (!polaris_touch_i2c_board()) {
+ 		return;
+@@ -64,7 +213,8 @@ polaris_rpmh_probe(void)
+ 		printf("POLARIS RPMH: unsupported/inconsistent snapshot; no transaction\n");
+ 		return;
+ 	}
+-	printf("POLARIS RPMH: IRQ enable=0x%x status=0x%x (read-only)\n",
++	rh_probe_ok = 1;
++	printf("POLARIS RPMH: IRQ enable=0x%x status=0x%x (probe)\n",
+ 	    snapshot.irq_enabled, snapshot.irq_status);
+ 	for (bank = 0; bank < PG_RH_BANKS; bank++) {
+ 		const struct pg_rh_slot *slot = &snapshot.slot[bank];
+@@ -78,6 +228,38 @@ polaris_rpmh_probe(void)
+ 			}
+ 		}
+ 	}
+-	printf("POLARIS RPMH: observation only; no lease, no ARC vote, no GPU power\n");
++	(void)PE_parse_boot_argn("polarisrpmhvote", &vote, sizeof(vote));
++	if (vote != 1) {
++		printf("POLARIS RPMH: observation only; no lease, no ARC vote, no GPU power\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("polarisrpmhlevel", &level, sizeof(level));
++	if (level < 0 || level > 9) {
++		printf("POLARIS RPMH: vote level %d outside gfx.lvl 0..9; no transaction\n",
++		    level);
++		return;
++	}
++	printf("POLARIS RPMH: vote opt-in level=%d; single-shot gfx.lvl only\n", level);
++	result = polaris_rpmh_vote_gfx((unsigned int)level);
++	printf("POLARIS RPMH: vote result=%d; no GDSC/clock/SMMU/GPU access\n", result);
+ }
++
++#ifdef PG_RH_TEST
++void
++polaris_rpmh_test_reset(void)
++{
++	rh_mapping = 0;
++	memset(&rh_transport, 0, sizeof(rh_transport));
++	rh_probe_ok = 0;
++	rh_claimed = 0;
++	rh_test_read = 0;
++	rh_test_write = 0;
++}
++
++int
++polaris_rpmh_test_quarantined(void)
++{
++	return rh_transport.quarantined;
++}
++#endif
+ #endif
+diff --git a/bsd/dev/polaris_rpmh.h b/bsd/dev/polaris_rpmh.h
+index 1396c19..e89c022 100644
+--- a/bsd/dev/polaris_rpmh.h
++++ b/bsd/dev/polaris_rpmh.h
+@@ -58,8 +58,9 @@ struct pg_rh_snapshot {
+ };
+ 
+ /* These are caller obligations, never conclusions inferred from an empty TCS.
+- * The current XNU adapter does not attest any of them and cannot claim/send.
+- * aggregate_votes_owned includes inherited ARC votes, not just TCS storage. */
++ * The 0105 adapter attests them only for its explicitly opted-in single-shot
++ * gfx.lvl experiment; aggregate_votes_owned includes inherited ARC votes,
++ * not just TCS storage. */
+ struct pg_rh_authority {
+ 	bool exclusive_apps_drv, idle_inhibited, aggregate_votes_owned;
+ };
+@@ -81,5 +82,14 @@ int pg_rh_claim(struct pg_rh_transport *, const struct pg_rh_io *,
+  * After any uncertain mutation: quarantine until reboot; never retry/reset. */
+ int pg_rh_send(struct pg_rh_transport *, const struct pg_vote *, unsigned int,
+     unsigned int timeout_us);
++/* One explicitly opted-in gfx.lvl vote. The adapter's single-OS lease is
++ * documented in polaris_rpmh.c; no GDSC/clock/SMMU access is implied. */
++int polaris_rpmh_vote_gfx(unsigned int selector);
+ void polaris_rpmh_probe(void);
++#ifdef PG_RH_TEST
++void polaris_rpmh_test_reset(void);
++int polaris_rpmh_test_quarantined(void);
++void polaris_rpmh_test_set_io(uint32_t (*)(void *, uint32_t),
++    void (*)(void *, uint32_t, uint32_t));
++#endif
+ #endif
