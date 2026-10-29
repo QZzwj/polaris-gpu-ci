@@ -73,6 +73,43 @@ Magisk，版本分别为 v331/v415。包内是 Android 用户态 `.so`；抽查�
 sentinel/fence，再验证真实 GPU 数组加法；接下来才是用户态接口及 iOS
 合成接入。通过计算用例也不能单独证明系统界面已由 GPU 加速。
 
+## 2026-10-29: 0104 RPMh transport and read-only probe
+
+Added `0104-polaris-rpmh-transport-and-readonly-probe.patch`, generated against
+the booting board's DTB and the XNU source tree that already compiled. The DRV2
+slice is at `0x179e0000`, TCS offset `0xd00`, slot stride `0x2a0`, ACTIVE 2 /
+SLEEP 3 / WAKE 3, and command stride `0x14`. `qcom,tcs-config` is ordered ACTIVE,
+SLEEP, WAKE, so slots 0/1 are ACTIVE; positions are not CONTROL/SLEEP/WAKE.
+AOSP `rpmh-rsc.c` at commit `43062a37ef7a0d352d6550c45e2f49c10303eb1e` was read
+before the implementation.
+
+`bsd/dev/polaris_rpmh_core.c` is an original implementation, not copied driver
+code. It uses only ACTIVE slots, rejects unknown geometry, refuses an address
+already enabled in either ACTIVE slot, checks IRQ status before mutation,
+requires each command's completion bit, and quarantines after a timeout or any
+uncertain write. It never retries, resets a TCS, or sends a compensating rail
+vote. Only proven completion restores payload words and its own IRQ-enable bit;
+SLEEP and WAKE are untouched. Both an overall deadline and a finite polling
+budget bound the wait.
+
+The XNU adapter `bsd/dev/polaris_rpmh.c` installs a read callback only, mapping
+`0x179e0000..0x179e3fff` behind its own `polarisrpmhdiag=1`. It prints geometry,
+IRQ state and ACTIVE contents. It has no write, timer or authority certificate,
+so no other GPU boot argument can make it send a rail vote. A log can establish
+register layout, not ownership of inherited ARC votes. Firmware leases or kernel
+resource ownership must be proven before sending; an empty TCS is insufficient.
+
+The same patched C sources were compiled against a simulated register device for
+unknown geometry, missing authority, in-flight conflicts, concurrency, stale IRQ,
+completion timeout, frozen clock, readback failure and invalid selectors. The
+success path was checked to restore an empty slot and preserve SLEEP/WAKE. All
+117 regressions pass (Python protocol plus actual C patches). 104 patches are
+contiguous and format-valid; all 49 Python tools parse. `validate-repo.py`'s shell
+pass crashes on Windows without `bash` because it reads `stderr=None`; that is a
+validator defect, so its patch and Python checks were invoked separately. A full
+XNU build and phone boot remain outstanding and GPU acceleration is still off.
+
+
 ## 接入上电前，先修正两处数据解释
 
 ### 1. ARC 等级、硬件 selector 和 VRM 电压是不同的数据

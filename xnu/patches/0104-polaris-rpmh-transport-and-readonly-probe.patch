@@ -1,0 +1,515 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 415bdd0..9ce6a64 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,8 @@ bsd/dev/polaris_touch_i2c.c		standard
+ bsd/dev/polaris_gpu_diag.c		standard
+ bsd/dev/polaris_gpu.c			standard
+ bsd/dev/polaris_gpu_validate.c		standard
++bsd/dev/polaris_rpmh_core.c		standard
++bsd/dev/polaris_rpmh.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index f8150b7..8b09af6 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -11,6 +11,7 @@
+ #include <dev/polaris_gpu_arc.h>
+ #include <dev/polaris_gpu_arc_vote.h>
+ #include <dev/polaris_gpu_pwr.h>
++#include <dev/polaris_rpmh.h>
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+@@ -153,6 +154,7 @@ polaris_gpu_init(void)
+ 	(void)pg_arc_vote_dry_run();
+ 	/* Read-only: report the GPUCC power state ABL left behind. Needs its own opt-in. */
+ 	polaris_gpu_pwr_probe();
++	polaris_rpmh_probe();
+ 	/* CX changes require an owned rails backend, which is still absent. */
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_RAILS)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_rpmh.c b/bsd/dev/polaris_rpmh.c
+new file mode 100644
+index 0000000..18a7e2d
+--- /dev/null
++++ b/bsd/dev/polaris_rpmh.c
+@@ -0,0 +1,83 @@
++/* Polaris APPS DRV2 read-only adapter. No write/time callbacks or authority
++ * certificate are installed: neither a boot argument nor an empty TCS proves
++ * ownership of inherited ARC votes. Send/rail policy is deliberately unwired. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <dev/polaris_rpmh.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern bool polaris_touch_i2c_board(void);
++static vm_offset_t rh_mapping;
++
++static uint32_t
++rh_kernel_read(void *cookie, uint32_t offset)
++{
++	vm_offset_t mapping = (vm_offset_t)cookie;
++	uint32_t value;
++	if ((offset & 3u) || offset > PG_RH_MAP_SIZE - 4) {
++		return UINT32_MAX;
++	}
++	value = *(volatile uint32_t *)(mapping + offset);
++#if defined(__aarch64__)
++	__asm__ volatile("dmb oshld" ::: "memory");
++#endif
++	if (value == UINT32_MAX) {
++		printf("POLARIS RPMH: unreadable DRV2 offset=0x%x\n", offset);
++	}
++	return value;
++}
++
++void
++polaris_rpmh_probe(void)
++{
++	struct pg_rh_snapshot snapshot;
++	struct pg_rh_io io;
++	unsigned int bank, cmd;
++	int optin = 0, result;
++
++	if (!polaris_touch_i2c_board()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("polarisrpmhdiag", &optin, sizeof(optin));
++	if (optin != 1) {
++		return;
++	}
++	if (!rh_mapping) {
++		rh_mapping = ml_io_map(PG_RH_BASE, PG_RH_MAP_SIZE);
++	}
++	if (!rh_mapping) {
++		printf("POLARIS RPMH: DRV2 map failed; no transaction\n");
++		return;
++	}
++	memset(&snapshot, 0, sizeof(snapshot));
++	memset(&io, 0, sizeof(io));
++	io.cookie = (void *)rh_mapping;
++	io.read = rh_kernel_read;
++	result = pg_rh_snapshot(&io, &snapshot);
++	printf("POLARIS RPMH: DRV2@0x179e0000 TCS+0xd00 config=0x%x "
++	    "banks=%u ncpt=%u result=%d\n", snapshot.config, snapshot.banks,
++	    snapshot.commands, result);
++	if (result != PG_RH_OK) {
++		printf("POLARIS RPMH: unsupported/inconsistent snapshot; no transaction\n");
++		return;
++	}
++	printf("POLARIS RPMH: IRQ enable=0x%x status=0x%x (read-only)\n",
++	    snapshot.irq_enabled, snapshot.irq_status);
++	for (bank = 0; bank < PG_RH_BANKS; bank++) {
++		const struct pg_rh_slot *slot = &snapshot.slot[bank];
++		printf("POLARIS RPMH: TCS%u %s idle=0x%x control=0x%x enable=0x%x wait=0x%x\n",
++		    bank, bank < 2 ? "ACTIVE" : (bank < 5 ? "SLEEP" : "WAKE"),
++		    slot->idle, slot->control, slot->enabled, slot->wait);
++		for (cmd = 0; cmd < snapshot.commands; cmd++) {
++			if (slot->enabled & (1u << cmd)) {
++				printf("POLARIS RPMH: TCS%u cmd%u msg=0x%x addr=0x%x data=0x%x\n",
++				    bank, cmd, slot->msgid[cmd], slot->addr[cmd], slot->data[cmd]);
++			}
++		}
++	}
++	printf("POLARIS RPMH: observation only; no lease, no ARC vote, no GPU power\n");
++}
++#endif
+diff --git a/bsd/dev/polaris_rpmh.h b/bsd/dev/polaris_rpmh.h
+new file mode 100644
+index 0000000..1396c19
+--- /dev/null
++++ b/bsd/dev/polaris_rpmh.h
+@@ -0,0 +1,85 @@
++/* Original Polaris RPMh transport. Register facts are documented in
++ * docs/POLARIS-RPMH-TRANSPORT.md; no third-party driver code is included. */
++#ifndef _BSD_DEV_POLARIS_RPMH_H_
++#define _BSD_DEV_POLARIS_RPMH_H_
++#include <sys/types.h>
++#include <stdbool.h>
++#include <dev/polaris_gpu_arc_vote.h>
++
++#define PG_RH_BASE 0x179e0000ull
++#define PG_RH_MAP_SIZE 0x4000u
++#define PG_RH_TCS 0xd00u
++#define PG_RH_STRIDE 0x2a0u
++#define PG_RH_COMMANDS 16u
++#define PG_RH_BANKS 8u
++#define PG_RH_ACTIVE 2u
++#define PG_RH_IRQ_EN (PG_RH_TCS + 0u)
++#define PG_RH_IRQ_STATUS (PG_RH_TCS + 4u)
++#define PG_RH_IRQ_CLEAR (PG_RH_TCS + 8u)
++#define PG_RH_WAIT 0x10u
++#define PG_RH_CONTROL 0x14u
++#define PG_RH_STATUS 0x18u
++#define PG_RH_ENABLE 0x1cu
++#define PG_RH_MSGID 0x30u
++#define PG_RH_ADDR 0x34u
++#define PG_RH_DATA 0x38u
++#define PG_RH_CMD_STATUS 0x3cu
++#define PG_RH_CMD_STRIDE 0x14u
++#define PG_RH_WRITE 0x10108u
++#define PG_RH_COMPLETE 0x10100u
++#define PG_RH_AMC 0x10000u
++#define PG_RH_TRIGGER 0x1000000u
++
++enum pg_rh_result {
++	PG_RH_OK, PG_RH_INVALID, PG_RH_UNSUPPORTED, PG_RH_BUSY,
++	PG_RH_TIMEOUT, PG_RH_IO, PG_RH_DENIED, PG_RH_QUARANTINED
++};
++
++/* All offsets are relative to PG_RH_BASE, not PG_RH_TCS. Read/write callbacks
++ * supply Device-memory ordering. Time must be monotonic; pause cannot sleep
++ * beyond the caller's deadline. The core performs no physical mapping. */
++struct pg_rh_io {
++	void *cookie;
++	uint32_t (*read)(void *, uint32_t);
++	void (*write)(void *, uint32_t, uint32_t);
++	uint64_t (*now_us)(void *);
++	void (*pause_us)(void *, unsigned int);
++};
++
++struct pg_rh_slot {
++	uint32_t idle, control, enabled, wait;
++	uint32_t msgid[PG_RH_COMMANDS], addr[PG_RH_COMMANDS], data[PG_RH_COMMANDS];
++};
++
++struct pg_rh_snapshot {
++	uint32_t id, solver, config, irq_enabled, irq_status;
++	unsigned int banks, commands;
++	struct pg_rh_slot slot[PG_RH_BANKS];
++};
++
++/* These are caller obligations, never conclusions inferred from an empty TCS.
++ * The current XNU adapter does not attest any of them and cannot claim/send.
++ * aggregate_votes_owned includes inherited ARC votes, not just TCS storage. */
++struct pg_rh_authority {
++	bool exclusive_apps_drv, idle_inhibited, aggregate_votes_owned;
++};
++
++struct pg_rh_transport {
++	struct pg_rh_io io;
++	unsigned int commands;
++	unsigned int initialized, locked, quarantined;
++};
++
++/* Pure snapshot operation: read callback only; no ownership is acquired. */
++int pg_rh_snapshot(const struct pg_rh_io *, struct pg_rh_snapshot *);
++/* One zero-initialized transport per exclusively owned DRV. No MMIO writes. */
++int pg_rh_claim(struct pg_rh_transport *, const struct pg_rh_io *,
++    const struct pg_rh_authority *);
++/* ACTIVE-only ARC batch, 1..3 distinct validated cx/mx/gfx selectors. The
++ * caller owns rail policy. Success is a TCS ACK, not voltage/clock ownership.
++ * Cleanup restores TCS programming, never rolls back the ARC vote itself.
++ * After any uncertain mutation: quarantine until reboot; never retry/reset. */
++int pg_rh_send(struct pg_rh_transport *, const struct pg_vote *, unsigned int,
++    unsigned int timeout_us);
++void polaris_rpmh_probe(void);
++#endif
+diff --git a/bsd/dev/polaris_rpmh_core.c b/bsd/dev/polaris_rpmh_core.c
+new file mode 100644
+index 0000000..64a33a2
+--- /dev/null
++++ b/bsd/dev/polaris_rpmh_core.c
+@@ -0,0 +1,296 @@
++/* Polaris ACTIVE TCS transaction engine, independently written from the
++ * documented register interface. It is compiled into XNU but the runtime
++ * adapter currently exposes only read-only snapshots, not a send entry point.
++ * The same compiled source is fault-tested with a simulated register device. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <dev/polaris_rpmh.h>
++
++static uint32_t
++rh_slot_off(unsigned int bank, uint32_t reg)
++{
++	return PG_RH_TCS + bank * PG_RH_STRIDE + reg;
++}
++
++int
++pg_rh_snapshot(const struct pg_rh_io *io, struct pg_rh_snapshot *out)
++{
++	unsigned int bank, cmd;
++
++	if (!io || !io->read || !out) {
++		return PG_RH_INVALID;
++	}
++	memset(out, 0, sizeof(*out));
++	out->config = io->read(io->cookie, 0xc);
++	out->banks = (out->config >> (6 * 2)) & 0x3fu;
++	out->commands = (out->config >> 27) & 0x1fu;
++	/* Verified geometry for this APPS DRV2 slice: ACTIVE 2 + SLEEP 3 +
++	 * WAKE 3 = 8 slots, 16 commands per TCS. Reject unknown layouts rather
++	 * than applying offsets or command widths from another SoC. */
++	if (out->config == UINT32_MAX || out->banks != PG_RH_BANKS ||
++	    out->commands != PG_RH_COMMANDS) {
++		return PG_RH_UNSUPPORTED;
++	}
++	out->irq_enabled = io->read(io->cookie, PG_RH_IRQ_EN);
++	out->irq_status = io->read(io->cookie, PG_RH_IRQ_STATUS);
++	if (out->irq_enabled == UINT32_MAX || out->irq_status == UINT32_MAX) {
++		return PG_RH_IO;
++	}
++	for (bank = 0; bank < PG_RH_BANKS; bank++) {
++		struct pg_rh_slot *slot = &out->slot[bank];
++		uint32_t base = rh_slot_off(bank, 0);
++
++		slot->idle = io->read(io->cookie, base + PG_RH_STATUS);
++		slot->control = io->read(io->cookie, base + PG_RH_CONTROL);
++		slot->enabled = io->read(io->cookie, base + PG_RH_ENABLE);
++		slot->wait = io->read(io->cookie, base + PG_RH_WAIT);
++		if (slot->idle > 1 || slot->control == UINT32_MAX ||
++		    slot->enabled & ~((1u << out->commands) - 1u) ||
++		    slot->wait & ~((1u << out->commands) - 1u)) {
++			return PG_RH_IO;
++		}
++		for (cmd = 0; cmd < out->commands; cmd++) {
++			uint32_t offset = base + cmd * PG_RH_CMD_STRIDE;
++			slot->msgid[cmd] = io->read(io->cookie, offset + PG_RH_MSGID);
++			slot->addr[cmd] = io->read(io->cookie, offset + PG_RH_ADDR);
++			slot->data[cmd] = io->read(io->cookie, offset + PG_RH_DATA);
++		}
++	}
++	return PG_RH_OK;
++}
++
++int
++pg_rh_claim(struct pg_rh_transport *ctx, const struct pg_rh_io *io,
++    const struct pg_rh_authority *authority)
++{
++	struct pg_rh_snapshot snapshot;
++	int result;
++
++	if (!ctx || !io || !io->read || !io->write || !io->now_us || !io->pause_us) {
++		return PG_RH_INVALID;
++	}
++	if (!authority || !authority->exclusive_apps_drv || !authority->idle_inhibited ||
++	    !authority->aggregate_votes_owned) {
++		return PG_RH_DENIED;
++	}
++	if (ctx->initialized || ctx->quarantined) {
++		return PG_RH_DENIED;
++	}
++	result = pg_rh_snapshot(io, &snapshot);
++	if (result != PG_RH_OK) {
++		return result;
++	}
++	ctx->io = *io;
++	ctx->commands = snapshot.commands;
++	ctx->initialized = 1;
++	return PG_RH_OK;
++}
++
++static bool
++rh_empty(const struct pg_rh_snapshot *snapshot, unsigned int bank)
++{
++	const struct pg_rh_slot *slot = &snapshot->slot[bank];
++	return slot->idle == 1 && slot->control == 0 && slot->enabled == 0 &&
++	       slot->wait == 0 && !(snapshot->irq_status & (1u << bank));
++}
++
++/* A global elapsed-time deadline AND a finite callback budget bound every poll,
++ * even when a defective timer stops advancing or jumps backwards. */
++static bool
++rh_continue(struct pg_rh_transport *ctx, uint64_t start, unsigned int timeout,
++    unsigned int *budget)
++{
++	uint64_t now = ctx->io.now_us(ctx->io.cookie);
++	if (!*budget || now < start || now - start >= timeout) {
++		return false;
++	}
++	--*budget;
++	return true;
++}
++
++static bool
++rh_store(struct pg_rh_transport *ctx, uint32_t off, uint32_t value,
++    uint64_t start, unsigned int timeout, unsigned int *budget)
++{
++	if (!rh_continue(ctx, start, timeout, budget)) {
++		return false;
++	}
++	ctx->io.write(ctx->io.cookie, off, value);
++	do {
++		if (ctx->io.read(ctx->io.cookie, off) == value) {
++			return true;
++		}
++		ctx->io.pause_us(ctx->io.cookie, 1);
++	} while (rh_continue(ctx, start, timeout, budget));
++	return false;
++}
++
++int
++pg_rh_send(struct pg_rh_transport *ctx, const struct pg_vote *votes,
++    unsigned int count, unsigned int timeout)
++{
++	struct pg_rh_snapshot snapshot;
++	uint64_t start;
++	unsigned int budget = 100000u, bank, i, j;
++	uint32_t base, bit, mask, irq;
++	int result;
++	bool done = false;
++
++	if (!ctx || !votes || !count || count > 3 || !timeout || timeout > 100000u) {
++		return PG_RH_INVALID;
++	}
++	if (!ctx->initialized) {
++		return PG_RH_DENIED;
++	}
++	if (__atomic_exchange_n(&ctx->locked, 1, __ATOMIC_ACQUIRE)) {
++		return PG_RH_BUSY;
++	}
++	result = PG_RH_QUARANTINED;
++	if (ctx->quarantined) {
++		goto unlock;
++	}
++	result = PG_RH_INVALID;
++	for (i = 0; i < count; i++) {
++		struct pg_vote expected;
++		if (!pg_arc_compose_selector(votes[i].resource, votes[i].selector, &expected) ||
++		    votes[i].addr != expected.addr || votes[i].data != expected.data ||
++		    votes[i].consumer_level != expected.consumer_level) {
++			goto unlock;
++		}
++		for (j = 0; j < i; j++) {
++			if (votes[i].addr == votes[j].addr) {
++				goto unlock;
++			}
++		}
++	}
++	result = pg_rh_snapshot(&ctx->io, &snapshot);
++	if (result != PG_RH_OK || snapshot.commands != ctx->commands) {
++		if (result == PG_RH_OK) {
++			result = PG_RH_UNSUPPORTED;
++		}
++		goto unlock;
++	}
++	/* Never reuse SLEEP/WAKE/CONTROL. Any inherited enabled ACTIVE command
++	 * to one of our resources is a conflict, even when its TCS looks idle. */
++	result = PG_RH_BUSY;
++	for (bank = 0; bank < PG_RH_ACTIVE; bank++) {
++		for (i = 0; i < ctx->commands; i++) {
++			if (!(snapshot.slot[bank].enabled & (1u << i))) {
++				continue;
++			}
++			for (j = 0; j < count; j++) {
++				if (snapshot.slot[bank].addr[i] == votes[j].addr) {
++					goto unlock;
++				}
++			}
++		}
++	}
++	for (bank = 0; bank < PG_RH_ACTIVE; bank++) {
++		if (rh_empty(&snapshot, bank)) {
++			break;
++		}
++	}
++	if (bank == PG_RH_ACTIVE) {
++		goto unlock;
++	}
++	base = rh_slot_off(bank, 0);
++	bit = 1u << bank;
++	mask = (1u << count) - 1u;
++	start = ctx->io.now_us(ctx->io.cookie);
++	/* From the first attempted mutation, a failure must remain quarantined.
++	 * Never reset a possibly executing slot or send a compensating rail vote. */
++	ctx->quarantined = 1;
++	result = PG_RH_TIMEOUT;
++#define RH_STORE(offset, value) do { \
++	if (!rh_store(ctx, (offset), (value), start, timeout, &budget)) goto unlock; \
++} while (0)
++	irq = ctx->io.read(ctx->io.cookie, PG_RH_IRQ_EN);
++	if (irq == UINT32_MAX) {
++		result = PG_RH_IO;
++		goto unlock;
++	}
++	RH_STORE(PG_RH_IRQ_EN, irq & ~bit);
++	/* Fresh inspection after IRQ masking, before touching the payload. */
++	if (ctx->io.read(ctx->io.cookie, base + PG_RH_STATUS) != 1 ||
++	    ctx->io.read(ctx->io.cookie, base + PG_RH_CONTROL) != 0 ||
++	    ctx->io.read(ctx->io.cookie, base + PG_RH_ENABLE) != 0 ||
++	    ctx->io.read(ctx->io.cookie, base + PG_RH_WAIT) != 0 ||
++	    (ctx->io.read(ctx->io.cookie, PG_RH_IRQ_STATUS) & bit)) {
++		result = PG_RH_BUSY;
++		goto unlock;
++	}
++	for (i = 0; i < count; i++) {
++		uint32_t offset = base + i * PG_RH_CMD_STRIDE;
++		RH_STORE(offset + PG_RH_MSGID, PG_RH_WRITE);
++		RH_STORE(offset + PG_RH_ADDR, votes[i].addr);
++		RH_STORE(offset + PG_RH_DATA, votes[i].data);
++	}
++	RH_STORE(base + PG_RH_WAIT, mask);
++	RH_STORE(base + PG_RH_ENABLE, mask);
++	RH_STORE(base + PG_RH_CONTROL, PG_RH_AMC);
++	/* Recheck fresh IRQ immediately before triggering; stale command status
++	 * cannot by itself complete a new transaction. Trigger may self-clear. */
++	if (ctx->io.read(ctx->io.cookie, PG_RH_IRQ_STATUS) & bit) {
++		result = PG_RH_IO;
++		goto unlock;
++	}
++	if (!rh_continue(ctx, start, timeout, &budget)) {
++		goto unlock;
++	}
++	ctx->io.write(ctx->io.cookie, base + PG_RH_CONTROL, PG_RH_AMC | PG_RH_TRIGGER);
++	while (rh_continue(ctx, start, timeout, &budget)) {
++		uint32_t status = ctx->io.read(ctx->io.cookie, PG_RH_IRQ_STATUS);
++		bool complete = status != UINT32_MAX && (status & bit) != 0 &&
++		    ctx->io.read(ctx->io.cookie, base + PG_RH_STATUS) == 1;
++		for (i = 0; i < count; i++) {
++			uint32_t cmd_status = ctx->io.read(ctx->io.cookie,
++			    base + PG_RH_CMD_STATUS + i * PG_RH_CMD_STRIDE);
++			complete &= cmd_status != UINT32_MAX &&
++			    (cmd_status & PG_RH_COMPLETE) == PG_RH_COMPLETE;
++		}
++		if (complete) {
++			done = true;
++			break;
++		}
++		ctx->io.pause_us(ctx->io.cookie, 1);
++	}
++	if (!done) {
++		goto unlock;
++	}
++	/* Only proven completion permits TCS cleanup. Restore old unused payload
++	 * words and our IRQ-enable bit; leave all other slots/IRQ sources alone. */
++	RH_STORE(base + PG_RH_CONTROL, PG_RH_AMC);
++	RH_STORE(base + PG_RH_CONTROL, 0);
++	RH_STORE(base + PG_RH_ENABLE, 0);
++	RH_STORE(base + PG_RH_WAIT, 0);
++	for (i = 0; i < count; i++) {
++		uint32_t offset = base + i * PG_RH_CMD_STRIDE;
++		RH_STORE(offset + PG_RH_MSGID, snapshot.slot[bank].msgid[i]);
++		RH_STORE(offset + PG_RH_ADDR, snapshot.slot[bank].addr[i]);
++		RH_STORE(offset + PG_RH_DATA, snapshot.slot[bank].data[i]);
++	}
++	if (!rh_continue(ctx, start, timeout, &budget)) {
++		goto unlock;
++	}
++	ctx->io.write(ctx->io.cookie, PG_RH_IRQ_CLEAR, bit);
++	if (ctx->io.read(ctx->io.cookie, PG_RH_IRQ_STATUS) & bit) {
++		result = PG_RH_IO;
++		goto unlock;
++	}
++	{
++		uint32_t current = ctx->io.read(ctx->io.cookie, PG_RH_IRQ_EN);
++		if (current == UINT32_MAX) {
++			result = PG_RH_IO;
++			goto unlock;
++		}
++		RH_STORE(PG_RH_IRQ_EN, (current & ~bit) | (irq & bit));
++	}
++	ctx->quarantined = 0;
++	result = PG_RH_OK;
++#undef RH_STORE
++unlock:
++	__atomic_store_n(&ctx->locked, 0, __ATOMIC_RELEASE);
++	return result;
++}
++#endif

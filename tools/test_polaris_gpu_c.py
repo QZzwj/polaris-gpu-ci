@@ -46,7 +46,7 @@ class GpuCTests(unittest.TestCase):
         start = next(i for i, l in enumerate(lines) if l.startswith('+++ b/bsd/dev/polaris_gpu.c'))
         (dev / 'polaris_gpu.c').write_text(''.join(l[1:] for l in lines[start + 1:]
                                                 if l.startswith('+')), newline='\n')
-        for number in range(94, 104):
+        for number in range(94, 105):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -76,6 +76,7 @@ class GpuCTests(unittest.TestCase):
 #include <dev/polaris_gpu_arc_vote.h>
 #include <dev/polaris_gpu_arc.h>
 #include <dev/polaris_gpu_pwr.h>
+#include <dev/polaris_rpmh.h>
 #include <pexpert/device_tree.h>
 #include <vm/pmap.h>
 #include <stdio.h>
@@ -123,6 +124,8 @@ int PE_parse_boot_argn(const char *name, void *out, int size) {
     return 1;
 }
 vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size) {
+    extern uint32_t rh_regs[];
+    if (phys == 0x179e0000 && size == 0x4000u) return (vm_offset_t)rh_regs;
     power_maps++;
     if (phys != 0x05091000 || size != sizeof(power_regs)) {
         power_bad_map = 1;
@@ -205,6 +208,89 @@ EXPORT const char *diag_run(unsigned bringup) {
     return power_text;
 }
 EXPORT unsigned diag_dt_reads(void) { return dt_reads; }
+/* ---- Simulated RPMh DRV2, not a hardware emulator. ---- */
+uint32_t rh_regs[0x4000 / 4];
+static uint32_t rh_other[0x4000 / 4];
+static uint64_t rh_now;
+static unsigned rh_writes, rh_pauses, rh_complete_after, rh_bad_write;
+static unsigned rh_seen_addr, rh_seen_data;
+static unsigned rh_sent_selector, rh_sent_level;
+static int rh_freeze_time, rh_fail_verify;
+static struct pg_rh_transport rh_ctx;
+#define RHOFF(tcs, reg) ((0xd00u + (tcs) * 0x2a0u + (reg)) / 4)
+static uint32_t rh_read(void *cookie, uint32_t off) {
+    (void)cookie;
+    if ((off & 3) || off > 0x3ffc) { rh_bad_write = 1; return UINT32_MAX; }
+    return rh_regs[off / 4];
+}
+static void rh_write(void *cookie, uint32_t off, uint32_t value) {
+    (void)cookie;
+    if ((off & 3) || off > 0x3ffc) { rh_bad_write = 1; return; }
+    rh_writes++;
+    if (rh_fail_verify && off == 0xd00 + 0x1c) return;
+    rh_regs[off / 4] = value;
+    if (off == 0xd00 + 8) rh_regs[0xd00 / 4 + 1] &= ~value;
+    if (off == 0xd00 + 0x34) rh_seen_addr = value;
+    if (off == 0xd00 + 0x38) rh_seen_data = value;
+    if (off >= 0xd00 && (off - 0xd00) % 0x2a0 == 0x14 && (value & 0x1000000u)) {
+        unsigned tcs = (off - 0xd00) / 0x2a0;
+        if (tcs >= 2 || rh_complete_after == 0) return;
+        rh_regs[0xd00 / 4 + 1] |= 1u << tcs;
+        rh_regs[RHOFF(tcs, 0x18)] = 1u;
+        for (unsigned i = 0; i < rh_complete_after; i++)
+            rh_regs[RHOFF(tcs, 0x3c + i * 0x14)] = 0x10100u;
+    }
+}
+static uint64_t rh_time(void *cookie) { (void)cookie; return rh_now; }
+static void rh_pause(void *cookie, unsigned us) {
+    (void)cookie; rh_pauses++; if (!rh_freeze_time) rh_now += us;
+}
+EXPORT void rh_reset(unsigned banks, unsigned ncpt, unsigned complete_after) {
+    memset(rh_regs, 0, sizeof(rh_regs));
+    rh_regs[3] = (banks << 12) | (ncpt << 27);
+    for (unsigned i = 0; i < 8; i++) rh_regs[RHOFF(i, 0x18)] = 1;
+    memcpy(rh_other, rh_regs, sizeof(rh_regs));
+    memset(&rh_ctx, 0, sizeof(rh_ctx));
+    rh_now = 100; rh_writes = rh_pauses = 0; rh_bad_write = 0;
+    rh_complete_after = complete_after; rh_freeze_time = rh_fail_verify = 0;
+}
+EXPORT void rh_freeze(int freeze) { rh_freeze_time = freeze; }
+EXPORT void rh_fail_irq_verify(int fail) { rh_fail_verify = fail; }
+EXPORT int rh_claim_mock(int drv, int idle, int votes) {
+    struct pg_rh_io io = {0, rh_read, rh_write, rh_time, rh_pause};
+    struct pg_rh_authority a = {(bool)drv, (bool)idle, (bool)votes};
+    return pg_rh_claim(&rh_ctx, &io, &a);
+}
+EXPORT int rh_snapshot_mock(void) {
+    struct pg_rh_io io = {0, rh_read, NULL, NULL, NULL};
+    struct pg_rh_snapshot s;
+    int r = pg_rh_snapshot(&io, &s);
+    return r ? -r : (int)s.commands;
+}
+EXPORT void rh_set_config(unsigned config) { rh_regs[3] = config; }
+EXPORT void rh_occupy(unsigned tcs, unsigned cmd, unsigned addr) {
+    rh_regs[RHOFF(tcs, 0x1c)] |= 1u << cmd;
+    rh_regs[RHOFF(tcs, 0x34 + cmd * 0x14)] = addr;
+}
+EXPORT void rh_set_irq(unsigned status) { rh_regs[0xd00 / 4 + 1] = status; }
+EXPORT int rh_send_mock(const char *row, unsigned selector, unsigned timeout) {
+    struct pg_vote v;
+    if (!pg_arc_compose_selector(row, selector, &v)) return -100;
+    rh_sent_selector = v.selector; rh_sent_level = v.consumer_level;
+    return pg_rh_send(&rh_ctx, &v, 1, timeout);
+}
+EXPORT unsigned rh_write_count(void) { return rh_writes; }
+EXPORT unsigned rh_pause_count(void) { return rh_pauses; }
+EXPORT int rh_bad(void) { return rh_bad_write; }
+EXPORT int rh_quarantined(void) { return (int)rh_ctx.quarantined; }
+EXPORT void rh_lock(void) { rh_ctx.locked = 1; }
+EXPORT unsigned rh_read_off(unsigned off) { return rh_regs[off / 4]; }
+EXPORT unsigned rh_sent_composed(unsigned which) {
+    return which ? rh_sent_level : rh_sent_selector;
+}
+EXPORT int rh_sleep_wake_unchanged(void) {
+    return !memcmp(&rh_regs[RHOFF(2, 0)], &rh_other[RHOFF(2, 0)], 6 * 0x2a0);
+}
 ''')
         library = root / ('gpu.dll' if os.name == 'nt' else 'gpu.so')
         shared_flag = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
@@ -217,7 +303,9 @@ EXPORT unsigned diag_dt_reads(void) { return dt_reads; }
                            str(dev / 'polaris_gpu_pwron.c'),
                            str(dev / 'polaris_gpu_diag.c'),
                            str(dev / 'polaris_gpu_validate.c'),
-                           str(dev / 'polaris_gpu.c'), '-o', str(library)]
+                           str(dev / 'polaris_gpu.c'),
+                           str(dev / 'polaris_rpmh_core.c'),
+                           str(dev / 'polaris_rpmh.c'), '-o', str(library)]
         if os.name != 'nt':
             argv.append('-fPIC')
         result = subprocess.run(argv, capture_output=True, text=True, timeout=180)
@@ -247,6 +335,20 @@ EXPORT unsigned diag_dt_reads(void) { return dt_reads; }
         cls.lib.diag_set_dram.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
         cls.lib.diag_run.argtypes = [ctypes.c_uint]
         cls.lib.diag_run.restype = ctypes.c_char_p
+        for name in ('rh_reset', 'rh_claim_mock', 'rh_snapshot_mock', 'rh_send_mock',
+                     'rh_write_count', 'rh_pause_count', 'rh_bad', 'rh_quarantined',
+                     'rh_read_off', 'rh_sleep_wake_unchanged'):
+            fn = getattr(cls.lib, name)
+            fn.restype = ctypes.c_int if name not in ('rh_reset',) else None
+        cls.lib.rh_claim_mock.argtypes = [ctypes.c_int] * 3
+        cls.lib.rh_send_mock.argtypes = [ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint]
+        cls.lib.rh_occupy.argtypes = [ctypes.c_uint] * 3
+        cls.lib.rh_set_irq.argtypes = [ctypes.c_uint]
+        cls.lib.rh_set_config.argtypes = [ctypes.c_uint]
+        cls.lib.rh_reset.argtypes = [ctypes.c_uint] * 3
+        cls.lib.rh_bad.restype = ctypes.c_int
+        cls.lib.rh_write_count.restype = ctypes.c_uint
+        cls.lib.rh_read_off.restype = ctypes.c_uint
         cls.lib.diag_dt_reads.restype = ctypes.c_uint
 
     def test_c_matches_protocol_for_every_selector(self):
@@ -364,6 +466,102 @@ EXPORT unsigned diag_dt_reads(void) { return dt_reads; }
         self.assertNotIn('CX GDSCR before=', log)
         self.assertEqual(self.lib.power_map_count(), 1)
         self.assertEqual(self.lib.power_memory_unchanged(), 1)
+
+
+class RpmhTests(GpuCTests):
+    """Fault-inject the actual compiled TCS engine; no board or hardware."""
+    def test_snapshot_is_readonly_and_rejects_unknown_geometry(self):
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_snapshot_mock(), 16)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        for config in (0, (7 << 12) | (16 << 27), (8 << 12) | (15 << 27),
+                       (8 << 12) | (17 << 27), 0xffffffff):
+            self.lib.rh_set_config(config)
+            self.assertLess(self.lib.rh_snapshot_mock(), 0)
+            self.assertEqual(self.lib.rh_write_count(), 0)
+
+    def test_claim_requires_every_authority_fact_and_never_writes(self):
+        for facts in ((0, 1, 1), (1, 0, 1), (1, 1, 0)):
+            self.lib.rh_reset(8, 16, 1)
+            self.assertEqual(self.lib.rh_claim_mock(*facts), 6)
+            self.assertEqual(self.lib.rh_write_count(), 0)
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+
+    def test_completed_active_write_restores_payload_and_leaves_sleep_wake(self):
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 1000), 0)
+        self.assertEqual(self.lib.rh_bad(), 0)
+        self.assertEqual(self.lib.rh_sent_composed(0), 9)
+        self.assertEqual(self.lib.rh_sent_composed(1), 0x1a0)
+        self.assertEqual(self.lib.rh_read_off(0xd00 + 0x34), 0)
+        self.assertEqual(self.lib.rh_read_off(0xd00 + 0x1c), 0)
+        self.assertEqual(self.lib.rh_read_off(0xd00 + 0x14), 0)
+        self.assertEqual(self.lib.rh_sleep_wake_unchanged(), 1)
+        self.assertEqual(self.lib.rh_quarantined(), 0)
+
+    def test_inflight_conflict_refuses_without_writes(self):
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.lib.rh_occupy(1, 3, 0x30050)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 1000), 3)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        self.assertEqual(self.lib.rh_quarantined(), 0)
+
+    def test_busy_and_stale_irq_are_rejected_before_any_mutation(self):
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.lib.rh_lock()
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 1000), 3)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.lib.rh_set_irq(3)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 1000), 3)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        # A stale IRQ on ACTIVE0 alone must not poison the clean ACTIVE1 slot.
+        self.lib.rh_set_irq(1)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 1000), 0)
+        self.assertEqual(self.lib.rh_read_off(0xd00 + 0x2a0 + 0x34), 0)
+        self.assertEqual(self.lib.rh_sleep_wake_unchanged(), 1)
+
+    def test_timeout_and_missing_completion_quarantine_and_never_retry(self):
+        for complete in (0, 0):
+            self.lib.rh_reset(8, 16, complete)
+            self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+            self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 4)
+            self.assertEqual(self.lib.rh_quarantined(), 1)
+            writes = self.lib.rh_write_count()
+            self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 7)
+            self.assertEqual(self.lib.rh_write_count(), writes)
+            break
+
+    def test_frozen_clock_still_bounded_and_only_active_slot_changes(self):
+        self.lib.rh_reset(8, 16, 0)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.lib.rh_freeze(1)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 4)
+        self.assertLess(self.lib.rh_pause_count(), 200001)
+        self.assertEqual(self.lib.rh_sleep_wake_unchanged(), 1)
+
+    def test_failed_readback_quarantines(self):
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.lib.rh_fail_irq_verify(1)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 4)
+        self.assertEqual(self.lib.rh_quarantined(), 1)
+
+    def test_invalid_selector_and_unsupported_layout_do_not_write(self):
+        self.lib.rh_reset(8, 16, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 0)
+        self.assertEqual(self.lib.rh_send_mock(b'vrm.cx', 0, 100), -100)
+        self.assertEqual(self.lib.rh_write_count(), 0)
+        self.lib.rh_reset(8, 15, 1)
+        self.assertEqual(self.lib.rh_claim_mock(1, 1, 1), 2)
+        self.assertEqual(self.lib.rh_send_mock(b'gfx.lvl', 9, 100), 6)
+        self.assertEqual(self.lib.rh_write_count(), 0)
 
 
 if __name__ == '__main__':
