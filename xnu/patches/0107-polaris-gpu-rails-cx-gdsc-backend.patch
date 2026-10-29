@@ -1,0 +1,292 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 8b09af6..1951157 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -44,6 +44,8 @@ struct polaris_gpu_context {
+ 	unsigned int owned;
+ };
+ 
++#define POLARIS_GPU_OWN_CX	(1u << 0)
++
+ static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
+ 
+ /* Written once by the firmware stage; read-only afterwards. */
+@@ -57,7 +59,7 @@ static const char *const polaris_gpu_stage_name[POLARIS_GPU_STAGE_COUNT] = {
+ /*
+  * Only an acquired resource may be released. Resource-specific release
+  * callbacks must be installed before ANY power or mapping code is enabled.
+- * No stages after the board stage have a backend in this revision.
++ * Only the rails stage has a bounded backend in this revision.
+  */
+ static bool
+ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+@@ -80,6 +82,21 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 		/* Validation acquires nothing; owned stays zero. */
+ 		return true;
+ 	}
++	if (stage == POLARIS_GPU_RAILS) {
++		/*
++		 * The first hardware stage: only the CX GDSC, only through the
++		 * rails backend, and only when its own opt-in is present. GX
++		 * remains with the GMU; no clock, bus, SMMU or GPU register is
++		 * touched. A refusal claims nothing.
++		 */
++		if (!polaris_gpu_rails_enter()) {
++			printf("POLARIS GPU: rails request refused; no ownership claimed\n");
++			return false;
++		}
++		ctx->owned |= POLARIS_GPU_OWN_CX;
++		ctx->completed++;
++		return true;
++	}
+ 	if (stage != POLARIS_GPU_BOARD) {
+ 		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
+ 		    polaris_gpu_stage_name[stage]);
+@@ -103,7 +120,12 @@ polaris_gpu_unwind(struct polaris_gpu_context *ctx, bool idle_confirmed)
+ 		printf("POLARIS GPU: idle unconfirmed; quarantined, CPU display unchanged\n");
+ 		return;
+ 	}
+-	/* No hardware release is permitted while no backend owns a resource. */
++	/* Release only the resources this driver actually acquired, in reverse. */
++	if (ctx->owned & POLARIS_GPU_OWN_CX) {
++		polaris_gpu_rails_exit();
++		ctx->owned &= ~POLARIS_GPU_OWN_CX;
++	}
++	/* No hardware release is permitted for anything without a backend. */
+ 	if (ctx->owned != 0) {
+ 		ctx->state = POLARIS_GPU_QUARANTINED;
+ 		printf("POLARIS GPU: owned resource lacks release backend; quarantined\n");
+@@ -159,9 +181,13 @@ polaris_gpu_init(void)
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_RAILS)) {
+ 		goto fail;
+ 	}
+-	/* Unreachable until individually owned, bounded backends are installed. */
+-	polaris_gpu.state = POLARIS_GPU_IDLE;
+-	return;
++	/*
++	 * CX is now owned. There is still no clock backend, so the gate must
++	 * refuse here and unwind must release CX in reverse order rather than
++	 * leave an ownerless domain powered.
++	 */
++	(void)polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_CLOCKS);
++	goto fail;
+ fail:
+ 	polaris_gpu_unwind(&polaris_gpu, true);
+ 	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index 4dc9de0..eaa0341 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -6,6 +6,14 @@
+ #define _BSD_DEV_POLARIS_GPU_PWR_H_
+ 
+ void polaris_gpu_pwr_probe(void);
+-void polaris_gpu_cx_on(void);
++
++/*
++ * Rails stage: one controlled CX GDSC request. enter() returns true only when
++ * this driver observed PWR_ON clear before its own write and PWR_ON set after
++ * it. exit() is a no-op unless enter() succeeded and restores the pre-write
++ * register value.
++ */
++int polaris_gpu_rails_enter(void);
++void polaris_gpu_rails_exit(void);
+ 
+ #endif /* _BSD_DEV_POLARIS_GPU_PWR_H_ */
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index c690660..e7f71c8 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -1,14 +1,20 @@
+ /*
+- * Polaris A630 CX power-domain request -- the first step that writes hardware.
++ * Polaris A630 CX power-domain request -- the rails-stage backend.
+  *
+  * Scope, deliberately narrow:
+  *   - only CX GDSCR at GPUCC+0x106c;
+  *   - only bit 0 (SW_COLLAPSE), cleared to request power, with every other bit
+  *     preserved by a read-modify-write;
+- *   - bounded polling of PWR_ON (bit 31) with a read iteration budget instead of a
+- *     timer, because no delay primitive is in use anywhere in this driver set;
+- *   - on timeout the original register value is written back and the caller is told
+- *     the request failed;
++ *   - only after the caller reached the rails stage and only with the separate
++ *     `polarisgpuon=1` opt-in;
++ *   - bounded polling of PWR_ON (bit 31) with a 1 us delay and a finite
++ *     iteration budget mirroring the vendor driver's 100 us budget;
++ *   - PWR_ON already set before the write means foreign ownership: observe,
++ *     never write, never claim;
++ *   - on timeout the original register value is written back and the caller is
++ *     told the request failed;
++ *   - a successful enter records the original value; exit restores it exactly
++ *     and is a no-op unless enter succeeded;
+  *   - GX GDSCR is never touched: a630v2-bringup-contract.md requires GX to be
+  *     requested through the GMU.
+  *
+@@ -16,10 +22,6 @@
+  *   PWR_ON_MASK = BIT(31), SW_COLLAPSE_MASK = BIT(0), HW_CONTROL_MASK = BIT(1),
+  *   SW_OVERRIDE_MASK = BIT(2). gdsc_enable() clears SW_COLLAPSE and polls PWR_ON
+  *   with a 100 us budget; that is the sequence mirrored here.
+- *
+- * A PWR_ON bit that is already set is reported as foreign/unknown ownership. Per the
+- * contract, observing PWR_ON is not acquiring the domain, so nothing is claimed and
+- * no vote is recorded.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+@@ -27,6 +29,7 @@
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
++#include <machine/machine_routines.h>
+ #include <dev/polaris_gpu_pwr.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -47,8 +50,17 @@ extern bool polaris_touch_i2c_board(void);
+ #define PG_GDSCR_PWR_ON       (1u << 31)
+ #define PG_GDSCR_SW_COLLAPSE  (1u << 0)
+ 
+-/* Bounded poll budget. The vendor driver allows 100 us; we count reads instead. */
+-#define PG_POLL_READS 2000u
++/* Bounded poll budget: 200 iterations of a 1 us delay. */
++#define PG_POLL_US 200u
++
++static volatile uint32_t *pg_cx_regs;
++static uint32_t pg_cx_saved;
++static int pg_cx_owned;
++
++#ifdef PG_PWR_TEST
++extern void pg_pwr_test_after_write(uint32_t, uint32_t);
++void pg_pwr_test_reset(void);
++#endif
+ 
+ static inline uint32_t
+ pg_rd32(volatile uint32_t *base, uint32_t off)
+@@ -60,54 +72,103 @@ static inline void
+ pg_wr32(volatile uint32_t *base, uint32_t off, uint32_t value)
+ {
+ 	base[off / 4u] = value;
++#ifdef PG_PWR_TEST
++	pg_pwr_test_after_write(off, value);
++#endif
+ }
+ 
+-void
+-polaris_gpu_cx_on(void)
++static bool
++pg_cx_map(void)
+ {
+ 	vm_offset_t virt;
+-	volatile uint32_t *regs;
++
++	if (pg_cx_regs != NULL) {
++		return true;
++	}
++	virt = ml_io_map(PG_GPUCC_MAP, PG_GPUCC_MAP_SZ);
++	if (virt == 0) {
++		printf("POLARIS PWR: cannot map GPUCC; power request skipped\n");
++		return false;
++	}
++	pg_cx_regs = (volatile uint32_t *)virt;
++	return true;
++}
++
++int
++polaris_gpu_rails_enter(void)
++{
+ 	int optin = 0;
+ 	uint32_t before, after, restored;
+ 	unsigned int i;
+ 
++	if (pg_cx_owned) {
++		return 1;
++	}
+ 	if (!polaris_touch_i2c_board()) {
+-		return;
++		return 0;
+ 	}
+ 	(void)PE_parse_boot_argn("polarisgpuon", &optin, sizeof(optin));
+ 	if (optin != 1) {
+-		return;
++		printf("POLARIS PWR: rails write not opt-in; CX untouched\n");
++		return 0;
+ 	}
+-	virt = ml_io_map(PG_GPUCC_MAP, PG_GPUCC_MAP_SZ);
+-	if (virt == 0) {
+-		printf("POLARIS PWR: cannot map GPUCC; power request skipped\n");
+-		return;
++	if (!pg_cx_map()) {
++		return 0;
+ 	}
+-	regs = (volatile uint32_t *)virt;
+-	before = pg_rd32(regs, PG_CX_GDSCR);
+-	printf("POLARIS PWR: CX GDSCR before=0x%08x (PWR_ON=%u)\n",
++	before = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
++	printf("POLARIS PWR: rails enter CX GDSCR before=0x%08x (PWR_ON=%u)\n",
+ 	    before, (before & PG_GDSCR_PWR_ON) != 0);
+ 	if (before & PG_GDSCR_PWR_ON) {
+ 		/* Already powered by someone we cannot identify: observe, never claim. */
+ 		printf("POLARIS PWR: CX already on and not ours; no write, no ownership\n");
+-		return;
++		return 0;
+ 	}
+ 	/* Request power: clear only SW_COLLAPSE, keep every other bit as it was. */
+-	pg_wr32(regs, PG_CX_GDSCR, before & ~PG_GDSCR_SW_COLLAPSE);
+-	for (i = 0; i < PG_POLL_READS; i++) {
+-		after = pg_rd32(regs, PG_CX_GDSCR);
++	pg_wr32(pg_cx_regs, PG_CX_GDSCR, before & ~PG_GDSCR_SW_COLLAPSE);
++	for (i = 0; i < PG_POLL_US; i++) {
++		after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
+ 		if (after & PG_GDSCR_PWR_ON) {
+-			printf("POLARIS PWR: CX PWR_ON after %u polls, GDSCR=0x%08x; "
+-			    "rollback = write 0x%08x\n", i + 1, after, before);
+-			return;
++			pg_cx_saved = before;
++			pg_cx_owned = 1;
++			printf("POLARIS PWR: rails enter PWR_ON after %u polls "
++			    "GDSCR=0x%08x; CX owned, rollback=0x%08x\n",
++			    i + 1, after, before);
++			return 1;
+ 		}
++		DELAY(1);
+ 	}
+-	after = pg_rd32(regs, PG_CX_GDSCR);
+-	pg_wr32(regs, PG_CX_GDSCR, before);
+-	restored = pg_rd32(regs, PG_CX_GDSCR);
+-	printf("POLARIS PWR: CX power request timed out after %u polls "
++	after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
++	pg_wr32(pg_cx_regs, PG_CX_GDSCR, before);
++	restored = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
++	printf("POLARIS PWR: rails enter timed out after %u polls "
+ 	    "(last=0x%08x); original restored=0x%08x, domain not claimed\n",
+-	    PG_POLL_READS, after, restored);
++	    PG_POLL_US, after, restored);
++	return 0;
+ }
+ 
++void
++polaris_gpu_rails_exit(void)
++{
++	uint32_t after;
++
++	if (!pg_cx_owned || pg_cx_regs == NULL) {
++		return;
++	}
++	pg_wr32(pg_cx_regs, PG_CX_GDSCR, pg_cx_saved);
++	after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
++	pg_cx_owned = 0;
++	printf("POLARIS PWR: rails exit restored GDSCR=0x%08x (PWR_ON=%u); "
++	    "CX released\n", after, (after & PG_GDSCR_PWR_ON) != 0);
++}
++
++#ifdef PG_PWR_TEST
++void
++pg_pwr_test_reset(void)
++{
++	pg_cx_regs = NULL;
++	pg_cx_saved = 0;
++	pg_cx_owned = 0;
++}
++#endif
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

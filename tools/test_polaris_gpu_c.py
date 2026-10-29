@@ -51,7 +51,7 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 107):
+        for number in range(94, 108):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -116,8 +116,9 @@ EXPORT unsigned ref_arg(unsigned i) {
 /* A local RAM window, never a real MMIO mapping. Poison unused offsets so a
  * second +0x1000 bias cannot masquerade as a plausible register value. */
 static uint32_t power_regs[0x2000 / 4], power_snapshot[0x2000 / 4];
-static int power_enabled, power_board, power_bad_map;
-static unsigned power_maps;
+static int power_enabled, power_on_arg, power_board, power_bad_map;
+static int power_model;
+static unsigned power_maps, power_writes;
 static int rh_diag_arg = 1, rh_vote_arg, rh_level_arg;
 static char power_text[8192];
 static size_t power_text_len;
@@ -145,6 +146,14 @@ int PE_parse_boot_argn(const char *name, void *out, int size) {
         memcpy(out, &rh_level_arg, sizeof(rh_level_arg));
         return rh_level_arg != 0;
     }
+    if (!strcmp(name, "polarisgpuon")) {
+        memcpy(out, &power_on_arg, sizeof(power_on_arg));
+        return power_on_arg != 0;
+    }
+    if (!strcmp(name, "polarisgpupwr")) {
+        memcpy(out, &power_enabled, sizeof(power_enabled));
+        return power_enabled != 0;
+    }
     memcpy(out, &power_enabled, sizeof(power_enabled));
     return 1;
 }
@@ -158,6 +167,7 @@ vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size) {
     }
     return (vm_offset_t)power_regs;
 }
+void pg_pwr_test_reset(void);
 EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     for (unsigned i = 0; i < sizeof(power_regs) / sizeof(power_regs[0]); i++)
         power_regs[i] = 0x5a5a5a5a;
@@ -165,15 +175,36 @@ EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     power_regs[0x540 / 4] = 0x11223344;
     power_regs[0x0c / 4] = 0xaabbccdd;
     memcpy(power_snapshot, power_regs, sizeof(power_regs));
-    power_enabled = enabled; power_board = board;
+    power_enabled = enabled; power_on_arg = enabled; power_board = board;
+    power_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
-    if (write_probe) polaris_gpu_cx_on(); else polaris_gpu_pwr_probe();
+    pg_pwr_test_reset();
+    if (write_probe) (void)polaris_gpu_rails_enter(); else polaris_gpu_pwr_probe();
     return power_text;
 }
 EXPORT unsigned power_map_count(void) { return power_maps; }
 EXPORT int power_memory_unchanged(void) {
     return !power_bad_map && memcmp(power_snapshot, power_regs, sizeof(power_regs)) == 0;
 }
+void pg_pwr_test_after_write(uint32_t off, uint32_t value) {
+    power_writes++;
+    if (off == 0x6c && power_model == 1 && !(value & 1u))
+        power_regs[0x6c / 4] = value | 0x80000000u;
+}
+EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
+    for (unsigned i = 0; i < sizeof(power_regs) / sizeof(power_regs[0]); i++)
+        power_regs[i] = 0x5a5a5a5a;
+    power_regs[0x6c / 4] = gdscr;
+    power_enabled = on; power_on_arg = on; power_board = board;
+    power_model = model; power_writes = 0;
+    power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
+    pg_pwr_test_reset();
+}
+EXPORT int rails_enter(void) { return polaris_gpu_rails_enter(); }
+EXPORT void rails_exit(void) { polaris_gpu_rails_exit(); }
+EXPORT unsigned power_reg(unsigned off) { return power_regs[off / 4]; }
+EXPORT unsigned power_write_count(void) { return power_writes; }
+EXPORT const char *power_log(void) { return power_text; }
 /* Fake ADT properties deliberately start at unaligned addresses, as real ADT
  * properties may. No firmware bytes, MMIO or device are needed by this test. */
 static const char *const blob_names[6] = {
@@ -221,7 +252,8 @@ EXPORT void diag_set_dram(uint64_t base, uint64_t size) {
 }
 EXPORT void diag_reset(int historical, int enabled, int board) {
     const unsigned sizes[6] = {31980, 32768, 6684, 148, 6536, 1968};
-    power_enabled = enabled; power_board = board;
+    power_enabled = enabled; power_on_arg = enabled; power_board = board;
+    power_model = 0; power_writes = 0; pg_pwr_test_reset();
     diag_set_dram(0x100000000ull, 0x7cc00000ull);
     for (unsigned i = 0; i < 6; i++)
         diag_set_blob(i, 0x110000000ull + i * 0x10000ull,
@@ -340,7 +372,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         library = root / ('gpu.dll' if os.name == 'nt' else 'gpu.so')
         shared_flag = '-dynamiclib' if sys.platform == 'darwin' else '-shared'
         argv = compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror', shared_flag,
-                           '-DARM64_BOARD_CONFIG_SWEET=1', '-DPG_RH_TEST',
+                           '-DARM64_BOARD_CONFIG_SWEET=1', '-DPG_RH_TEST', '-DPG_PWR_TEST',
                            '-I' + str(root / 'include'),
                            '-I' + str(root / 'bsd'), str(wrapper),
                            str(dev / 'polaris_gpu_arc_vote.c'),
@@ -373,6 +405,13 @@ EXPORT int rh_sleep_wake_unchanged(void) {
             getattr(cls.lib, name).restype = ctypes.c_uint
         cls.lib.power_probe.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int]
         cls.lib.power_probe.restype = ctypes.c_char_p
+        cls.lib.power_rails_reset.argtypes = [ctypes.c_uint, ctypes.c_int,
+                                              ctypes.c_int, ctypes.c_int]
+        cls.lib.rails_enter.restype = ctypes.c_int
+        cls.lib.power_reg.argtypes = [ctypes.c_uint]
+        cls.lib.power_reg.restype = ctypes.c_uint
+        cls.lib.power_write_count.restype = ctypes.c_uint
+        cls.lib.power_log.restype = ctypes.c_char_p
         cls.lib.power_map_count.restype = ctypes.c_uint
         cls.lib.power_memory_unchanged.restype = ctypes.c_int
         cls.lib.diag_reset.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -454,8 +493,12 @@ EXPORT int rh_sleep_wake_unchanged(void) {
     def test_power_requires_separate_optin_and_matching_board(self):
         for write in (0, 1):
             for enabled, board in ((0, 1), (1, 0)):
-                self.assertEqual(self.lib.power_probe(write, enabled, board), b'')
+                log = self.lib.power_probe(write, enabled, board)
+                expected = (b'POLARIS PWR: rails write not opt-in; CX untouched\n'
+                            if write and board and not enabled else b'')
+                self.assertEqual(log, expected)
                 self.assertEqual(self.lib.power_map_count(), 0)
+                self.assertEqual(self.lib.power_write_count(), 0)
                 self.assertEqual(self.lib.power_memory_unchanged(), 1)
 
     def test_diagnostic_accepts_both_registered_sets_without_gpu_access(self):
@@ -507,17 +550,65 @@ EXPORT int rh_sleep_wake_unchanged(void) {
             self.assertIn(reason, self.lib.diag_run(0).decode())
             self.assertEqual(self.lib.power_map_count(), 0)
 
-    def test_bringup_stops_at_rails_without_calling_standalone_cx_write(self):
-        # Both power flags are 1 in this mock. Only the read-only probe may map;
-        # the old unconditional CX experiment must not bypass the rails backend.
+    def test_bringup_rails_refuses_foreign_on_domain_without_write(self):
+        # Both power flags are 1 in this mock, but the inherited PWR_ON=1 bit
+        # means the domain belongs to someone else. The stage may observe it,
+        # never write or claim it, and the CPU display must remain.
         self.lib.power_probe(0, 1, 1)
         self.lib.diag_reset(0, 1, 1)
         log = self.lib.diag_run(1).decode()
-        self.assertIn('rails backend not implemented', log)
+        self.assertIn('CX GDSCR before=0x80000001', log)
+        self.assertIn('CX already on and not ours; no write, no ownership', log)
+        self.assertIn('rails request refused; no ownership claimed', log)
         self.assertIn('acceleration unavailable; CPU display unchanged', log)
-        self.assertNotIn('CX GDSCR before=', log)
-        self.assertEqual(self.lib.power_map_count(), 1)
+        self.assertEqual(self.lib.power_map_count(), 2)
         self.assertEqual(self.lib.power_memory_unchanged(), 1)
+
+    def test_rails_requires_optin_and_board_before_mapping(self):
+        for on, board in ((0, 1), (1, 0)):
+            self.lib.power_rails_reset(0x00222001, 1, on, board)
+            self.assertEqual(self.lib.rails_enter(), 0)
+            self.assertEqual(self.lib.power_map_count(), 0)
+            self.assertEqual(self.lib.power_write_count(), 0)
+            self.assertEqual(self.lib.power_reg(0x6c), 0x00222001)
+
+    def test_rails_foreign_on_domain_is_observed_without_write(self):
+        self.lib.power_rails_reset(0x80000001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('CX GDSCR before=0x80000001', log)
+        self.assertIn('already on and not ours', log)
+        self.assertEqual(self.lib.power_write_count(), 0)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x80000001)
+
+    def test_rails_timeout_restores_original_and_claims_nothing(self):
+        self.lib.power_rails_reset(0x00222001, 0, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('timed out after 200 polls', log)
+        self.assertIn('domain not claimed', log)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x00222001)
+        self.assertEqual(self.lib.power_write_count(), 2)
+
+    def test_rails_enter_owns_pwr_on_and_exit_restores_exact_value(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('CX owned, rollback=0x00222001', log)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x80222000)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.power_write_count(), 1)
+        self.lib.rails_exit()
+        log = self.lib.power_log().decode()
+        self.assertIn('rails exit restored GDSCR=0x00222001', log)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x00222001)
+        self.assertEqual(self.lib.power_write_count(), 2)
+
+    def test_rails_exit_without_enter_is_a_noop(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.lib.rails_exit()
+        self.assertEqual(self.lib.power_write_count(), 0)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x00222001)
 
 
 class RpmhTests(GpuCTests):
