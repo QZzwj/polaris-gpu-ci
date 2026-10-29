@@ -1,0 +1,290 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 1026673..b8b3dd4 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -1,7 +1,7 @@
+ /*
+  * Polaris A630 bring-up gate. This is NOT a GPU power driver.
+- * Maps only the GMU CSR window read-only; never writes GMU registers and
+- * never passes command buffers to the GPU.
++ * Maps the GMU CSR and GPU SMMU windows read-only; never writes either
++ * register file and never passes command buffers to the GPU.
+  * Never replace the CPU framebuffer unless a fence and presentation work.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -23,6 +23,7 @@ enum polaris_gpu_stage {
+ 	POLARIS_GPU_CLOCKS,
+ 	POLARIS_GPU_BUS,
+ 	POLARIS_GPU_GMU,
++	POLARIS_GPU_SMMU_PROBE,
+ 	POLARIS_GPU_HFI,
+ 	POLARIS_GPU_SMMU,
+ 	POLARIS_GPU_PAS,
+@@ -55,7 +56,7 @@ static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
+ static struct pg_handoff polaris_gpu_handoff;
+ 
+ static const char *const polaris_gpu_stage_name[POLARIS_GPU_STAGE_COUNT] = {
+-	"board", "firmware", "rails", "clocks", "bus", "GMU",
++	"board", "firmware", "rails", "clocks", "bus", "GMU", "SMMU-probe",
+ 	"HFI", "SMMU", "PAS13", "CP", "fence"
+ };
+ 
+@@ -145,6 +146,20 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 		printf("POLARIS GPU: GMU registers readable; firmware not started\n");
+ 		return true;
+ 	}
++	if (stage == POLARIS_GPU_SMMU_PROBE) {
++		/*
++		 * Read the GPU SMMU global and context registers. Nothing is
++		 * programmed: no SMR/S2CR write, no page table, no domain
++		 * claim. A readable SMMU only proves the CX domain reaches it.
++		 */
++		if (!polaris_gpu_smmu_probe()) {
++			printf("POLARIS GPU: SMMU probe refused; no ownership claimed\n");
++			return false;
++		}
++		ctx->completed++;
++		printf("POLARIS GPU: SMMU registers readable; no attach\n");
++		return true;
++	}
+ 	if (stage != POLARIS_GPU_BOARD) {
+ 		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
+ 		    polaris_gpu_stage_name[stage]);
+@@ -240,10 +255,11 @@ polaris_gpu_init(void)
+ 	/*
+ 	 * CX is now owned. The clocks stage brings up the GMU clock source and
+ 	 * CX branch; the bus stage then enables the two GCC branches feeding
+-	 * the GMU. The GMU stage maps the CSR window read-only. The HFI stage
+-	 * still has no backend, so the gate must refuse there and unwind must
+-	 * release bus, clocks and then CX in reverse order rather than leave
+-	 * ownerless resources powered.
++	 * the GMU. The GMU stage maps the CSR window read-only; the SMMU probe
++	 * stage reads the SMMU register file without programming it. The HFI
++	 * stage still has no backend, so the gate must refuse there and unwind
++	 * must release bus, clocks and then CX in reverse order rather than
++	 * leave ownerless resources powered.
+ 	 */
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_CLOCKS)) {
+ 		goto fail;
+@@ -255,10 +271,13 @@ polaris_gpu_init(void)
+ 		goto fail;
+ 	}
+ 	/*
+-	 * The GMU probe above only read registers: it did not start the CM3
+-	 * firmware and left no GMU transaction in flight, so the idle
++	 * The GMU and SMMU probes above only read registers: neither started
++	 * the CM3 firmware nor left a transaction in flight, so the idle
+ 	 * precondition for unwinding is trivially satisfied.
+ 	 */
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_SMMU_PROBE)) {
++		goto fail;
++	}
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_HFI)) {
+ 		goto fail;
+ 	}
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index 086cfc6..bbb0d2a 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -47,4 +47,14 @@ void polaris_gpu_bus_exit(void);
+  */
+ int polaris_gpu_gmu_enter(void);
+ 
++/*
++ * SMMU probe stage: map the GPU SMMU register file (0x05040000 + 0x10000)
++ * read-only and record the global identification and per-context-bank
++ * configuration. Requires the CX domain, clocks and bus owned above. This
++ * stage does not program SMR/S2CR, does not install page tables and claims
++ * no domain or firmware: a readable SMMU only proves the interconnect
++ * reaches it.
++ */
++int polaris_gpu_smmu_probe(void);
++
+ #endif /* _BSD_DEV_POLARIS_GPU_PWR_H_ */
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 37c407b..dcc95d4 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -148,6 +148,46 @@ extern bool polaris_touch_i2c_board(void);
+ #error "the GMU register constants would leave the documented CSR window"
+ #endif
+ 
++/*
++ * GPU SMMU (arm,smmu-kgsl@5040000), vendor DTS <0x05040000 0x10000>.
++ * This is an ARM SMMU-500 register file: GR0 at +0x0000, GR1 (the CBAR
++ * array) at +(1 << pgshift), and the context banks at +0x8000 with the
++ * same stride. qcom,protect=<0x40000 0xc000> is relative to a different
++ * aperture covering the HYP-owned CB5-CB7 and is never mapped here.
++ * Every access in this revision is a read.
++ */
++#define PG_SMMU_BASE            0x05040000ull
++#define PG_SMMU_WINDOW          0x10000u
++#define PG_SMMU_CB_BASE         (PG_SMMU_WINDOW / 2u)
++
++#define PG_SMMU_IDR0            0x020u
++#define PG_SMMU_IDR1            0x024u
++#define PG_SMMU_IDR2            0x028u
++#define PG_SMMU_IDR3            0x02cu
++#define PG_SMMU_IDR5            0x034u
++#define PG_SMMU_IDR6            0x038u
++#define PG_SMMU_IDR7            0x03cu
++#define PG_SMMU_GFAR            0x040u
++#define PG_SMMU_GFSR            0x048u
++#define PG_SMMU_GFSYNR0         0x050u
++#define PG_SMMU_GFSYNR1         0x054u
++#define PG_SMMU_SMR(n)          (0x800u + ((n) * 4u))
++#define PG_SMMU_S2CR(n)         (0xc00u + ((n) * 4u))
++#define PG_SMMU_CB_FSR          0x058u
++
++#define PG_SMMU_IDR0_NUMSMRG_SHIFT  0
++#define PG_SMMU_IDR0_NUMSMRG_MASK   0xffu
++#define PG_SMMU_IDR0_NUMSIDB_SHIFT  9
++#define PG_SMMU_IDR0_NUMSIDB_MASK   0xfu
++#define PG_SMMU_IDR0_NUMIRPT_SHIFT  16
++#define PG_SMMU_IDR0_NUMIRPT_MASK   0xffu
++#define PG_SMMU_IDR1_PAGESIZE       (1u << 31)
++#define PG_SMMU_IDR1_NUMCB_SHIFT    0
++#define PG_SMMU_IDR1_NUMCB_MASK     0xffu
++#define PG_SMMU_S2CR_TYPE_SHIFT     16
++#define PG_SMMU_S2CR_TYPE_MASK      0x3u
++#define PG_SMMU_S2CR_CBNDX_MASK     0xffu
++
+ /*
+  * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
+  * mainline agree on the Fabia table). PLL_MODE carries PLL_OUTCTRL(0),
+@@ -195,6 +235,7 @@ static volatile uint32_t *pg_pll_regs;
+ static volatile uint32_t *pg_gcc_axi_regs;
+ static volatile uint32_t *pg_gcc_gfx_regs;
+ static volatile uint32_t *pg_gmu_regs;
++static volatile uint32_t *pg_smmu_regs;
+ static uint32_t pg_cx_saved;
+ static int pg_cx_owned;
+ 
+@@ -322,6 +363,23 @@ pg_gmu_map(void)
+ 	return true;
+ }
+ 
++static bool
++pg_smmu_map(void)
++{
++	vm_offset_t virt;
++
++	if (pg_smmu_regs != NULL) {
++		return true;
++	}
++	virt = ml_io_map(PG_SMMU_BASE, PG_SMMU_WINDOW);
++	if (virt == 0) {
++		printf("POLARIS PWR: cannot map SMMU; probe skipped\n");
++		return false;
++	}
++	pg_smmu_regs = (volatile uint32_t *)virt;
++	return true;
++}
++
+ int
+ polaris_gpu_rails_enter(void)
+ {
+@@ -909,6 +967,95 @@ polaris_gpu_gmu_enter(void)
+ 	return 1;
+ }
+ 
++/*
++ * Map the GPU SMMU register file and record what the vendor firmware left
++ * behind. No SMR, S2CR, CBAR, SCTLR or TLB register is written and no page
++ * table is installed. The context-bank geometry is derived from IDR1 the
++ * same way arm-smmu.c derives it; a geometry that would leave the 64 KiB
++ * aperture is refused instead of guessed. Stream IDs are printed raw: the
++ * DT routes SID 0x208 with mask 0x7 across the four GPU domains, but this
++ * probe does not claim or reprogram that routing.
++ */
++int
++polaris_gpu_smmu_probe(void)
++{
++	uint32_t idr0, idr1, idr2, idr3, idr5, idr6, idr7;
++	uint32_t gfar, gfsr, gfsynr0, gfsynr1;
++	uint32_t num_cb, num_smr, num_irpt, sid_bits;
++	uint32_t pgshift, cb_stride, cb_base, n;
++	const char *granule;
++
++	if (!pg_cx_owned || !pg_clk_owned || !pg_bus_owned ||
++	    pg_cx_regs == NULL) {
++		printf("POLARIS PWR: smmu refused; bus not owned\n");
++		return 0;
++	}
++	if (!pg_smmu_map()) {
++		return 0;
++	}
++
++	idr0 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR0);
++	idr1 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR1);
++	idr2 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR2);
++	idr3 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR3);
++	idr5 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR5);
++	idr6 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR6);
++	idr7 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR7);
++	gfar = pg_rd32(pg_smmu_regs, PG_SMMU_GFAR);
++	gfsr = pg_rd32(pg_smmu_regs, PG_SMMU_GFSR);
++	gfsynr0 = pg_rd32(pg_smmu_regs, PG_SMMU_GFSYNR0);
++	gfsynr1 = pg_rd32(pg_smmu_regs, PG_SMMU_GFSYNR1);
++
++	num_cb = (idr1 >> PG_SMMU_IDR1_NUMCB_SHIFT) &
++	    PG_SMMU_IDR1_NUMCB_MASK;
++	num_smr = (idr0 >> PG_SMMU_IDR0_NUMSMRG_SHIFT) &
++	    PG_SMMU_IDR0_NUMSMRG_MASK;
++	num_irpt = (idr0 >> PG_SMMU_IDR0_NUMIRPT_SHIFT) &
++	    PG_SMMU_IDR0_NUMIRPT_MASK;
++	sid_bits = (idr0 >> PG_SMMU_IDR0_NUMSIDB_SHIFT) &
++	    PG_SMMU_IDR0_NUMSIDB_MASK;
++	pgshift = (idr1 & PG_SMMU_IDR1_PAGESIZE) ? 16u : 12u;
++	granule = (pgshift == 16u) ? "64K" : "4K";
++	cb_stride = 1u << pgshift;
++	cb_base = PG_SMMU_CB_BASE;
++
++	if (num_cb == 0 || num_cb > 8 || num_smr == 0 || num_smr > 32 ||
++	    cb_base + (num_cb * cb_stride) > PG_SMMU_WINDOW) {
++		printf("POLARIS PWR: SMMU IDR is not usable (idr0=0x%08x "
++		    "idr1=0x%08x); probe refused\n", idr0, idr1);
++		return 0;
++	}
++
++	printf("POLARIS PWR: SMMU IDR0=0x%08x IDR1=0x%08x IDR2=0x%08x "
++	    "IDR3=0x%08x IDR5=0x%08x IDR6=0x%08x IDR7=0x%08x\n",
++	    idr0, idr1, idr2, idr3, idr5, idr6, idr7);
++	printf("POLARIS PWR: SMMU GFAR=0x%08x GFSR=0x%08x GFSYNR0=0x%08x "
++	    "GFSYNR1=0x%08x\n", gfar, gfsr, gfsynr0, gfsynr1);
++
++	for (n = 0; n < num_cb; n++) {
++		uint32_t cbar, smr, s2cr, fsr, type;
++
++		cbar = pg_rd32(pg_smmu_regs, cb_stride + (n * 4u));
++		smr = pg_rd32(pg_smmu_regs, PG_SMMU_SMR(n));
++		s2cr = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(n));
++		fsr = pg_rd32(pg_smmu_regs,
++		    cb_base + (n * cb_stride) + PG_SMMU_CB_FSR);
++		type = (s2cr >> PG_SMMU_S2CR_TYPE_SHIFT) &
++		    PG_SMMU_S2CR_TYPE_MASK;
++		printf("POLARIS PWR: SMMU CB%u CBAR=0x%08x SMR=0x%08x "
++		    "S2CR=0x%08x type=%s cbndx=%u FSR=0x%08x\n", n, cbar, smr,
++		    s2cr,
++		    type == 0 ? "trans" : (type == 1 ? "bypass" :
++		    (type == 2 ? "fault" : "reserved")),
++		    s2cr & PG_SMMU_S2CR_CBNDX_MASK, fsr);
++	}
++
++	printf("POLARIS PWR: SMMU read-only; contexts=%u smr=%u sid_bits=%u "
++	    "irpt=%u granule=%s; no attach\n",
++	    num_cb, num_smr, sid_bits, num_irpt, granule);
++	return 1;
++}
++
+ #ifdef PG_PWR_TEST
+ void
+ pg_pwr_test_reset(void)
+@@ -925,6 +1072,7 @@ pg_pwr_test_reset(void)
+ 	pg_gcc_axi_regs = NULL;
+ 	pg_gcc_gfx_regs = NULL;
+ 	pg_gmu_regs = NULL;
++	pg_smmu_regs = NULL;
+ 	pg_bus_owned = 0;
+ 	pg_bus_axi_saved = 0;
+ 	pg_bus_memnoc_saved = 0;
