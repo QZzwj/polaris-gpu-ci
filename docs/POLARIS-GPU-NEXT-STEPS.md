@@ -45,6 +45,34 @@ Magisk，版本分别为 v331/v415。包内是 Android 用户态 `.so`；抽查�
 测试，不能算作 0096 的真机结果。0096 的源码只打印请求、没有发送路径，
 因此重新打包它也不会得到 GPU 加速。
 
+## 2026-10-29 补充：Android OpenCL 示例的适用范围
+
+用户提供了《在 Android 上实现 Metal 的计算 Demo》（2022-06-06）全文。
+其中把 Metal 数组加法改写为 OpenCL kernel，使用 Android 已有的
+`libOpenCL.so`、`dlopen`/`dlsym` 和 GPU context/queue。它演示相同的计算任务，
+没有提供 Metal API、MSL 编译器或 iOS 图形驱动的实现。
+
+只读核对本地 `D:\ios\adreno-630-gpu-driver`：没有名称含 OpenCL 的文件；
+抽查 Android 10 的 64 位 `libgsl.so`、`libGLESv2_adreno.so`、`libEGL_adreno.so`
+及 `vulkan.sdm845.so` 均是 ELF64/AArch64。ELF 动态段列出 Android 的
+`libcutils.so`、`liblog.so` 等依赖；`libgsl.so` 导入 `ioctl`、`mmap`、
+`mmap64`、`property_get`，并包含 `/dev/kgsl-3d0`、`/dev/ion` 等路径字符串。
+这不是实际执行追踪，但结合 KGSL 的公开 ioctl/mmap 接口，足以否定
+“直接用 iOS dlopen 加载这些文件即可获得 GPU”的建议。iOS 的原生 dyld
+加载 Mach-O；即使增加 ELF/Bionic 兼容层，内核接口和真正的硬件后端仍需实现。
+
+检查脚本及每个抽查文件的 SHA256、DT_NEEDED、未定义符号、路径字符串保存在
+`D:\ios\gpu-fix\inspect_android_gpu_libs.py` 和
+`D:\ios\gpu-fix\android-gpu-libs-local.json`；没有执行这些库或操作手机。
+本次对照了 Apple 的 Metal 计算示例、dlopen 手册和 Android Bionic 说明，
+以及 AOSP libdrm 的 KGSL 源码；没有复制第三方驱动代码。
+所查 AOSP KGSL 示例来自旧版 libdrm，仅用于核对设备接口形式，不能用于
+推导 A630 的寄存器、上电或提交序列。
+
+可复用的是验证方法：先完成受控上电、SMMU、GMU/HFI、PAS13 和 CP
+sentinel/fence，再验证真实 GPU 数组加法；接下来才是用户态接口及 iOS
+合成接入。通过计算用例也不能单独证明系统界面已由 GPU 加速。
+
 ## 接入上电前，先修正两处数据解释
 
 ### 1. ARC 等级、硬件 selector 和 VRM 电压是不同的数据

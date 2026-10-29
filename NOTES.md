@@ -982,3 +982,25 @@ reverse/forward apply succeeded on reconstructed source; resulting C passes the
 whitespace check (space-prefixed context lines inside a .patch are required diff
 syntax, not C indentation errors). No new CI dispatch or 0103 phone boot in this
 milestone. The remaining GPU backend work above is not complete.
+
+### 2026-10-29: user-supplied Android OpenCL article reviewed against local ELF
+
+User pasted the full 2022-06-06 article about reproducing Metal's array-add
+example using Android OpenCL, dlopen/dlsym and an existing vendor runtime. It is
+not a Metal implementation or an XNU kernel GPU backend. Checked Apple Metal
+sample/dlopen primary docs, Android Bionic overview and AOSP libdrm KGSL source;
+native Darwin dlopen expects Mach-O, whereas the vendor package is Android ELF.
+
+Read-only ELF64 inspection (no library execution) of Android-10 libgsl,
+libGLESv2_adreno, libEGL_adreno and vulkan.sdm845 reports AArch64 and Android
+DT_NEEDED dependencies including libcutils/liblog. libgsl imports ioctl/mmap/
+mmap64/property_get and embeds /dev/kgsl-3d0 and /dev/ion. These are static evidence,
+not an execution trace. No file whose name contains OpenCL exists in that package.
+Detailed local JSON and reproducible script: gpu-fix/android-gpu-libs-local.json
+and inspect_android_gpu_libs.py. No phone, image, CI or source patch change in
+this review; 0103 remains locally validated but not full-XNU-built/phone-tested.
+
+Recorded applicability in docs/POLARIS-GPU-NEXT-STEPS.md. Reuse the array-add
+idea only after actual headless CP proof; do not add a loader wrapper and report
+GPU acceleration. ELF/Bionic and KGSL ABI adaptation would itself be substantial
+work and would still require the missing hardware backend and iOS integration.
