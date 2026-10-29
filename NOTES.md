@@ -1040,10 +1040,20 @@ no boot argument can make it send an ARC vote. The image manifest records
 snapshot will establish register geometry, not ownership of inherited ARC
 votes, and must not be described as GPU acceleration.
 
-As of **2026-10-29 05:45 UTC** the image has not been booted: `fastboot devices`
-and `adb devices` both returned no target. The local read-only helper
-`gpu-fix/device_0104.py` pins the image hash, refuses any write-path manifest,
-temporarily boots only, reads the persistent ring through the pinned recovery,
-and writes `ring-0104-summary-local.json` without putting serials in git.
-GPU acceleration remains off until a phone run proves the RSC geometry and a
-separately gated, owned rail vote is implemented.
+At **2026-10-29 05:52 UTC** the image was temporarily booted on the same Polaris
+(`fastboot boot`, no partition write) and the persistent ring was read through
+the pinned recovery. Ring flush #12, 219,035 bytes. The probe printed:
+
+- `POLARIS RPMH: DRV2@0x179e0000 TCS+0xd00 config=0x80008104 banks=8 ncpt=16 result=0`
+- `POLARIS RPMH: IRQ enable=0x1 status=0x0 (read-only)`
+- all eight TCS banks `idle=0x1 control=0x0 enable=0x0 wait=0x0`, including
+  ACTIVE0/ACTIVE1; no enabled command was present.
+
+This confirms the Polaris APPS DRV2 register base, TCS offset, 8-bank/16-command
+geometry and a quiescent TCS on hardware. It does **not** prove ownership of
+inherited ARC votes and does not send a vote; the ring still ends with
+`POLARIS GPU: acceleration unavailable; CPU display unchanged`. The read-only
+helper `gpu-fix/device_0104.py` pinned the image hash, refused any write-path
+manifest, booted only temporarily, and wrote `ring-0104-summary-local.json`
+without putting serials in git. GPU acceleration remains off until a separately
+gated, owned rail vote is implemented and proven.
