@@ -1,19 +1,36 @@
-# MIX 2S iOS/XNU GPU：当前阻塞与下一步（2026-10-28）
+# MIX 2S iOS/XNU GPU：当前阻塞与下一步（2026-10-29）
 
 **后续修复状态：**0099 已在代码中修正 ARC 地址/selector 语义，并把
 0095 的错误 SID/context-bank 表改为原始 phandle/specifier 引用。主机工具
 现在能解析完整 DTB，先解析 provider 和 `#iommu-cells`，再得到 SID/mask，
 context bank 保持未分配。二进制 command-db 解码器也保留 OFF 和重复档位。
-82 项 Python 测试和 7 项实际 C 补丁执行测试通过。0102 还修复了并发修改
+0102 的 82 项 Python 测试和 7 项实际 C 补丁执行测试通过。0102 还修复了并发修改
 引入的 GPUCC 映射起点与寄存器偏移重复相加问题；模拟 RAM 测试先复现
 错误，再验证修复，没有访问真实 MMIO。完整 XNU 构建
-`40677321846` 已成功；0102 已经由 fastboot 接受临时启动，内核运行结果
-仍待新日志核实。仍缺 GPU 硬件后端，不能据此宣称已启用 GPU 加速。
+`40677321846` 已成功；用户确认 0102 进入 iOS，2026-10-29 通过临时
+recovery 只读提取的新日志确认 ARC 修正代码执行、8/8 CPU 启动，以及
+GPUCC 读回 `cx_gdscr=0x00222001`、`cx_hw_ctrl=0x00005ff4`、
+`gx_gdscr=0x00222001`。日志随后明确停止于
+`rails backend not implemented` 和 `acceleration unavailable; CPU display unchanged`；
+另有 302 次 `IOAcceleratorES` 匹配结果为零。GPU 加速仍未启用。
+
+新补丁 0103 统一旧诊断与 0094 的固件校验，消除官方 SQE 31980 字节
+被旧诊断的固定 32136 字节误拒绝的问题；这条旧报错不是本次阻塞点。
+0103 也移除初始化阶段对独立 CX 写入实验的直接调用，使它不能绕过
+缺失的 rails 后端。其函数与既有补丁保留，未启用供电写入。
+修复前的实际 C 源码复现两项问题；修复后 **95 项测试通过**
+（82 Python + 13 实际 C），涵盖两套已注册长度、缺失/畸形属性、越界、
+对齐、重叠、保留区及双开关下禁止调用 CX 写入实验。
+0103 尚未完成完整 XNU 构建或手机验证，不能把主机测试说成硬件结果。
+
+读日志后，在 2026-10-29 01:36 UTC 再次临时启动用户已确认进入过 iOS 的
+同一 0102 镜像；fastboot Sending/Booting OKAY，本次返回的屏幕状态尚未观察。
+没有刷写分区，手机不包含尚未构建的 0103。
 
 以下诊断记录描述修复前的 0095/0096；运行时由 0099 覆盖这些错误解释。
 
-本次是代码、文件格式、保存的真机日志及上游源码核查。没有运行手机测试、
-重启手机、刷写分区或实现硬件后端。GPU 加速仍未完成。
+以下 0095/0096 诊断与上游源码核查是历史记录，后续真机验证以本页顶部和
+`NOTES.md` 的 2026-10-29 条目为准。GPU 硬件后端仍未实现。
 
 ## 为什么安装 adreno-630-gpu-driver 解决不了
 
@@ -32,7 +49,7 @@ Magisk，版本分别为 v331/v415。包内是 Android 用户态 `.so`；抽查�
 
 ### 1. ARC 等级、硬件 selector 和 VRM 电压是不同的数据
 
-当前 `tools/polaris_rpmh_vote.py` 和补丁 0096 把 `gfx.lvl` 等 AUX 表的
+修复前的 `tools/polaris_rpmh_vote.py` 和补丁 0096 把 `gfx.lvl` 等 AUX 表的
 等级值用作请求数据，并让 `rail_vote()` 把它送往 `vrm.gfx` 等地址。
 这不符合厂商 RPMh regulator 实现：
 
@@ -45,9 +62,9 @@ Magisk，版本分别为 v331/v415。包内是 Android 用户态 `.so`；抽查�
 本机保存的 command-db 中 `gfx.lvl` 地址为 `0x30050`，`vrm.gfx` 为
 `0x42700`。这些事实不能证明 XNU 已拥有相应 TCS 或供电资源。
 
-**下一项代码工作：**修正纯离线 Python/C 请求模型，区分 resource address、
+**已由 0099 完成：**修正纯离线 Python/C 请求模型，区分 resource address、
 consumer level、selector 和 VRM 电压；增加针对厂商语义的回归测试。
-保留无发送路径的状态。现有 8 个 composer 测试重复了旧假设，测试通过
+保留无发送路径的状态。此前 8 个 composer 测试重复了旧假设，测试通过
 不能证明编码正确。
 
 ### 2. iommus 的第一个 cell 是 provider phandle
@@ -61,13 +78,14 @@ consumer level、selector 和 VRM 电压；增加针对厂商语义的回归测�
 `handset-cmd-db-and-domain-facts.md` 第 7 节把它解释成 SID，并把后一个
 参数解释成 context bank，证据不足；这次更正优先于这些旧描述。
 
-**下一项数据工作：**解析 provider 的 phandle、`#iommu-cells` 和厂商
-SMMU binding/驱动；分别确认 SID、mask、动态 context bank 分配和 HYP
-限制。不能直接把现有表用于 SMR/S2CR/CB 编程。
+**离线解析已完成：**`tools/polaris_iommu.py` 解析 provider 的 phandle、
+`#iommu-cells` 后得到 SID/mask；本地 boot DTB 解析出 SID 0/2/1/4/5、mask 0。
+动态 context bank 分配、HYP 限制及 XNU 所有权仍待实现；不能直接把原始
+phandle 表用于 SMR/S2CR/CB 编程。
 
 ## 真正启用 GPU 的开发顺序和验收
 
-1. 完成上述编码、DT 解析修正，然后实现 Polaris 专用 RPMh/TCS、供电、
+1. 编码和离线 DT 解析修正已完成；实现 Polaris 专用 RPMh/TCS、供电、
    GPUCC 时钟及带宽后端。每步需要确认资源归属、ACK/读回、超时和回退。
    第一项真机目标是证明确实完成可控上电，而不是继续增加打印信息。
 2. 在任何设备 DMA 前完成 GMU/3D 的受限 SMMU 映射；再完成 A630 GMU

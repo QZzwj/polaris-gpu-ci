@@ -911,3 +911,67 @@ build, but full log downloads via `gh run view --log`, `gh api .../logs` and the
 official signed log service stalled/timed out; compile diagnostics have not been
 reviewed. Kernel/image integrity checks above did succeed. No permanent flashing
 is appropriate while runtime remains unverified, and GPU acceleration is absent.
+
+### 2026-10-29: 0102 runtime captured; GPU remains unavailable; 0103 source repair
+
+User confirmed the temporary 0102 image entered iOS and the handset had returned
+to FASTBOOT. Checked the same unique Polaris against the local serial record and
+temporarily booted the pinned recovery (Sending/Booting OKAY). Through recovery
+ADB read only the last 1025 * 4096 bytes of userdata; no partition flash. Local
+ring `D:\ios\gpu-fix\ring-0102-local.bin` is 4,198,400 B, SHA256
+`f9f6e3427d6ae0ad02b08ef5f8d94d853d0f396f8c14a56279f1782213f605a0`.
+Decoded `ring-0102-decoded-local.txt`: version 1, total 1,198,233 bytes, flush #4941.
+Dump, decoded userspace log and serial-bearing records stay outside git.
+
+Observed in this ring:
+
+- 8/8 CPUs initialized, SGI1 verified; userspace creates framebuffer surfaces,
+  swaps them and reaches the 1000-swap marker. User independently observed iOS.
+- The corrected ARC output includes gfx.lvl 10 selectors with OFF and max
+  level 0x1a0 selector/data 9 at 0x30050. These establish execution of 0099;
+  they alone do not uniquely fingerprint 0102. Attribution also uses the exact
+  recorded build/image and boot record.
+- Read-only GPUCC CX GDSCR **0x00222001**, CX HW_CTRL **0x00005ff4**,
+  GX GDSCR **0x00222001**. The tested mapping places these at 0x0509106c,
+  0x05091540 and 0x0509100c. No vote, GDSC write or domain ownership is proven.
+- Explicit `rails backend not implemented` followed by
+  `acceleration unavailable; CPU display unchanged`. There are 302 zero-result
+  IOAcceleratorES matches. No `panic(cpu` substring in the captured ring; this
+  does not establish indefinite stability. **No GPU acceleration, no FPS claim.**
+- The earlier `invalid GPU-SQE range` message comes from 0091's hardcoded
+  32136-byte historical length; 0094 then validates the actual registered MIUI
+  set (31980-byte SQE). It is a contradictory diagnostic, not the rails blocker.
+
+Forward **0103-polaris-gpu-shared-handoff-diagnostic.patch** replaces 0091's
+duplicate metadata validator with pg_validate_handoff(), retaining its independent
+board/opt-in gates and no MMIO. Both registered length vectors get the same bounds,
+overlap and reserved-region checks as bring-up. Firmware hashes remain packaging
+checks, not runtime authentication. It also removes the unconditional call from
+polaris_gpu_init() to the standalone 0098 CX experiment: even setting both power
+flags cannot bypass the missing owned rails backend. The 0098 function itself and
+all prior patches are preserved. This repair **does not implement power or GPU**.
+
+Extended native fixture to compile and execute actual diag, validator and init C
+from patches with unaligned fake ADT properties. Two tests fail on reconstructed
+0102 (official-set false refusal and unexpected CX experiment call), then pass
+with 0103. All **95** regressions pass (82 Python + 13 compiled C) with Zig 0.13.0,
+-Wall -Wextra -Werror. Tests cover opt-in/board before ADT, both sets, malformed/
+missing lengths, overlap/alignment, managed RAM bounds/overflow, reserved RAM and
+the unchanged RAM-window power registers. Full 0103 XNU build/phone test pending.
+
+After saving the ring, at **2026-10-29 01:36:00 UTC** used recovery's reboot to
+bootloader, checked same Polaris, rechecked 0102 image SHA256
+`18e45bc35e41791ed4e9dcd308a01ec9eb09333e6fe4909b783dfc9e060e4fb5`,
+and temporarily booted that same user-validated image. Sending/Booting OKAY;
+the return boot's screen is not yet observed. No permanent flashing, no 0103
+image was packaged/booted. Local helper `return_ios_0102.py` records this separate
+return boot without overwriting the original test record.
+
+Next implement the real Polaris RPMh/TCS rail backend with ownership and ACK,
+GPUCC clocks/bandwidth, then SMMU before GMU/DMA, HFI/PAS13 and CP sentinel/fence;
+only later iOS graphics integration. Do not enable polarisgpuon or flash a
+diagnostic as a performance fix. Local boot DTB confirms apps RSC DRV 2 uses
+0x179e0000 + TCS offset 0xd00 with ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1;
+static DT is not runtime ownership. Never transplant Sweet's 0x18220000/ldoc11
+RPMh helper to Polaris. Full CI logs still unreviewed: the existing 433342-byte
+ci-0102-logs.zip is a truncated ZIP without central directory, not verified logs.
