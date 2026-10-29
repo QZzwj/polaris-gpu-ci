@@ -51,7 +51,7 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 112):
+        for number in range(94, 113):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -119,10 +119,14 @@ static uint32_t power_regs[0x2000 / 4], power_snapshot[0x2000 / 4];
 static uint32_t pll_regs[0x1000 / 4], pll_snapshot[0x1000 / 4];
 static uint32_t gcc_axi_regs[0x1000 / 4], gcc_axi_snapshot[0x1000 / 4];
 static uint32_t gcc_gfx_regs[0x1000 / 4], gcc_gfx_snapshot[0x1000 / 4];
+/* The GMU window is 0x30000 bytes in the vendor DTS; keep it unaligned like
+ * the real mapping so a stray +0x1000 bias is visible as a poisoned read. */
+static uint32_t gmu_regs[0x30000 / 4], gmu_snapshot[0x30000 / 4];
 #define PLL1_PAGE_OFFSET 0x100u
 static int power_enabled, power_on_arg, power_board, power_bad_map;
 static int power_pll_bad_map;
 static int power_bus_bad_map;
+static int power_gmu_bad_map;
 static int power_model, power_clk_model, power_bus_model;
 static unsigned power_maps, power_writes, power_cfg_ahb_write_count;
 static int rh_diag_arg = 1, rh_vote_arg, rh_level_arg;
@@ -179,6 +183,10 @@ vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size) {
         if (power_bus_bad_map) return 0;
         return (vm_offset_t)gcc_gfx_regs;
     }
+    if (phys == 0x0506a000 && size == sizeof(gmu_regs)) {
+        if (power_gmu_bad_map) return 0;
+        return (vm_offset_t)gmu_regs;
+    }
     if (phys != 0x05091000 || size != sizeof(power_regs)) {
         power_bad_map = 1;
         return 0;
@@ -204,6 +212,28 @@ static void power_bus_init(void) {
     power_bus_model = 0;
     power_cfg_ahb_write_count = 0;
 }
+static void power_gmu_init(void) {
+    for (unsigned i = 0; i < sizeof(gmu_regs) / sizeof(gmu_regs[0]); i++)
+        gmu_regs[i] = 0x5a5a5a5a;
+    gmu_regs[0x14000 / 4] = 0;          /* CM3_SYSRESET */
+    gmu_regs[0x14004 / 4] = 0;          /* CM3_BOOT_CONFIG */
+    gmu_regs[0x14068 / 4] = 0;          /* CM3_FW_BUSY */
+    gmu_regs[0x14070 / 4] = 0;          /* CM3_FW_INIT_RESULT */
+    gmu_regs[0x140b4 / 4] = 0;          /* CM3_CFG */
+    gmu_regs[0x14600 / 4] = 0;          /* HFI_CTRL_STATUS */
+    gmu_regs[0x14604 / 4] = 0x00010000; /* HFI_VERSION_INFO */
+    gmu_regs[0x14610 / 4] = 0;          /* HFI_QTBL_INFO */
+    gmu_regs[0x14730 / 4] = 0;          /* GENERAL_7 */
+    gmu_regs[0x24c14 / 4] = 0;          /* AO_HOST_INTR_STATUS */
+    gmu_regs[0x24c18 / 4] = 0;          /* AO_HOST_INTR_MASK */
+    gmu_regs[0x24c30 / 4] = 0;          /* GPU_CX_BUSY_STATUS */
+    gmu_regs[0x24c20 / 4] = 0;          /* RSCC_CONTROL_ACK */
+    gmu_regs[0x24c4c / 4] = 0;          /* AHB_FENCE_STATUS */
+    gmu_regs[0x14220 / 4] = 0x00000010; /* CX_ALWAYS_ON_CNT_L */
+    gmu_regs[0x14224 / 4] = 0x00000002; /* CX_ALWAYS_ON_CNT_H */
+    memcpy(gmu_snapshot, gmu_regs, sizeof(gmu_regs));
+    power_gmu_bad_map = 0;
+}
 void pg_pwr_test_reset(void);
 EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     for (unsigned i = 0; i < sizeof(power_regs) / sizeof(power_regs[0]); i++)
@@ -221,6 +251,7 @@ EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     pg_pwr_test_reset();
     power_pll_init();
     power_bus_init();
+    power_gmu_init();
     if (write_probe) (void)polaris_gpu_rails_enter(); else polaris_gpu_pwr_probe();
     return power_text;
 }
@@ -310,6 +341,7 @@ EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
     pg_pwr_test_reset();
     power_pll_init();
     power_bus_init();
+    power_gmu_init();
 }
 EXPORT int rails_enter(void) { return polaris_gpu_rails_enter(); }
 EXPORT void rails_exit(void) { polaris_gpu_rails_exit(); }
@@ -317,13 +349,21 @@ EXPORT int clocks_enter(void) { return polaris_gpu_clocks_enter(); }
 EXPORT void clocks_exit(void) { polaris_gpu_clocks_exit(); }
 EXPORT int bus_enter(void) { return polaris_gpu_bus_enter(); }
 EXPORT void bus_exit(void) { polaris_gpu_bus_exit(); }
+EXPORT int gmu_enter(void) { return polaris_gpu_gmu_enter(); }
 EXPORT void power_clock_fault(unsigned mode) { power_clk_model = (int)mode; }
 EXPORT void power_bus_fault(unsigned mode) { power_bus_model = (int)mode; }
 EXPORT void power_bus_map_fault(int bad) { power_bus_bad_map = bad; }
+EXPORT void power_gmu_map_fault(int bad) { power_gmu_bad_map = bad; }
 EXPORT void power_boot_optin(int on) { power_on_arg = on; }
 EXPORT unsigned power_reg(unsigned off) { return power_regs[off / 4]; }
 EXPORT unsigned power_gcc_reg(unsigned which, unsigned off) {
     return (which ? gcc_gfx_regs : gcc_axi_regs)[off / 4];
+}
+EXPORT unsigned power_gmu_reg(unsigned off) { return gmu_regs[off / 4]; }
+EXPORT void power_gmu_set(unsigned off, unsigned value) { gmu_regs[off / 4] = value; }
+EXPORT int power_gmu_unchanged(void) {
+    return !power_gmu_bad_map &&
+        memcmp(gmu_snapshot, gmu_regs, sizeof(gmu_regs)) == 0;
 }
 EXPORT unsigned power_pll_reg(unsigned off) { return pll_regs[(PLL1_PAGE_OFFSET + off) / 4]; }
 EXPORT void power_pll_set(unsigned off, unsigned value) { pll_regs[(PLL1_PAGE_OFFSET + off) / 4] = value; }
@@ -389,6 +429,7 @@ EXPORT void diag_reset(int historical, int enabled, int board) {
     const unsigned sizes[6] = {31980, 32768, 6684, 148, 6536, 1968};
     power_enabled = enabled; power_on_arg = enabled; power_board = board;
     power_model = 0; power_writes = 0; pg_pwr_test_reset();
+    power_gmu_init();
     diag_set_dram(0x100000000ull, 0x7cc00000ull);
     for (unsigned i = 0; i < 6; i++)
         diag_set_blob(i, 0x110000000ull + i * 0x10000ull,
@@ -546,6 +587,12 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.clocks_enter.restype = ctypes.c_int
         cls.lib.bus_enter.restype = ctypes.c_int
         cls.lib.bus_exit.restype = None
+        cls.lib.gmu_enter.restype = ctypes.c_int
+        cls.lib.power_gmu_map_fault.argtypes = [ctypes.c_int]
+        cls.lib.power_gmu_reg.argtypes = [ctypes.c_uint]
+        cls.lib.power_gmu_reg.restype = ctypes.c_uint
+        cls.lib.power_gmu_set.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        cls.lib.power_gmu_unchanged.restype = ctypes.c_int
         cls.lib.power_bus_fault.argtypes = [ctypes.c_uint]
         cls.lib.power_bus_map_fault.argtypes = [ctypes.c_int]
         cls.lib.power_boot_optin.argtypes = [ctypes.c_int]
@@ -1003,7 +1050,62 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x80000000)
         self.assertEqual(self.lib.power_gcc_reg(1, 0x0c), 0x80000000)
 
-    def test_bringup_clocks_stage_runs_then_bus_refuses_and_unwinds(self):
+    def test_gmu_refuses_without_bus_before_mapping(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        maps = self.lib.power_map_count()
+        writes = self.lib.power_write_count()
+        self.assertEqual(self.lib.gmu_enter(), 0)
+        self.assertIn('gmu refused; bus not owned', self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_map_count(), maps)
+        self.assertEqual(self.lib.power_write_count(), writes)
+
+    def test_gmu_reads_identify_registers_without_any_write(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        writes = self.lib.power_write_count()
+        self.assertEqual(self.lib.gmu_enter(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('GMU CSR sysreset=0x00000000 boot=0x00000000 '
+                      'cfg=0x00000000 fw_busy=0x00000000 init=0x00000000', log)
+        self.assertIn('GMU HFI status=0x00000000 version=0x00010000 '
+                      'qtbl_info=0x00000000 general7=0x00000000', log)
+        self.assertIn('GMU AO intr_status=0x00000000 mask=0x00000000 '
+                      'cx_busy=0x00000000 rscc_ack=0x00000000 fence=0x00000000', log)
+        self.assertIn('GMU cx_always_on=0x0000000200000010; registers readable, '
+                      'fw=not-started, hfi=not-initialized', log)
+        self.assertEqual(self.lib.power_write_count(), writes)
+        self.assertEqual(self.lib.power_gmu_unchanged(), 1)
+
+    def test_gmu_decodes_firmware_magic_without_writing(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_gmu_set(0x14070, 0xbabeface)
+        self.lib.power_gmu_set(0x14600, 1)
+        writes = self.lib.power_write_count()
+        self.assertEqual(self.lib.gmu_enter(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('fw=mainline-magic, hfi=initialized', log)
+        self.assertEqual(self.lib.power_write_count(), writes)
+
+    def test_gmu_map_failure_claims_nothing(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_gmu_map_fault(1)
+        writes = self.lib.power_write_count()
+        self.assertEqual(self.lib.gmu_enter(), 0)
+        self.assertIn('cannot map GMU CSRs; probe skipped',
+                      self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_write_count(), writes)
+
+    def test_bringup_clocks_bus_gmu_read_then_hfi_refuses_and_unwinds(self):
         self.lib.diag_reset(0, 1, 1)
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
         log = self.lib.diag_run(1).decode()
@@ -1011,7 +1113,12 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertIn('gmu clock source root on; cfg=0x00000300', log)
         self.assertIn('POLARIS GPU: GMU clock running', log)
         self.assertIn('POLARIS GPU: GMU bus clocks running', log)
-        self.assertIn('GMU backend not implemented; no hardware access', log)
+        self.assertIn('GMU CSR sysreset=0x00000000 boot=0x00000000 '
+                      'cfg=0x00000000 fw_busy=0x00000000 init=0x00000000', log)
+        self.assertIn('POLARIS GPU: GMU registers readable; '
+                      'firmware not started', log)
+        self.assertIn('POLARIS GPU: HFI backend not implemented; '
+                      'no hardware access', log)
         self.assertIn('bus exit restored axi=0x80000000 memnoc=0x80000000', log)
         self.assertIn('clocks exit restored cbcr=0x80004220 '
                       'cmd=0x80000000 cfg=0x00000000', log)
@@ -1021,6 +1128,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
         self.assertEqual(self.lib.power_reg(0x120), 0x80000000)
         self.assertEqual(self.lib.power_reg(0x124), 0)
+        self.assertEqual(self.lib.power_gmu_unchanged(), 1)
 
     def test_bringup_without_gpuon_writes_nothing(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
