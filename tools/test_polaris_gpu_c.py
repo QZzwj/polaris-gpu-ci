@@ -51,7 +51,7 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 111):
+        for number in range(94, 112):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -117,11 +117,14 @@ EXPORT unsigned ref_arg(unsigned i) {
  * second +0x1000 bias cannot masquerade as a plausible register value. */
 static uint32_t power_regs[0x2000 / 4], power_snapshot[0x2000 / 4];
 static uint32_t pll_regs[0x1000 / 4], pll_snapshot[0x1000 / 4];
+static uint32_t gcc_axi_regs[0x1000 / 4], gcc_axi_snapshot[0x1000 / 4];
+static uint32_t gcc_gfx_regs[0x1000 / 4], gcc_gfx_snapshot[0x1000 / 4];
 #define PLL1_PAGE_OFFSET 0x100u
 static int power_enabled, power_on_arg, power_board, power_bad_map;
 static int power_pll_bad_map;
-static int power_model, power_clk_model;
-static unsigned power_maps, power_writes;
+static int power_bus_bad_map;
+static int power_model, power_clk_model, power_bus_model;
+static unsigned power_maps, power_writes, power_cfg_ahb_write_count;
 static int rh_diag_arg = 1, rh_vote_arg, rh_level_arg;
 static char power_text[8192];
 static size_t power_text_len;
@@ -168,6 +171,14 @@ vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size) {
         if (power_pll_bad_map) return 0;
         return (vm_offset_t)pll_regs;
     }
+    if (phys == 0x00144000 && size == sizeof(gcc_axi_regs)) {
+        if (power_bus_bad_map) return 0;
+        return (vm_offset_t)gcc_axi_regs;
+    }
+    if (phys == 0x00171000 && size == sizeof(gcc_gfx_regs)) {
+        if (power_bus_bad_map) return 0;
+        return (vm_offset_t)gcc_gfx_regs;
+    }
     if (phys != 0x05091000 || size != sizeof(power_regs)) {
         power_bad_map = 1;
         return 0;
@@ -178,6 +189,20 @@ static void power_pll_init(void) {
     memset(pll_regs, 0, sizeof(pll_regs));
     memcpy(pll_snapshot, pll_regs, sizeof(pll_regs));
     power_pll_bad_map = 0;
+}
+static void power_bus_init(void) {
+    for (unsigned i = 0; i < sizeof(gcc_axi_regs) / sizeof(gcc_axi_regs[0]); i++)
+        gcc_axi_regs[i] = 0x5a5a5a5a;
+    for (unsigned i = 0; i < sizeof(gcc_gfx_regs) / sizeof(gcc_gfx_regs[0]); i++)
+        gcc_gfx_regs[i] = 0x5a5a5a5a;
+    gcc_axi_regs[0x38 / 4] = 0x80000000;
+    gcc_gfx_regs[0x0c / 4] = 0x80000000;
+    gcc_gfx_regs[0x04 / 4] = 0x00000001;
+    memcpy(gcc_axi_snapshot, gcc_axi_regs, sizeof(gcc_axi_regs));
+    memcpy(gcc_gfx_snapshot, gcc_gfx_regs, sizeof(gcc_gfx_regs));
+    power_bus_bad_map = 0;
+    power_bus_model = 0;
+    power_cfg_ahb_write_count = 0;
 }
 void pg_pwr_test_reset(void);
 EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
@@ -191,10 +216,11 @@ EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     power_regs[0x124 / 4] = 0;
     memcpy(power_snapshot, power_regs, sizeof(power_regs));
     power_enabled = enabled; power_on_arg = enabled; power_board = board;
-    power_model = 0; power_clk_model = 0; power_writes = 0;
+    power_model = 0; power_clk_model = 0; power_bus_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
     pg_pwr_test_reset();
     power_pll_init();
+    power_bus_init();
     if (write_probe) (void)polaris_gpu_rails_enter(); else polaris_gpu_pwr_probe();
     return power_text;
 }
@@ -204,6 +230,28 @@ EXPORT int power_memory_unchanged(void) {
 }
 void pg_pwr_test_after_write(unsigned page, uint32_t off, uint32_t value) {
     power_writes++;
+    if (page == 2) {
+        uint32_t *regs = NULL;
+        if (off == 0x38) regs = gcc_axi_regs;
+        else if (off == 0x0c || off == 0x04) regs = gcc_gfx_regs;
+        else { power_bad_map = 1; return; }
+        if (off == 0x04) {
+            power_cfg_ahb_write_count++;
+            regs[off / 4] = value;
+            return;
+        }
+        regs[off / 4] = value;
+        if (value & 1u) {
+            if ((off == 0x38 && power_bus_model == 1) ||
+                (off == 0x0c && power_bus_model == 2))
+                regs[off / 4] |= 0x80000000u;
+            else
+                regs[off / 4] &= ~0x80000000u;
+        } else {
+            regs[off / 4] |= 0x80000000u;
+        }
+        return;
+    }
     if (page == 1) {
         /* Fabia PLL1: LOCK_DET appears once OPMODE=RUN with L/FRAC set. */
         if (off == 0x2c) {
@@ -237,11 +285,17 @@ void pg_pwr_test_after_write(unsigned page, uint32_t off, uint32_t value) {
             /* UPDATE never self-clears. */
         } else {
             v &= ~1u;
+            v &= ~0x10u;
         }
         power_regs[0x120 / 4] = v;
     }
-    if (off == 0x124 && power_clk_model == 5)
-        power_regs[0x124 / 4] = 0;      /* CFG write never lands */
+    if (off == 0x124) {
+        if (power_clk_model == 5)
+            power_regs[0x124 / 4] = 0;  /* CFG write never lands */
+        else
+            power_regs[0x124 / 4] = value;
+        power_regs[0x120 / 4] |= 0x10u; /* CFG is dirty until UPDATE. */
+    }
 }
 EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
     for (unsigned i = 0; i < sizeof(power_regs) / sizeof(power_regs[0]); i++)
@@ -251,17 +305,26 @@ EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
     power_regs[0x120 / 4] = 0x80000000;
     power_regs[0x124 / 4] = 0;
     power_enabled = on; power_on_arg = on; power_board = board;
-    power_model = model; power_clk_model = 0; power_writes = 0;
+    power_model = model; power_clk_model = 0; power_bus_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
     pg_pwr_test_reset();
     power_pll_init();
+    power_bus_init();
 }
 EXPORT int rails_enter(void) { return polaris_gpu_rails_enter(); }
 EXPORT void rails_exit(void) { polaris_gpu_rails_exit(); }
 EXPORT int clocks_enter(void) { return polaris_gpu_clocks_enter(); }
 EXPORT void clocks_exit(void) { polaris_gpu_clocks_exit(); }
+EXPORT int bus_enter(void) { return polaris_gpu_bus_enter(); }
+EXPORT void bus_exit(void) { polaris_gpu_bus_exit(); }
 EXPORT void power_clock_fault(unsigned mode) { power_clk_model = (int)mode; }
+EXPORT void power_bus_fault(unsigned mode) { power_bus_model = (int)mode; }
+EXPORT void power_bus_map_fault(int bad) { power_bus_bad_map = bad; }
+EXPORT void power_boot_optin(int on) { power_on_arg = on; }
 EXPORT unsigned power_reg(unsigned off) { return power_regs[off / 4]; }
+EXPORT unsigned power_gcc_reg(unsigned which, unsigned off) {
+    return (which ? gcc_gfx_regs : gcc_axi_regs)[off / 4];
+}
 EXPORT unsigned power_pll_reg(unsigned off) { return pll_regs[(PLL1_PAGE_OFFSET + off) / 4]; }
 EXPORT void power_pll_set(unsigned off, unsigned value) { pll_regs[(PLL1_PAGE_OFFSET + off) / 4] = value; }
 EXPORT void power_pll_snapshot(void) { memcpy(pll_snapshot, pll_regs, sizeof(pll_regs)); }
@@ -270,6 +333,12 @@ EXPORT int power_pll_unchanged(void) {
 }
 EXPORT void power_pll_map_fault(int bad) { power_pll_bad_map = bad; }
 EXPORT unsigned power_write_count(void) { return power_writes; }
+EXPORT unsigned power_cfg_ahb_writes(void) { return power_cfg_ahb_write_count; }
+EXPORT int power_bus_unchanged(void) {
+    return !power_bus_bad_map &&
+        memcmp(gcc_axi_snapshot, gcc_axi_regs, sizeof(gcc_axi_regs)) == 0 &&
+        memcmp(gcc_gfx_snapshot, gcc_gfx_regs, sizeof(gcc_gfx_regs)) == 0;
+}
 EXPORT const char *power_log(void) { return power_text; }
 /* Fake ADT properties deliberately start at unaligned addresses, as real ADT
  * properties may. No firmware bytes, MMIO or device are needed by this test. */
@@ -475,14 +544,23 @@ EXPORT int rh_sleep_wake_unchanged(void) {
                                               ctypes.c_int, ctypes.c_int]
         cls.lib.rails_enter.restype = ctypes.c_int
         cls.lib.clocks_enter.restype = ctypes.c_int
+        cls.lib.bus_enter.restype = ctypes.c_int
+        cls.lib.bus_exit.restype = None
+        cls.lib.power_bus_fault.argtypes = [ctypes.c_uint]
+        cls.lib.power_bus_map_fault.argtypes = [ctypes.c_int]
+        cls.lib.power_boot_optin.argtypes = [ctypes.c_int]
         cls.lib.power_reg.argtypes = [ctypes.c_uint]
         cls.lib.power_reg.restype = ctypes.c_uint
+        cls.lib.power_gcc_reg.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        cls.lib.power_gcc_reg.restype = ctypes.c_uint
         cls.lib.power_pll_reg.argtypes = [ctypes.c_uint]
         cls.lib.power_pll_reg.restype = ctypes.c_uint
         cls.lib.power_pll_set.argtypes = [ctypes.c_uint, ctypes.c_uint]
         cls.lib.power_pll_unchanged.restype = ctypes.c_int
         cls.lib.power_pll_map_fault.argtypes = [ctypes.c_int]
         cls.lib.power_write_count.restype = ctypes.c_uint
+        cls.lib.power_cfg_ahb_writes.restype = ctypes.c_uint
+        cls.lib.power_bus_unchanged.restype = ctypes.c_int
         cls.lib.power_log.restype = ctypes.c_char_p
         cls.lib.power_map_count.restype = ctypes.c_uint
         cls.lib.power_memory_unchanged.restype = ctypes.c_int
@@ -716,6 +794,8 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
         self.assertEqual(self.lib.power_reg(0x120), 0x80000000)
         self.assertEqual(self.lib.power_reg(0x124), 0)
+        self.assertEqual(self.lib.power_reg(0x120) & 0x10, 0)
+        self.assertEqual(self.lib.power_bus_unchanged(), 1)
         self.assertEqual(self.lib.power_reg(0x6c), 0x80222000)
         self.assertEqual(self.lib.power_pll_unchanged(), 1)
 
@@ -840,6 +920,89 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.power_reg(0x124), 0)
         self.assertEqual(self.lib.power_pll_unchanged(), 1)
 
+    def test_bus_refuses_without_owned_clocks_before_mapping(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.bus_enter(), 0)
+        self.assertIn('bus refused; clocks not owned', self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_map_count(), 0)
+        self.assertEqual(self.lib.power_write_count(), 0)
+
+    def test_bus_requires_separate_optin_after_clocks(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        maps = self.lib.power_map_count()
+        writes = self.lib.power_write_count()
+        self.lib.power_boot_optin(0)
+        self.assertEqual(self.lib.bus_enter(), 0)
+        self.assertIn('bus write not opt-in; bus untouched',
+                      self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_map_count(), maps)
+        self.assertEqual(self.lib.power_write_count(), writes)
+        self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x80000000)
+        self.assertEqual(self.lib.power_gcc_reg(1, 0x0c), 0x80000000)
+
+    def test_bus_axi_timeout_restores_axi_and_leaves_memnoc(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.lib.power_bus_fault(1)
+        self.assertEqual(self.lib.bus_enter(), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('bus axi halt timeout after 200 polls; '
+                      'axi restored=0x80000000; memnoc untouched=0x80000000', log)
+        self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x80000000)
+        self.assertEqual(self.lib.power_gcc_reg(1, 0x0c), 0x80000000)
+        self.assertEqual(self.lib.power_cfg_ahb_writes(), 0)
+
+    def test_bus_memnoc_timeout_restores_memnoc_then_axi(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.lib.power_bus_fault(2)
+        self.assertEqual(self.lib.bus_enter(), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('bus memnoc halt timeout after 200 polls; '
+                      'memnoc restored=0x80000000 axi restored=0x80000000', log)
+        self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x80000000)
+        self.assertEqual(self.lib.power_gcc_reg(1, 0x0c), 0x80000000)
+        self.assertEqual(self.lib.power_cfg_ahb_writes(), 0)
+
+    def test_bus_enables_both_branches_readonly_cfg_ahb_and_exit_restores(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('bus enter axi=0x80000000 memnoc=0x80000000 '
+                      'cfg_ahb=0x00000001', log)
+        self.assertIn('bus axi enabled after 1 polls; CBCR=0x00000001', log)
+        self.assertIn('bus memnoc enabled after 1 polls; CBCR=0x00000001', log)
+        self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x00000001)
+        self.assertEqual(self.lib.power_gcc_reg(1, 0x0c), 0x00000001)
+        self.assertEqual(self.lib.power_gcc_reg(1, 0x04), 0x00000001)
+        self.assertEqual(self.lib.power_cfg_ahb_writes(), 0)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.bus_exit()
+        log = self.lib.power_log().decode()
+        self.assertIn('bus exit restored axi=0x80000000 memnoc=0x80000000 '
+                      'cfg_ahb=0x00000001', log)
+        self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x80000000)
+        self.assertEqual(self.lib.power_gcc_reg(1, 0x0c), 0x80000000)
+        self.lib.bus_exit()
+        self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x80000000)
+
+    def test_bus_failed_second_map_claims_nothing(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.lib.power_bus_map_fault(1)
+        self.assertEqual(self.lib.bus_enter(), 0)
+        self.assertIn('cannot map GCC GPU AXI branch page',
+                      self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_gcc_reg(0, 0x38), 0x80000000)
+        self.assertEqual(self.lib.power_gcc_reg(1, 0x0c), 0x80000000)
+
     def test_bringup_clocks_stage_runs_then_bus_refuses_and_unwinds(self):
         self.lib.diag_reset(0, 1, 1)
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
@@ -847,7 +1010,9 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertIn('CX owned, rollback=0x00222001', log)
         self.assertIn('gmu clock source root on; cfg=0x00000300', log)
         self.assertIn('POLARIS GPU: GMU clock running', log)
-        self.assertIn('bus backend not implemented; no hardware access', log)
+        self.assertIn('POLARIS GPU: GMU bus clocks running', log)
+        self.assertIn('GMU backend not implemented; no hardware access', log)
+        self.assertIn('bus exit restored axi=0x80000000 memnoc=0x80000000', log)
         self.assertIn('clocks exit restored cbcr=0x80004220 '
                       'cmd=0x80000000 cfg=0x00000000', log)
         self.assertIn('rails exit collapsed after 1 polls GDSCR=0x00222001; CX released', log)

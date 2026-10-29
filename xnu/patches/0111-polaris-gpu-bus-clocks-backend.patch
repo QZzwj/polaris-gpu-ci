@@ -1,0 +1,382 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 0fda889..72b6fa3 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -46,6 +46,7 @@ struct polaris_gpu_context {
+ 
+ #define POLARIS_GPU_OWN_CX	(1u << 0)
+ #define POLARIS_GPU_OWN_CLOCKS	(1u << 1)
++#define POLARIS_GPU_OWN_BUS	(1u << 2)
+ 
+ static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
+ 
+@@ -113,6 +114,21 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 		printf("POLARIS GPU: GMU clock running\n");
+ 		return true;
+ 	}
++	if (stage == POLARIS_GPU_BUS) {
++		/*
++		 * Enable the two GCC branches that carry GMU AXI and memory
++		 * traffic. The backend requires CX and clocks owned above and
++		 * undoes both branch writes if either halt poll fails.
++		 */
++		if (!polaris_gpu_bus_enter()) {
++			printf("POLARIS GPU: bus request refused; no ownership claimed\n");
++			return false;
++		}
++		ctx->owned |= POLARIS_GPU_OWN_BUS;
++		ctx->completed++;
++		printf("POLARIS GPU: GMU bus clocks running\n");
++		return true;
++	}
+ 	if (stage != POLARIS_GPU_BOARD) {
+ 		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
+ 		    polaris_gpu_stage_name[stage]);
+@@ -137,6 +153,10 @@ polaris_gpu_unwind(struct polaris_gpu_context *ctx, bool idle_confirmed)
+ 		return;
+ 	}
+ 	/* Release only the resources this driver actually acquired, in reverse. */
++	if (ctx->owned & POLARIS_GPU_OWN_BUS) {
++		polaris_gpu_bus_exit();
++		ctx->owned &= ~POLARIS_GPU_OWN_BUS;
++	}
+ 	if (ctx->owned & POLARIS_GPU_OWN_CLOCKS) {
+ 		polaris_gpu_clocks_exit();
+ 		ctx->owned &= ~POLARIS_GPU_OWN_CLOCKS;
+@@ -203,14 +223,18 @@ polaris_gpu_init(void)
+ 	}
+ 	/*
+ 	 * CX is now owned. The clocks stage brings up the GMU clock source and
+-	 * CX branch; the next stage still has no backend, so the gate must
+-	 * refuse there and unwind must release clocks and then CX in reverse
++	 * CX branch; the bus stage then enables the two GCC branches feeding
++	 * the GMU. The GMU stage still has no backend, so the gate must refuse
++	 * there and unwind must release bus, clocks and then CX in reverse
+ 	 * order rather than leave ownerless resources powered.
+ 	 */
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_CLOCKS)) {
+ 		goto fail;
+ 	}
+-	(void)polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BUS);
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BUS)) {
++		goto fail;
++	}
++	(void)polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_GMU);
+ 	goto fail;
+ fail:
+ 	polaris_gpu_unwind(&polaris_gpu, true);
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index 9c1c376..30f75c5 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -26,4 +26,15 @@ void polaris_gpu_rails_exit(void);
+ int polaris_gpu_clocks_enter(void);
+ void polaris_gpu_clocks_exit(void);
+ 
++/*
++ * Bus stage: enable the two GCC voted branches that feed the GMU
++ * (ddrss_gpu_axi_clk and gpu_memnoc_gfx_clk). Requires both the CX domain and
++ * the clocks stage owned above. Each branch is read back and polled with a
++ * finite budget; failure restores every branch this stage changed, in reverse
++ * order. exit() restores the saved branch values and is a no-op unless enter()
++ * succeeded. The GPU configuration AHB branch is observed read-only.
++ */
++int polaris_gpu_bus_enter(void);
++void polaris_gpu_bus_exit(void);
++
+ #endif /* _BSD_DEV_POLARIS_GPU_PWR_H_ */
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 87840a2..703df67 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -46,6 +46,24 @@ extern bool polaris_touch_i2c_board(void);
+ #define PG_PLL1_MAP_SZ   0x1000ull
+ /* gpu_cc_pll1.offset in the vendor gpucc-sdm845 driver. */
+ #define PG_PLL1_OFFSET   0x100u
++
++/*
++ * GCC has a much larger register window than GPUCC (the vendor regmap accepts
++ * offsets through 0x182090). Map only the two pages that hold the GMU branch
++ * registers instead of claiming the whole GCC aperture.
++ *
++ * gcc_ddrss_gpu_axi_clk  = GCC + 0x44038 -> 0x00144038
++ * gcc_gpu_memnoc_gfx_clk = GCC + 0x7100c -> 0x0017100c
++ * gcc_gpu_cfg_ahb_clk    = GCC + 0x71004 -> 0x00171004
++ */
++#define PG_GCC_AXI_MAP       0x00144000ull
++#define PG_GCC_AXI_MAP_SZ    0x1000ull
++#define PG_GCC_GFX_MAP       0x00171000ull
++#define PG_GCC_GFX_MAP_SZ    0x1000ull
++#define PG_GCC_DDRSS_GPU_AXI_OFF  0x038u
++#define PG_GCC_GPU_MEMNOC_GFX_OFF 0x00cu
++#define PG_GCC_GPU_CFG_AHB_OFF    0x004u
++
+ #define PG_CX_GDSCR      (0x106cu - PG_GPUCC_PAGE_OFFSET)
+ #define PG_CX_GMU_CBCR   (0x1098u - PG_GPUCC_PAGE_OFFSET)
+ #define PG_GMU_CLK_CMD   (0x1120u - PG_GPUCC_PAGE_OFFSET)
+@@ -82,9 +100,19 @@ extern bool polaris_touch_i2c_board(void);
+ #define PG_RCG_CMD_UPDATE      (1u << 0)
+ #define PG_RCG_CMD_ROOT_EN     (1u << 1)
+ #define PG_RCG_CMD_ROOT_OFF    (1u << 31)
++#define PG_RCG_CMD_DIRTY_CFG   (1u << 4)
+ #define PG_RCG_CFG_PLL1        (3u << 8)
+ #define PG_RCG_CFG_GPLL0_200M  (6u << 8 | 2u)
+ 
++/*
++ * GCC branch registers use the common clk-branch layout. bit 0 is the branch
++ * enable; bit 31 reads as CLK_OFF while the branch is halted. Both GMU-facing
++ * branches are BRANCH_VOTED: an enable waits for CLK_OFF to clear, while a
++ * disable does not poll because another voter may still hold the branch on.
++ */
++#define PG_GCC_BRANCH_ENABLE   (1u << 0)
++#define PG_GCC_BRANCH_CLK_OFF  (1u << 31)
++
+ /*
+  * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
+  * mainline agree on the Fabia table). PLL_MODE carries PLL_OUTCTRL(0),
+@@ -129,6 +157,8 @@ extern bool polaris_touch_i2c_board(void);
+ 
+ static volatile uint32_t *pg_cx_regs;
+ static volatile uint32_t *pg_pll_regs;
++static volatile uint32_t *pg_gcc_axi_regs;
++static volatile uint32_t *pg_gcc_gfx_regs;
+ static uint32_t pg_cx_saved;
+ static int pg_cx_owned;
+ 
+@@ -137,6 +167,10 @@ static uint32_t pg_cbcr_saved;
+ static uint32_t pg_cmd_saved;
+ static uint32_t pg_cfg_saved;
+ 
++static int pg_bus_owned;
++static uint32_t pg_bus_axi_saved;
++static uint32_t pg_bus_memnoc_saved;
++
+ struct pg_pll_state {
+ 	uint32_t mode;
+ 	uint32_t l;
+@@ -209,6 +243,32 @@ pg_pll_map(void)
+ 	return true;
+ }
+ 
++static bool
++pg_gcc_map(void)
++{
++	vm_offset_t virt;
++
++	if (pg_gcc_axi_regs == NULL) {
++		virt = ml_io_map(PG_GCC_AXI_MAP, PG_GCC_AXI_MAP_SZ);
++		if (virt == 0) {
++			printf("POLARIS PWR: cannot map GCC GPU AXI branch page; "
++			    "bus request skipped\n");
++			return false;
++		}
++		pg_gcc_axi_regs = (volatile uint32_t *)virt;
++	}
++	if (pg_gcc_gfx_regs == NULL) {
++		virt = ml_io_map(PG_GCC_GFX_MAP, PG_GCC_GFX_MAP_SZ);
++		if (virt == 0) {
++			printf("POLARIS PWR: cannot map GCC GPU GFX branch page; "
++			    "bus request skipped\n");
++			return false;
++		}
++		pg_gcc_gfx_regs = (volatile uint32_t *)virt;
++	}
++	return true;
++}
++
+ int
+ polaris_gpu_rails_enter(void)
+ {
+@@ -434,11 +494,21 @@ pg_pll1_exit(void)
+ static void
+ pg_clocks_rollback(uint32_t cbcr, uint32_t cmd, uint32_t cfg)
+ {
+-	uint32_t rc, rm, rf;
++	uint32_t rc, rm, rf, now;
++	unsigned int i;
+ 
+ 	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr, 0);
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd, 0);
+ 	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, cfg, 0);
++	now = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, now | PG_RCG_CMD_UPDATE, 0);
++	for (i = 0; i < PG_RCG_POLL_US; i++) {
++		if ((pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD) &
++		    (PG_RCG_CMD_UPDATE | PG_RCG_CMD_DIRTY_CFG)) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd, 0);
+ 	rc = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+ 	rm = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
+ 	rf = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
+@@ -567,15 +637,40 @@ polaris_gpu_clocks_enter(void)
+ void
+ polaris_gpu_clocks_exit(void)
+ {
+-	uint32_t cbcr, rc, rm, rf;
++	uint32_t cbcr, cmd, dirty_before, rc, rm, rf;
++	unsigned int i;
+ 
+ 	if (!pg_clk_owned || pg_cx_regs == NULL) {
+ 		return;
+ 	}
+ 	cbcr = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+ 	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr & ~PG_CBCR_ENABLE, 0);
+-	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, pg_cmd_saved, 0);
++	cmd = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++	dirty_before = cmd & PG_RCG_CMD_DIRTY_CFG;
++
++	/*
++	 * Restore CFG first, then commit it with UPDATE. Restoring CMD before
++	 * CFG leaves CMD_DIRTY_CFG set (observed on the 0110 run) and makes the
++	 * final register pair disagree about which configuration is live.
++	 */
+ 	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, pg_cfg_saved, 0);
++	cmd = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd | PG_RCG_CMD_UPDATE, 0);
++	for (i = 0; i < PG_RCG_POLL_US; i++) {
++		cmd = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++		if ((cmd & (PG_RCG_CMD_UPDATE | PG_RCG_CMD_DIRTY_CFG)) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (dirty_before && i < PG_RCG_POLL_US) {
++		printf("POLARIS PWR: clocks exit cleared dirty cfg after %u polls; "
++		    "cmd=0x%08x\n", i + 1, cmd);
++	} else if (cmd & PG_RCG_CMD_DIRTY_CFG) {
++		printf("POLARIS PWR: clocks exit dirty cfg remains after %u polls; "
++		    "cmd=0x%08x\n", i, cmd);
++	}
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, pg_cmd_saved, 0);
+ 	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, pg_cbcr_saved, 0);
+ 	rc = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+ 	rm = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
+@@ -586,6 +681,113 @@ polaris_gpu_clocks_exit(void)
+ 	pg_clk_owned = 0;
+ }
+ 
++int
++polaris_gpu_bus_enter(void)
++{
++	int optin = 0;
++	uint32_t axi, memnoc, cfg_ahb;
++	unsigned int i;
++
++	if (pg_bus_owned) {
++		return 1;
++	}
++	if (!pg_cx_owned || !pg_clk_owned || pg_cx_regs == NULL) {
++		printf("POLARIS PWR: bus refused; clocks not owned\n");
++		return 0;
++	}
++	if (!PE_parse_boot_argn("polarisgpuon", &optin, sizeof(optin)) ||
++	    optin != 1) {
++		printf("POLARIS PWR: bus write not opt-in; bus untouched\n");
++		return 0;
++	}
++	if (!pg_gcc_map()) {
++		return 0;
++	}
++
++	axi = pg_rd32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF);
++	memnoc = pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF);
++	cfg_ahb = pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_CFG_AHB_OFF);
++	pg_bus_axi_saved = axi;
++	pg_bus_memnoc_saved = memnoc;
++	printf("POLARIS PWR: bus enter axi=0x%08x memnoc=0x%08x "
++	    "cfg_ahb=0x%08x\n", axi, memnoc, cfg_ahb);
++
++	/* Enable ddrss_gpu_axi_clk and wait for its voted branch to unhalt. */
++	pg_wr32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF,
++	    axi | PG_GCC_BRANCH_ENABLE, 2);
++	for (i = 0; i < PG_POLL_US; i++) {
++		if ((pg_rd32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF) &
++		    PG_GCC_BRANCH_CLK_OFF) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_POLL_US) {
++		pg_wr32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF, axi, 2);
++		DELAY(10);
++		printf("POLARIS PWR: bus axi halt timeout after %u polls; "
++		    "axi restored=0x%08x; memnoc untouched=0x%08x\n",
++		    PG_POLL_US,
++		    pg_rd32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF),
++		    pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF));
++		return 0;
++	}
++	printf("POLARIS PWR: bus axi enabled after %u polls; CBCR=0x%08x\n",
++	    i + 1, pg_rd32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF));
++
++	/* Enable gpu_memnoc_gfx_clk; on failure undo AXI as well. */
++	pg_wr32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF,
++	    memnoc | PG_GCC_BRANCH_ENABLE, 2);
++	for (i = 0; i < PG_POLL_US; i++) {
++		if ((pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF) &
++		    PG_GCC_BRANCH_CLK_OFF) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_POLL_US) {
++		pg_wr32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF, memnoc, 2);
++		DELAY(10);
++		pg_wr32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF, axi, 2);
++		DELAY(10);
++		printf("POLARIS PWR: bus memnoc halt timeout after %u polls; "
++		    "memnoc restored=0x%08x axi restored=0x%08x\n",
++		    PG_POLL_US,
++		    pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF),
++		    pg_rd32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF));
++		return 0;
++	}
++	printf("POLARIS PWR: bus memnoc enabled after %u polls; CBCR=0x%08x\n",
++	    i + 1, pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF));
++	pg_bus_owned = 1;
++	return 1;
++}
++
++void
++polaris_gpu_bus_exit(void)
++{
++	uint32_t axi, memnoc, cfg_ahb;
++
++	if (!pg_bus_owned || pg_gcc_axi_regs == NULL ||
++	    pg_gcc_gfx_regs == NULL) {
++		return;
++	}
++
++	/* VOTED branches do not poll on disable: another voter may hold them. */
++	pg_wr32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF,
++	    pg_bus_memnoc_saved, 2);
++	DELAY(10);
++	pg_wr32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF,
++	    pg_bus_axi_saved, 2);
++	DELAY(10);
++	axi = pg_rd32(pg_gcc_axi_regs, PG_GCC_DDRSS_GPU_AXI_OFF);
++	memnoc = pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_MEMNOC_GFX_OFF);
++	cfg_ahb = pg_rd32(pg_gcc_gfx_regs, PG_GCC_GPU_CFG_AHB_OFF);
++	printf("POLARIS PWR: bus exit restored axi=0x%08x memnoc=0x%08x "
++	    "cfg_ahb=0x%08x\n", axi, memnoc, cfg_ahb);
++	pg_bus_owned = 0;
++}
++
+ #ifdef PG_PWR_TEST
+ void
+ pg_pwr_test_reset(void)
+@@ -599,6 +801,11 @@ pg_pwr_test_reset(void)
+ 	pg_cfg_saved = 0;
+ 	pg_pll_regs = NULL;
+ 	pg_pll_owned = 0;
++	pg_gcc_axi_regs = NULL;
++	pg_gcc_gfx_regs = NULL;
++	pg_bus_owned = 0;
++	pg_bus_axi_saved = 0;
++	pg_bus_memnoc_saved = 0;
+ 	memset(&pg_pll_saved, 0, sizeof(pg_pll_saved));
+ }
+ #endif
