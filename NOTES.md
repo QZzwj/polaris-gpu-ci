@@ -1086,3 +1086,52 @@ the real API and the fixture declares the same prototype, so this mismatch can
 no longer pass host tests. Patch 0105 was regenerated (LF, 8,903 bytes) and all
 122 regressions pass. A new CI build is required before any 0105 image is
 packaged; GPU acceleration remains off.
+
+
+### 2026-10-29: 0105 CI success and device results (no GPU)
+
+CI run **40829091993** on branch `polaris-gpu-fixes-9b4d58b7` succeeded for
+remote commit `4bcc90de26016288bedd0e649dd7f08efc7b7c69` (local
+`9b4d58b799f37472f85b5e4e7c14744996c158cc`). It produced
+`kernel.release.sweet`, 12,318,384 B, SHA256
+`ea390585c172eab5026ceb7f840f7b0f7a04da95fd2314f6a78c0f61bbebf326`.
+Two temporary images were packaged with `polarisgpuon=0`:
+
+- regression, `boot-polaris-0105-regression.img`, 18,141,184 B, SHA256
+  `0f0268d8c6cfb6df4b9a457c9a15b4666a6913f7635e42436f0d76566cd6f2a4`,
+  cmdline ends `polarisrpmhvote=0`.
+- vote, `boot-polaris-0105-vote-lvl0.img`, 18,141,184 B, SHA256
+  `6d9aba03c79eb8c781796d299ef24baae2ec7b1e7790b6d0bce572d9ab13423c`,
+  cmdline ends `polarisrpmhvote=1 polarisrpmhlevel=0`.
+
+Both were only temporarily booted with `fastboot boot`; no partition was
+written. The regression ring (flush #17, 209,615 B, SHA256
+`31e0740734175c9c6c6f900daed38094ad0e41c1324d7ba000eb539b63b91a2a`)
+still reports `DRV2@0x179e0000 TCS+0xd00 config=0x80008104 banks=8 ncpt=16
+result=0`, all eight TCS banks idle/empty, the ten `gfx.lvl` selectors through
+OFF/`0x1a0`, and `observation only; no lease, no ARC vote, no GPU power`.
+This establishes that 0105 did not regress the read-only path.
+
+The vote ring (flush #67, 227,348 B, SHA256
+`05e60fbe2a4f032136557c3c0b06e68f9ecd0908b20ff64aa6dd08dd0f1bcc4f`)
+contains the single attempted command:
+
+- `POLARIS RPMH: vote opt-in level=0; single-shot gfx.lvl only`
+- `POLARIS RPMH: gfx.lvl selector=0 addr=0x30050 data=0x0 result=4`
+- `POLARIS RPMH: vote did not ACK; transport quarantined=1`
+- `POLARIS RPMH: vote result=4; no GDSC/clock/SMMU/GPU access`
+
+`result=4` is `PG_RH_TIMEOUT`: the command was written in the selected ACTIVE
+TCS, but the completion status/IRQ did not arrive before the 10 ms deadline.
+There is no `post-vote` line because completion never permitted cleanup. The
+transport stayed quarantined until reboot and was not retried. This proves the
+boot path can reach the write attempt, but it does **not** prove a TCS write,
+ACK, gfx rail ownership, voltage/clock bring-up, or GPU execution. The display
+remained CPU-composited (`SWEET FB` swaps, no GPU acceleration).
+
+Next diagnostic must explain the missing completion without retrying the same
+vote: read back the target ACTIVE TCS `STATUS`, `CONTROL`, `ENABLE`, `WAIT`,
+`MSGID`, `ADDR`, `DATA`, `CMD_STATUS`, and DRV `IRQ_ENABLE`/`IRQ_STATUS` after
+the timeout, and compare the trigger/enable sequence with the documented
+AOSP RPMh RSC ordering. Do not switch to level 9 or touch GPUCC/GDSC until the
+completion path is understood.
