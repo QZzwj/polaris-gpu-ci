@@ -1004,3 +1004,46 @@ Recorded applicability in docs/POLARIS-GPU-NEXT-STEPS.md. Reuse the array-add
 idea only after actual headless CP proof; do not add a loader wrapper and report
 GPU acceleration. ELF/Bionic and KGSL ABI adaptation would itself be substantial
 work and would still require the missing hardware backend and iOS integration.
+
+### 2026-10-29: 0104 RPMh build, silent patch-skip incident, temporary image
+
+CI run **40820200192** on branch `polaris-gpu-fixes-3816ca34` succeeded for
+remote commit `7a6b6383900bfbc17dba67a9649e71fe8d8e96f7` (local
+`3816ca342b83e9e69b81cb411608326d4dbb0df0`). It produced the kernel used for
+the first RPMh read-only probe:
+
+- `kernel.release.sweet`, 12,318,376 B, SHA256
+  `a1560eefc375e7e9da5814d5fed44f6b9e9d5a1e5c7cc96b9446ebdd77740d79`.
+  Strings contain `POLARIS RPMH` x8, `DRV2@0x179e0000`, `observation only`,
+  `unreadable DRV2` and `gfx.lvl=10 selectors including OFF`.
+- Temporary image `boot-polaris-0104-temporary.img`, 18,141,184 B, SHA256
+  `28a4f77aaeeef4db88d5e290766c8f32937b9302fe0288be4c39caba09f37e6f`,
+  payload 11,839,344 B, 2,750,608 B left below the ABL load limit. The boot
+  command line enables `polarisgpudiag=1 polarisgpu=1 polarisgpupwr=1
+  polarisrpmhdiag=1` and keeps `polarisgpuon=0`.
+
+The first run **40809778516** reported success but was not a valid 0104 build:
+its log showed both `0103` and `0104` being skipped as "already upstream,
+previously applied, or malformed", and the artifact contained no RPMh code.
+Root cause: the reconstructed baseline omitted one line that patch 0092 adds to
+`polaris_gpu_diag.c`, so the 0103/0104 context did not match. The exact
+`xnu-buildtree` artifact from that run was extracted and both patches were
+regenerated against it. Forward/reverse/forward application then passed on a
+clean baseline, and all **117** regressions pass (82 Python plus actual compiled
+C fixtures, Zig 0.13.0, `-Wall -Wextra -Werror`).
+
+The 0104 adapter installs only a read callback after mapping
+`0x179e0000..0x179e3fff`; it installs no write, timer or authority callback, so
+no boot argument can make it send an ARC vote. The image manifest records
+`gpu_acceleration:false`, `gpu_power_write_optin:false` and
+`rpmh_write_path_wired:false`. This is still observation only: a successful
+snapshot will establish register geometry, not ownership of inherited ARC
+votes, and must not be described as GPU acceleration.
+
+As of **2026-10-29 05:45 UTC** the image has not been booted: `fastboot devices`
+and `adb devices` both returned no target. The local read-only helper
+`gpu-fix/device_0104.py` pins the image hash, refuses any write-path manifest,
+temporarily boots only, reads the persistent ring through the pinned recovery,
+and writes `ring-0104-summary-local.json` without putting serials in git.
+GPU acceleration remains off until a phone run proves the RSC geometry and a
+separately gated, owned rail vote is implemented.
