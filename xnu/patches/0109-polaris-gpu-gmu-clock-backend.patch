@@ -1,0 +1,320 @@
+From 0109 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] polaris: bring up GMU clock source and CX branch
+
+0108 read the GPUCC clock state and proved the CX GDSC collapses on exit,
+but left the GMU clock off: CX_GMU_CBCR read back with CLK_OFF set and the
+gmu_clk_src RCG had ROOT_OFF set with an empty configuration.
+
+This patch adds the clocks-stage backend behind the existing entry/exit
+contract: assert the WAKE/SLEEP nibbles in CX_GMU_CBCR, enable the RCG root,
+select parent 3 (PLL1_OUT_MAIN) with divider 1, commit the update, enable the
+CX GMU branch and wait for CLK_OFF to clear. Every step is bounded (500 us
+for the root/update, 200 us for the branch) and any failure restores all
+three saved registers before returning. The branch is disabled and the
+registers are restored on exit, in reverse order before the CX rail.
+
+PLL1 at GPUCC+0x0100 is outside the mapped window (which begins at +0x1000)
+and is not written. GX, SMMU, GMU and firmware remain untouched.
+
+
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 368a6ed..0fda889 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -45,6 +45,7 @@ struct polaris_gpu_context {
+ };
+ 
+ #define POLARIS_GPU_OWN_CX	(1u << 0)
++#define POLARIS_GPU_OWN_CLOCKS	(1u << 1)
+ 
+ static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
+ 
+@@ -59,7 +60,7 @@ static const char *const polaris_gpu_stage_name[POLARIS_GPU_STAGE_COUNT] = {
+ /*
+  * Only an acquired resource may be released. Resource-specific release
+  * callbacks must be installed before ANY power or mapping code is enabled.
+- * Only the rails stage has a bounded backend in this revision.
++ * Rails and clocks have bounded backends in this revision.
+  */
+ static bool
+ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+@@ -98,10 +99,19 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 		return true;
+ 	}
+ 	if (stage == POLARIS_GPU_CLOCKS) {
+-		/* Read-only: GPUCC clock state while CX is owned. No write, no vote. */
+-		polaris_gpu_clocks_probe();
+-		printf("POLARIS GPU: clocks backend not implemented; state read only\n");
+-		return false;
++		/*
++		 * Bring up the GMU clock source root and its CX branch. The
++		 * backend requires the CX domain owned above and restores the
++		 * three saved registers if any step fails.
++		 */
++		if (!polaris_gpu_clocks_enter()) {
++			printf("POLARIS GPU: clocks request refused; no ownership claimed\n");
++			return false;
++		}
++		ctx->owned |= POLARIS_GPU_OWN_CLOCKS;
++		ctx->completed++;
++		printf("POLARIS GPU: GMU clock running\n");
++		return true;
+ 	}
+ 	if (stage != POLARIS_GPU_BOARD) {
+ 		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
+@@ -127,6 +137,10 @@ polaris_gpu_unwind(struct polaris_gpu_context *ctx, bool idle_confirmed)
+ 		return;
+ 	}
+ 	/* Release only the resources this driver actually acquired, in reverse. */
++	if (ctx->owned & POLARIS_GPU_OWN_CLOCKS) {
++		polaris_gpu_clocks_exit();
++		ctx->owned &= ~POLARIS_GPU_OWN_CLOCKS;
++	}
+ 	if (ctx->owned & POLARIS_GPU_OWN_CX) {
+ 		polaris_gpu_rails_exit();
+ 		ctx->owned &= ~POLARIS_GPU_OWN_CX;
+@@ -188,11 +202,15 @@ polaris_gpu_init(void)
+ 		goto fail;
+ 	}
+ 	/*
+-	 * CX is now owned. There is still no clock backend, so the gate must
+-	 * refuse here and unwind must release CX in reverse order rather than
+-	 * leave an ownerless domain powered.
++	 * CX is now owned. The clocks stage brings up the GMU clock source and
++	 * CX branch; the next stage still has no backend, so the gate must
++	 * refuse there and unwind must release clocks and then CX in reverse
++	 * order rather than leave ownerless resources powered.
+ 	 */
+-	(void)polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_CLOCKS);
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_CLOCKS)) {
++		goto fail;
++	}
++	(void)polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BUS);
+ 	goto fail;
+ fail:
+ 	polaris_gpu_unwind(&polaris_gpu, true);
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index e0029eb..8f588d5 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -16,7 +16,13 @@ void polaris_gpu_pwr_probe(void);
+ int polaris_gpu_rails_enter(void);
+ void polaris_gpu_rails_exit(void);
+ 
+-/* Read-only GPUCC clock state; requires the CX domain owned above. */
+-void polaris_gpu_clocks_probe(void);
++/*
++ * Clocks stage: bring up the GMU clock source root and the CX GMU branch.
++ * Requires the CX domain owned above; returns true only when every step
++ * completed and was read back. exit() restores the three saved registers and
++ * is a no-op unless enter() succeeded.
++ */
++int polaris_gpu_clocks_enter(void);
++void polaris_gpu_clocks_exit(void);
+ 
+ #endif /* _BSD_DEV_POLARIS_GPU_PWR_H_ */
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 97c7481..e642174 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -54,13 +54,42 @@ extern bool polaris_touch_i2c_board(void);
+ #define PG_GDSCR_PWR_ON       (1u << 31)
+ #define PG_GDSCR_SW_COLLAPSE  (1u << 0)
+ 
++/*
++ * GMU clock constants, from the vendor gpucc-sdm845 driver and the common
++ * clk-rcg2/clk-branch code:
++ *   - CX_GMU_CBCR (+0x1098): bit 0 enables the branch, bit 31 reads back as
++ *     CLK_OFF while the branch is halted; WAKE/SLEEP are the two high nibbles
++ *     of the low 16 bits and are left asserted to keep the GMU clock alive.
++ *   - gmu_clk_src RCG (+0x1120 cmd, +0x1124 cfg): bit 1 requests the root,
++ *     bit 31 reports ROOT_OFF while the root is off, bit 0 is UPDATE and
++ *     self-clears; SRC_SEL is bits 8..10 and selects parent 3 (PLL1 main).
++ * PLL1 itself lives at GPUCC+0x0100, outside this mapping (which starts at
++ * +0x1000), so this stage must never write it.
++ */
++#define PG_CBCR_CLK_OFF        (1u << 31)
++#define PG_CBCR_GMU_MASK       (0x0ff0u)
++#define PG_CBCR_GMU_ON         (0x0ff0u)
++#define PG_CBCR_ENABLE         (1u << 0)
++
++#define PG_RCG_CMD_UPDATE      (1u << 0)
++#define PG_RCG_CMD_ROOT_EN     (1u << 1)
++#define PG_RCG_CMD_ROOT_OFF    (1u << 31)
++#define PG_RCG_CFG_PLL1        (3u << 8)
++
+ /* Bounded poll budget: 200 iterations of a 1 us delay. */
+ #define PG_POLL_US 200u
++/* RCG root/update budget: 500 iterations of a 1 us delay, as clk-rcg2 uses. */
++#define PG_RCG_POLL_US 500u
+ 
+ static volatile uint32_t *pg_cx_regs;
+ static uint32_t pg_cx_saved;
+ static int pg_cx_owned;
+ 
++static int pg_clk_owned;
++static uint32_t pg_cbcr_saved;
++static uint32_t pg_cmd_saved;
++static uint32_t pg_cfg_saved;
++
+ #ifdef PG_PWR_TEST
+ extern void pg_pwr_test_after_write(uint32_t, uint32_t);
+ void pg_pwr_test_reset(void);
+@@ -177,21 +206,138 @@ polaris_gpu_rails_exit(void)
+ 	    pg_cx_saved, PG_POLL_US, after);
+ }
+ 
+-void
+-polaris_gpu_clocks_probe(void)
++static void
++pg_clocks_rollback(uint32_t cbcr, uint32_t cmd, uint32_t cfg)
++{
++	uint32_t rc, rm, rf;
++
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, cfg);
++	rc = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
++	rm = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++	rf = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
++	printf("POLARIS PWR: GMU clock bring-up failed; rolled back "
++	    "(cbcr=0x%08x cmd=0x%08x cfg=0x%08x)\n", rc, rm, rf);
++}
++
++int
++polaris_gpu_clocks_enter(void)
+ {
+-	uint32_t cbcr, cmd, cfg;
++	uint32_t cbcr, cmd, cfg, value;
++	unsigned int i;
+ 
+ 	if (!pg_cx_owned || pg_cx_regs == NULL) {
+-		printf("POLARIS PWR: clock probe skipped; CX not owned\n");
+-		return;
++		printf("POLARIS PWR: clocks refused; CX not owned\n");
++		return 0;
++	}
++	if (pg_clk_owned) {
++		return 1;
+ 	}
+ 	cbcr = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
+ 	cmd = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
+ 	cfg = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
+-	printf("POLARIS PWR: clocks read-only cx_gmu_cbcr=0x%08x "
+-	    "gmu_clk_cmd=0x%08x cfg=0x%08x; nothing written\n",
+-	    cbcr, cmd, cfg);
++	pg_cbcr_saved = cbcr;
++	pg_cmd_saved = cmd;
++	pg_cfg_saved = cfg;
++	printf("POLARIS PWR: clocks enter cx_gmu_cbcr=0x%08x "
++	    "gmu_clk_cmd=0x%08x cfg=0x%08x\n", cbcr, cmd, cfg);
++
++	/* Assert WAKE and SLEEP without disturbing any other CBCR bit. */
++	value = (cbcr & ~PG_CBCR_GMU_MASK) | PG_CBCR_GMU_ON;
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, value);
++	if ((pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR) & PG_CBCR_GMU_MASK) !=
++	    PG_CBCR_GMU_ON) {
++		pg_clocks_rollback(cbcr, cmd, cfg);
++		return 0;
++	}
++
++	/* Request the root and wait for ROOT_OFF to drop. */
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd | PG_RCG_CMD_ROOT_EN);
++	for (i = 0; i < PG_RCG_POLL_US; i++) {
++		if ((pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD) & PG_RCG_CMD_ROOT_OFF)
++		    == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_RCG_POLL_US) {
++		pg_clocks_rollback(cbcr, cmd, cfg);
++		return 0;
++	}
++
++	/* Parent 3 = PLL1_OUT_MAIN, divider 1, dual-edge mode off. */
++	value = PG_RCG_CFG_PLL1;
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, value);
++	if (pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG) != value) {
++		pg_clocks_rollback(cbcr, cmd, cfg);
++		return 0;
++	}
++
++	/* Commit the new configuration and wait for UPDATE to self-clear. */
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, cmd | PG_RCG_CMD_ROOT_EN |
++	    PG_RCG_CMD_UPDATE);
++	for (i = 0; i < PG_RCG_POLL_US; i++) {
++		if ((pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD) & PG_RCG_CMD_UPDATE)
++		    == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_RCG_POLL_US) {
++		pg_clocks_rollback(cbcr, cmd, cfg);
++		return 0;
++	}
++
++	/* Enable the branch and wait for the halt indication to clear. */
++	value = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, value | PG_CBCR_ENABLE);
++	for (i = 0; i < PG_POLL_US; i++) {
++		if ((pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR) & PG_CBCR_CLK_OFF) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_POLL_US) {
++		pg_clocks_rollback(pg_cbcr_saved, pg_cmd_saved, pg_cfg_saved);
++		return 0;
++	}
++
++	/* Drop only the root request hint; ROOT_OFF must stay clear. */
++	value = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, value & ~PG_RCG_CMD_ROOT_EN);
++	if (pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD) & PG_RCG_CMD_ROOT_OFF) {
++		pg_clocks_rollback(pg_cbcr_saved, pg_cmd_saved, pg_cfg_saved);
++		return 0;
++	}
++
++	pg_clk_owned = 1;
++	printf("POLARIS PWR: gmu clock source root on; cfg=0x%08x\n",
++	    pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG));
++	printf("POLARIS PWR: gmu branch enabled; CBCR=0x%08x\n",
++	    pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR));
++	return 1;
++}
++
++void
++polaris_gpu_clocks_exit(void)
++{
++	uint32_t cbcr, rc, rm, rf;
++
++	if (!pg_clk_owned || pg_cx_regs == NULL) {
++		return;
++	}
++	cbcr = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, cbcr & ~PG_CBCR_ENABLE);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CMD, pg_cmd_saved);
++	pg_wr32(pg_cx_regs, PG_GMU_CLK_CFG, pg_cfg_saved);
++	pg_wr32(pg_cx_regs, PG_CX_GMU_CBCR, pg_cbcr_saved);
++	rc = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
++	rm = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++	rf = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
++	printf("POLARIS PWR: clocks exit restored cbcr=0x%08x cmd=0x%08x "
++	    "cfg=0x%08x\n", rc, rm, rf);
++	pg_clk_owned = 0;
+ }
+ 
+ #ifdef PG_PWR_TEST
+@@ -201,6 +347,10 @@ pg_pwr_test_reset(void)
+ 	pg_cx_regs = NULL;
+ 	pg_cx_saved = 0;
+ 	pg_cx_owned = 0;
++	pg_clk_owned = 0;
++	pg_cbcr_saved = 0;
++	pg_cmd_saved = 0;
++	pg_cfg_saved = 0;
+ }
+ #endif
+ 

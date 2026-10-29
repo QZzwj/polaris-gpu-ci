@@ -51,7 +51,7 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 109):
+        for number in range(94, 110):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -117,7 +117,7 @@ EXPORT unsigned ref_arg(unsigned i) {
  * second +0x1000 bias cannot masquerade as a plausible register value. */
 static uint32_t power_regs[0x2000 / 4], power_snapshot[0x2000 / 4];
 static int power_enabled, power_on_arg, power_board, power_bad_map;
-static int power_model;
+static int power_model, power_clk_model;
 static unsigned power_maps, power_writes;
 static int rh_diag_arg = 1, rh_vote_arg, rh_level_arg;
 static char power_text[8192];
@@ -174,9 +174,12 @@ EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     power_regs[0x6c / 4] = 0x80000001;
     power_regs[0x540 / 4] = 0x11223344;
     power_regs[0x0c / 4] = 0xaabbccdd;
+    power_regs[0x98 / 4] = 0x80004220;
+    power_regs[0x120 / 4] = 0x80000000;
+    power_regs[0x124 / 4] = 0;
     memcpy(power_snapshot, power_regs, sizeof(power_regs));
     power_enabled = enabled; power_on_arg = enabled; power_board = board;
-    power_model = 0; power_writes = 0;
+    power_model = 0; power_clk_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
     pg_pwr_test_reset();
     if (write_probe) (void)polaris_gpu_rails_enter(); else polaris_gpu_pwr_probe();
@@ -192,18 +195,43 @@ void pg_pwr_test_after_write(uint32_t off, uint32_t value) {
         power_regs[0x6c / 4] = value | 0x80000000u;
     if (off == 0x6c && power_model == 2)
         power_regs[0x6c / 4] = value | 0x80000000u;
+    if (off == 0x98) {
+        uint32_t v = value;
+        if (v & 1u) {
+            if (power_clk_model == 3) v |= 0x80000000u;  /* halt never clears */
+            else v &= ~0x80000000u;
+        }
+        power_regs[0x98 / 4] = v;
+    }
+    if (off == 0x120) {
+        uint32_t v = value;
+        if (power_clk_model == 1) v |= 0x80000000u;      /* ROOT_OFF stuck */
+        else if (v & 2u) v &= ~0x80000000u;
+        if (power_clk_model == 2 && (v & 1u)) {
+            /* UPDATE never self-clears. */
+        } else {
+            v &= ~1u;
+        }
+        power_regs[0x120 / 4] = v;
+    }
 }
 EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
     for (unsigned i = 0; i < sizeof(power_regs) / sizeof(power_regs[0]); i++)
         power_regs[i] = 0x5a5a5a5a;
     power_regs[0x6c / 4] = gdscr;
+    power_regs[0x98 / 4] = 0x80004220;
+    power_regs[0x120 / 4] = 0x80000000;
+    power_regs[0x124 / 4] = 0;
     power_enabled = on; power_on_arg = on; power_board = board;
-    power_model = model; power_writes = 0;
+    power_model = model; power_clk_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
     pg_pwr_test_reset();
 }
 EXPORT int rails_enter(void) { return polaris_gpu_rails_enter(); }
 EXPORT void rails_exit(void) { polaris_gpu_rails_exit(); }
+EXPORT int clocks_enter(void) { return polaris_gpu_clocks_enter(); }
+EXPORT void clocks_exit(void) { polaris_gpu_clocks_exit(); }
+EXPORT void power_clock_fault(unsigned mode) { power_clk_model = (int)mode; }
 EXPORT unsigned power_reg(unsigned off) { return power_regs[off / 4]; }
 EXPORT unsigned power_write_count(void) { return power_writes; }
 EXPORT const char *power_log(void) { return power_text; }
@@ -410,6 +438,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.power_rails_reset.argtypes = [ctypes.c_uint, ctypes.c_int,
                                               ctypes.c_int, ctypes.c_int]
         cls.lib.rails_enter.restype = ctypes.c_int
+        cls.lib.clocks_enter.restype = ctypes.c_int
         cls.lib.power_reg.argtypes = [ctypes.c_uint]
         cls.lib.power_reg.restype = ctypes.c_uint
         cls.lib.power_write_count.restype = ctypes.c_uint
@@ -621,17 +650,99 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.lib.rails_exit()
         self.assertEqual(self.lib.power_write_count(), 2)
 
-    def test_bringup_reads_clock_state_readonly_then_collapses_cx(self):
+    def test_clocks_enter_starts_gmu_source_and_branch_then_exit_restores(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('clocks enter cx_gmu_cbcr=0x80004220', log)
+        self.assertIn('gmu clock source root on; cfg=0x00000300', log)
+        self.assertIn('gmu branch enabled; CBCR=0x00004ff1', log)
+        self.assertEqual(self.lib.power_reg(0x98), 0x00004ff1)
+        self.assertEqual(self.lib.power_reg(0x120), 0x00000000)
+        self.assertEqual(self.lib.power_reg(0x124), 0x00000300)
+        self.lib.clocks_exit()
+        log = self.lib.power_log().decode()
+        self.assertIn('clocks exit restored cbcr=0x80004220 '
+                      'cmd=0x80000000 cfg=0x00000000', log)
+        self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
+        self.assertEqual(self.lib.power_reg(0x120), 0x80000000)
+        self.assertEqual(self.lib.power_reg(0x124), 0)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x80222000)
+
+    def test_clocks_refuse_without_cx_ownership(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.clocks_enter(), 0)
+        self.assertIn('clocks refused; CX not owned', self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_write_count(), 0)
+        self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
+
+    def test_clocks_root_off_timeout_rolls_back_all_three(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.lib.power_clock_fault(1)
+        self.assertEqual(self.lib.clocks_enter(), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('GMU clock bring-up failed; rolled back', log)
+        self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
+        self.assertEqual(self.lib.power_reg(0x120), 0x80000000)
+        self.assertEqual(self.lib.power_reg(0x124), 0)
+
+    def test_clocks_update_busy_times_out_and_rolls_back(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.lib.power_clock_fault(2)
+        self.assertEqual(self.lib.clocks_enter(), 0)
+        self.assertIn('GMU clock bring-up failed; rolled back',
+                      self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
+        self.assertEqual(self.lib.power_reg(0x120), 0x80000000)
+        self.assertEqual(self.lib.power_reg(0x124), 0)
+
+    def test_clocks_branch_halt_timeout_rolls_back(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.lib.power_clock_fault(3)
+        self.assertEqual(self.lib.clocks_enter(), 0)
+        self.assertIn('GMU clock bring-up failed; rolled back',
+                      self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
+        self.assertEqual(self.lib.power_reg(0x120), 0x80000000)
+        self.assertEqual(self.lib.power_reg(0x124), 0)
+
+    def test_clocks_never_touch_gx_or_pll1_page(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        gx = self.lib.power_reg(0x0c)
+        pll1 = self.lib.power_reg(0x100)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.power_reg(0x0c), gx)
+        self.assertEqual(self.lib.power_reg(0x100), pll1)
+        self.assertEqual(self.lib.power_map_count(), 1)
+
+    def test_bringup_clocks_stage_runs_then_bus_refuses_and_unwinds(self):
         self.lib.diag_reset(0, 1, 1)
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
         log = self.lib.diag_run(1).decode()
         self.assertIn('CX owned, rollback=0x00222001', log)
-        self.assertIn('clocks read-only cx_gmu_cbcr=0x5a5a5a5a '
-                      'gmu_clk_cmd=0x5a5a5a5a cfg=0x5a5a5a5a; nothing written', log)
-        self.assertIn('clocks backend not implemented; state read only', log)
+        self.assertIn('gmu clock source root on; cfg=0x00000300', log)
+        self.assertIn('POLARIS GPU: GMU clock running', log)
+        self.assertIn('bus backend not implemented; no hardware access', log)
+        self.assertIn('clocks exit restored cbcr=0x80004220 '
+                      'cmd=0x80000000 cfg=0x00000000', log)
         self.assertIn('rails exit collapsed after 1 polls GDSCR=0x00222001; CX released', log)
         self.assertIn('acceleration unavailable; CPU display unchanged', log)
-        self.assertEqual(self.lib.power_write_count(), 2)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x00222001)
+        self.assertEqual(self.lib.power_reg(0x98), 0x80004220)
+        self.assertEqual(self.lib.power_reg(0x120), 0x80000000)
+        self.assertEqual(self.lib.power_reg(0x124), 0)
+
+    def test_bringup_without_gpuon_writes_nothing(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.lib.diag_reset(0, 0, 1)
+        self.assertEqual(self.lib.diag_run(1), b'')
+        self.assertEqual(self.lib.power_map_count(), 0)
+        self.assertEqual(self.lib.power_write_count(), 0)
 
     def test_rails_exit_without_enter_is_a_noop(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
