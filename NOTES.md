@@ -1405,3 +1405,67 @@ This verifies clock and bus gating only. The GMU register block, GX
 domain, firmware load, HFI, SMMU/PAS13, CP and fence remain untouched;
 `GMU backend not implemented` is the refusal at the next stage, and the
 UI is still composed by the CPU.
+
+
+### 2026-10-29: 0111 regression image device verification
+
+`boot-polaris-0111-regression.img` (SHA256
+`ee5afc67eebc2d462ed66635a2a9afc6b1cce40fee46013ab10d0fbad3eded9f`)
+was started with `fastboot boot` only; no partition was written. The ring
+is 4,198,400 B, SHA256
+`5f45c70dff4f58c7219cb04a57a089408cc0c4159bf986a5e4beb89a6f07821b`.
+With `polarisgpuon=0` it contains only the refusal path:
+
+```
+POLARIS PWR: read-only GPUCC cx_gdscr=0x00222001 cx_hw_ctrl=0x00005ff4 gx_gdscr=0x00222001 (no vote, no GDSC write)
+POLARIS PWR: rails write not opt-in; CX untouched
+POLARIS GPU: rails request refused; no ownership claimed
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+No clocks, BUS or GMU log line appears (`bus_enter_logged=false`). This
+closes the default-path safety check: without the explicit opt-in the
+kernel performs only read-only probes, never writes CX GDSCR, GPUCC or
+GCC, and still reaches SpringBoard with CPU display.
+
+### 2026-10-29: 0112 GMU CSR read-only probe device verification
+
+Commit `d041b5f` (`gpu: map GMU CSRs read-only after bus clocks (0112)`)
+passed CI run `40886478657`, including `Verify GPU protocol regressions`;
+the published branch `polaris-gpu-fixes-d041b5f6` points at
+`04322873fa4c1d0c39aa60412eb8af0848540c9c`. Kernel SHA256
+`5ebb0d40db7f1a61b0f4f159227f5e18a9b58ed440c33dccb29125f525eca86f`,
+rails image SHA256
+`51147e91650e82eea73ee546a7a9ab1d02f2f100ad4b9445d67e761753c8e261`.
+The image was started with `fastboot boot` only; the ring is 4,198,400 B,
+SHA256 `465e75a09c10069b9d85e732d2e17d0e4b5f6cef0dd6ed5224196301e4dcec34`.
+The GMU lines are:
+
+```
+POLARIS PWR: GMU CSR sysreset=0x00000001 boot=0x00000000 cfg=0x00004052 fw_busy=0x00000000 init=0x00000000
+POLARIS PWR: GMU HFI status=0x00000000 version=0x00000000 qtbl_info=0x00000000 general7=0x00000000
+POLARIS PWR: GMU AO intr_status=0x00000000 mask=0x00000000 cx_busy=0x30000000 rscc_ack=0x00000000 fence=0x00000000
+POLARIS PWR: GMU cx_always_on=0x0000000000000ea0; registers readable, fw=not-started, hfi=not-initialized
+POLARIS GPU: GMU registers readable; firmware not started
+POLARIS GPU: HFI backend not implemented; no hardware access
+POLARIS PWR: bus exit restored axi=0x80000000 memnoc=0x80004220 cfg_ahb=0x00000001
+POLARIS PWR: clocks exit restored cbcr=0x80004220 cmd=0x80000000 cfg=0x00000000
+POLARIS PWR: PLL1 exit; restored mode=0x00000000 opmode=0x00000000 l=0x00000000 frac=0x00000000
+POLARIS PWR: rails exit collapsed after 2 polls GDSCR=0x00222001; CX released
+```
+
+`CM3_SYSRESET=1` means the CM3 is held in reset, as expected before a
+firmware load; `CM3_CFG=0x4052`, `FW_BUSY=0` and `FW_INIT_RESULT=0`.
+HFI `VERSION_INFO` reads 0 on this handset (the host test fixture had
+used 0x10000 as a sample) and `HFI_CTRL_STATUS=0`: no HFI queue exists.
+`GPU_CX_BUSY_STATUS=0x30000000` is non-zero while
+`cx_always_on=0xea0` (3744), so the CX always-on counter is already
+running. All CX/clocks/BUS/PLL1 state was restored exactly, the ring ends
+with normal SpringBoard traffic, and there is no panic or watchdog record.
+
+This verifies only that the interconnect reaches the GMU and that its CSR
+window is readable. Nothing was reset, loaded or queued: CM3/ITCM and HFI
+writes, SMMU/PAS13 (`a630_zap`), GX, CP and fence are untouched. The UI
+remains CPU-composited and there is still no GPU acceleration. The next
+stage is SMMU + PAS13 plus an HFI queue inside GMU IOVA, before any CM3 or
+HFI write can be attempted.
