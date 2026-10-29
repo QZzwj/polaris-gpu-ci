@@ -51,7 +51,7 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 108):
+        for number in range(94, 109):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
@@ -189,6 +189,8 @@ EXPORT int power_memory_unchanged(void) {
 void pg_pwr_test_after_write(uint32_t off, uint32_t value) {
     power_writes++;
     if (off == 0x6c && power_model == 1 && !(value & 1u))
+        power_regs[0x6c / 4] = value | 0x80000000u;
+    if (off == 0x6c && power_model == 2)
         power_regs[0x6c / 4] = value | 0x80000000u;
 }
 EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
@@ -600,8 +602,35 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.power_write_count(), 1)
         self.lib.rails_exit()
         log = self.lib.power_log().decode()
-        self.assertIn('rails exit restored GDSCR=0x00222001', log)
+        self.assertIn('rails exit collapsed after 1 polls GDSCR=0x00222001; CX released', log)
         self.assertEqual(self.lib.power_reg(0x6c), 0x00222001)
+        self.assertEqual(self.lib.power_write_count(), 2)
+
+    def test_rails_exit_reports_unconfirmed_when_pwr_on_sticks(self):
+        # Model 2 keeps PWR_ON set after every GDSCR write. Enter may still
+        # claim the domain (it saw PWR_ON), but exit must not claim release.
+        self.lib.power_rails_reset(0x00222001, 2, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.lib.rails_exit()
+        log = self.lib.power_log().decode()
+        self.assertIn('wrote 0x00222001 but PWR_ON stayed set for 200 polls', log)
+        self.assertIn('CX state unconfirmed', log)
+        self.assertNotIn('CX released', log)
+        self.assertEqual(self.lib.power_reg(0x6c), 0x80222001)
+        self.assertEqual(self.lib.power_write_count(), 2)
+        self.lib.rails_exit()
+        self.assertEqual(self.lib.power_write_count(), 2)
+
+    def test_bringup_reads_clock_state_readonly_then_collapses_cx(self):
+        self.lib.diag_reset(0, 1, 1)
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        log = self.lib.diag_run(1).decode()
+        self.assertIn('CX owned, rollback=0x00222001', log)
+        self.assertIn('clocks read-only cx_gmu_cbcr=0x5a5a5a5a '
+                      'gmu_clk_cmd=0x5a5a5a5a cfg=0x5a5a5a5a; nothing written', log)
+        self.assertIn('clocks backend not implemented; state read only', log)
+        self.assertIn('rails exit collapsed after 1 polls GDSCR=0x00222001; CX released', log)
+        self.assertIn('acceleration unavailable; CPU display unchanged', log)
         self.assertEqual(self.lib.power_write_count(), 2)
 
     def test_rails_exit_without_enter_is_a_noop(self):

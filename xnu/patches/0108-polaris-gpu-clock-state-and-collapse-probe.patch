@@ -1,0 +1,103 @@
+From 0108 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] polaris: confirm CX collapse on exit and read GPUCC clock state
+
+The 0107 rails test proved the CX GDSC can be powered (PWR_ON after 2 us)
+but the exit path read PWR_ON once, immediately after restoring the
+pre-write value, and still saw it set.  Collapse is asynchronous in the
+vendor gdsc driver, so poll the same 200 us budget before claiming the
+domain is released and report a timeout instead of claiming success.
+
+While CX is owned, also read the two GPUCC clock registers that the next
+stage needs (0x1098 CX_GMU_CBCR and 0x1120/0x1124 GMU clock source).
+This patch performs no clock write, vote or GMU access.
+
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 1951157..368a6ed 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -97,6 +97,12 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 		ctx->completed++;
+ 		return true;
+ 	}
++	if (stage == POLARIS_GPU_CLOCKS) {
++		/* Read-only: GPUCC clock state while CX is owned. No write, no vote. */
++		polaris_gpu_clocks_probe();
++		printf("POLARIS GPU: clocks backend not implemented; state read only\n");
++		return false;
++	}
+ 	if (stage != POLARIS_GPU_BOARD) {
+ 		printf("POLARIS GPU: %s backend not implemented; no hardware access\n",
+ 		    polaris_gpu_stage_name[stage]);
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index eaa0341..e0029eb 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -16,4 +16,7 @@ void polaris_gpu_pwr_probe(void);
+ int polaris_gpu_rails_enter(void);
+ void polaris_gpu_rails_exit(void);
+ 
++/* Read-only GPUCC clock state; requires the CX domain owned above. */
++void polaris_gpu_clocks_probe(void);
++
+ #endif /* _BSD_DEV_POLARIS_GPU_PWR_H_ */
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index e7f71c8..e3bfe29 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -42,6 +42,9 @@ extern bool polaris_touch_i2c_board(void);
+ #define PG_GPUCC_MAP     (PG_GPUCC_BASE + PG_GPUCC_PAGE_OFFSET)
+ #define PG_GPUCC_MAP_SZ  0x2000ull
+ #define PG_CX_GDSCR      (0x106cu - PG_GPUCC_PAGE_OFFSET)
++#define PG_CX_GMU_CBCR   (0x1098u - PG_GPUCC_PAGE_OFFSET)
++#define PG_GMU_CLK_CMD   (0x1120u - PG_GPUCC_PAGE_OFFSET)
++#define PG_GMU_CLK_CFG   (0x1124u - PG_GPUCC_PAGE_OFFSET)
+ 
+ #if (PG_GPUCC_MAP + PG_GPUCC_MAP_SZ) > (PG_GPUCC_BASE + PG_GPUCC_WINDOW)
+ #error "the GPUCC power mapping would leave the documented window"
+@@ -150,15 +153,44 @@ void
+ polaris_gpu_rails_exit(void)
+ {
+ 	uint32_t after;
++	unsigned int i;
+ 
+ 	if (!pg_cx_owned || pg_cx_regs == NULL) {
+ 		return;
+ 	}
+ 	pg_wr32(pg_cx_regs, PG_CX_GDSCR, pg_cx_saved);
++	for (i = 0; i < PG_POLL_US; i++) {
++		after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
++		if ((after & PG_GDSCR_PWR_ON) == 0) {
++			pg_cx_owned = 0;
++			printf("POLARIS PWR: rails exit collapsed after %u polls "
++			    "GDSCR=0x%08x; CX released\n", i + 1, after);
++			return;
++		}
++		DELAY(1);
++	}
+ 	after = pg_rd32(pg_cx_regs, PG_CX_GDSCR);
+ 	pg_cx_owned = 0;
+-	printf("POLARIS PWR: rails exit restored GDSCR=0x%08x (PWR_ON=%u); "
+-	    "CX released\n", after, (after & PG_GDSCR_PWR_ON) != 0);
++	printf("POLARIS PWR: rails exit wrote 0x%08x but PWR_ON stayed set for "
++	    "%u polls (GDSCR=0x%08x); CX state unconfirmed\n",
++	    pg_cx_saved, PG_POLL_US, after);
++}
++
++void
++polaris_gpu_clocks_probe(void)
++{
++	uint32_t cbcr, cmd, cfg;
++
++	if (!pg_cx_owned || pg_cx_regs == NULL) {
++		printf("POLARIS PWR: clock probe skipped; CX not owned\n");
++		return;
++	}
++	cbcr = pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR);
++	cmd = pg_rd32(pg_cx_regs, PG_GMU_CLK_CMD);
++	cfg = pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG);
++	printf("POLARIS PWR: clocks read-only cx_gmu_cbcr=0x%08x "
++	    "gmu_clk_cmd=0x%08x cfg=0x%08x; nothing written\n",
++	    cbcr, cmd, cfg);
+ }
+ 
+ #ifdef PG_PWR_TEST
