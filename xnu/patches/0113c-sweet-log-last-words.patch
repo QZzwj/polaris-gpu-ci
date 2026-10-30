@@ -1,0 +1,56 @@
+﻿diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6046ea0..157f380 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -688,6 +688,18 @@ sweet_ufs_init(void)
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
+ 
++/*
++ * One block below the ring keeps the tail of the ring for the next reader.
++ * The stock kernel rewrites the ring itself on the following boot; this
++ * block is outside its header+ring window, so it survives that rewrite.
++ */
++struct sweet_log_last {
++	char magic[8];
++	uint32_t version, len;
++	uint64_t total, seq;
++	char text[UFS_BLOCK - 32];
++};
++
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+@@ -848,6 +860,10 @@ sweet_log_sync(void)
+ 	}
+ 	if (blk >= SWEET_LOG_SIZE / UFS_BLOCK) {
+ 		struct sweet_log_header h;
++		struct sweet_log_last *last;
++		uint64_t start;
++		uint32_t i;
++
+ 		bzero(&h, sizeof(h));
+ 		memcpy(h.magic, "SWEETLOG", 8);
+ 		h.version = 1;
+@@ -859,6 +875,21 @@ sweet_log_sync(void)
+ 		if (!ufs_write_blocks(base, 1)) {
+ 			(void)ufs_sync_cache();
+ 		}
++		last = (struct sweet_log_last *)(su.dma + DMA_BOUNCE);
++		bzero(last, UFS_BLOCK);
++		memcpy(last->magic, "SWEETLST", 8);
++		last->version = 1;
++		start = total > sizeof(last->text) ? total - sizeof(last->text) : 0;
++		last->len = (uint32_t)(total - start);
++		last->total = total;
++		last->seq = 0;
++		for (i = 0; i < last->len; i++) {
++			last->text[i] = sweet_log_ring[(start + i) %
++			    SWEET_LOG_SIZE];
++		}
++		if (!ufs_write_blocks(base - 1, 1)) {
++			(void)ufs_sync_cache();
++		}
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ }
