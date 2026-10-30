@@ -62,6 +62,9 @@ class GpuCTests(unittest.TestCase):
                 subprocess.run(['git', 'apply', '--include=bsd/dev/*',
                                 str(next(PATCHES.glob('0107b-*.patch')))],
                                cwd=root, check=True, capture_output=True)
+        subprocess.run(['git', 'apply', '--include=bsd/dev/*',
+                        str(next(PATCHES.glob('0116b-*.patch')))],
+                       cwd=root, check=True, capture_output=True)
         inc = root / 'include/sys'
         inc.mkdir(parents=True)
         (inc / 'types.h').write_text('#include <stdint.h>\n')

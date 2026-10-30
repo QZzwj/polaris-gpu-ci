@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index be00707..14c4eea 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -163,9 +163,13 @@ extern void sweet_log_sync(void);
+  * GPU SMMU (arm,smmu-kgsl@5040000), vendor DTS <0x05040000 0x10000>.
+  * This is an ARM SMMU-500 register file: GR0 at +0x0000, GR1 (the CBAR
+  * array) at +(1 << pgshift), and the context banks at +0x8000 with the
+- * same stride. qcom,protect=<0x40000 0xc000> is relative to a different
+- * aperture covering the HYP-owned CB5-CB7 and is never mapped here.
+- * Every access in this revision is a read.
++ * same stride. The 64 KiB aperture covers CB0-CB7 at that stride; the
++ * device IDR1 reports NUMCB=5, so only CB0-CB4 are probed. qcom,protect=
++ * <0x40000 0xc000> is an unresolved protected-register word range in vendor
++ * kgsl_iommu.c, not a proven context-bank ownership map. qcom,gpu-offset=
++ * <0x48000> is also unresolved and lies outside this map. Neither property
++ * is mapped, interpreted or used to claim a bank here. Every access in this
++ * revision is a read.
+  */
+ #define PG_SMMU_BASE            0x05040000ull
+ #define PG_SMMU_WINDOW          0x10000u
+@@ -1144,9 +1148,13 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size)
+  * The last "SMMU read begin" line in the persistent ring therefore names the
+  * exact register that did not answer. The context-bank geometry is derived
+  * from IDR1 the same way arm-smmu.c derives it; a geometry that would leave
+- * the 64 KiB aperture is refused instead of guessed. Stream IDs are printed
+- * raw: the DT routes SID 0x208 with mask 0x7 across the four GPU domains, but
+- * this probe does not claim or reprogram that routing.
++ * the 64 KiB aperture is refused instead of guessed. This probe reports the
++ * existing SMR/S2CR routing only and never claims or reprograms it. The
++ * recovery DTB's SMMU provider phandle is 0x208 (the local boot DTB uses
++ * 0x18f); that cell is a phandle, not a stream ID. The GPU iommus entries use
++ * SIDs 0 (gfx3d_user), 2 then 1 (gfx3d_secure), 4 (gmu_user) and 5
++ * (gmu_kernel), all with DT mask 0. The mask 0x7 in vendor logs is an SMMU
++ * stream-match mask, not the DT iommus mask.
+  */
+ static uint32_t
+ pg_smmu_read(uint32_t off, unsigned int level)

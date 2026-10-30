@@ -36,8 +36,9 @@ GPU = (0x05000000, 0x40000)
 GMU = (0x0506a000, 0x30000)
 PDC = (0x0b200000, 0x300000)
 SMMU = (0x05040000, 0x10000)
-# DT qcom,protect is an OFFSET relative to SMMU base, not a range within
-# its 64KiB reg. It refers to CB5..CB7; do not map them from this contract.
+# DT qcom,protect is an unresolved protected-register word range in vendor
+# kgsl_iommu.c, not a proven CB5..CB7 ownership map. qcom,gpu-offset is also
+# unresolved and outside the 64KiB SMMU reg; neither is mapped or written.
 HYP_PROTECT = (0x40000, 0xc000)
 ZAP = (0x8c415000, 0x2000)
 CX_GDSCR = 0x0509106c

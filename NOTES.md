@@ -1674,3 +1674,47 @@ no HFI register is written.
 `BW_VOTE_TBL`/`TEST`, SMMU stage-1 attach (S2CR is still all-BYPASS),
 PAS13 zap, the CP SQE ring/fence, and Mesa/IOSurface are later stages.
 The UI remains CPU-composited.
+
+### 2026-10-30: 0116b corrects SMMU audit comments and docs
+
+`xnu/patches/0116b-polaris-gpu-smmu-audit-comments.patch` is a
+comment-only follow-up to 0116 (2,295 B, 38 LF / 0 CR, SHA-256
+`22E27BDB656FC04514DD7A9AC96A3C1B7FD2D326C9F5DC48355C83BC95EE9ACB`).
+It rewrites two comments in `bsd/dev/polaris_gpu_pwron.c`; no code or
+register access changes. The patch applies after 0116 and reverses
+cleanly in a fresh chain.
+
+The audit facts recorded are:
+
+- The 64 KiB SMMU aperture covers CB0–CB7 at the IDR1-derived stride,
+  but device `IDR1=0x20008005` reports `NUMCB=5`, so only CB0–CB4 are
+  probed. Device `IDR0=0x48016605`, `IDR2=0x00007511`; `SMR[0..4]=0`,
+  `S2CR[0..4]=0x000200ff` (FAULT, cbndx=255). `0x02c` (IDR3) is never
+  read.
+- `qcom,protect=<0x40000 0xc000>` is an unresolved protected-register
+  word range in vendor `kgsl_iommu.c`, not proven CB5–CB7 ownership;
+  `qcom,gpu-offset=<0x48000>` is unresolved and outside the map.
+  Neither is mapped, written or interpreted.
+- `0x208` in the recovery DTB is the SMMU provider phandle, not a
+  stream ID; the local boot DTB uses `0x18f`. GPU SIDs are 0
+  (`gfx3d_user`), 2 then 1 (`gfx3d_secure`), 4 (`gmu_user`) and 5
+  (`gmu_kernel`), all with DT mask 0. Vendor `0x7` is the stream-match
+  mask.
+
+Files changed: the new `xnu/patches/0116b-*.patch`,
+`tools/test_polaris_gpu_c.py` (applies 0116b after 0116 in its rebuild
+chain), `research/polaris/README.md` (English and Chinese ownership
+wording), `research/polaris/a630v2-bringup-contract.md`,
+`research/polaris/gmu-secure-implementation.md`, the `HYP_PROTECT`
+comment in `tools/polaris_gpu_stages.py`, the root `README.md`, and this
+entry. The C fixture still asserts IDR1 NUMCB=5, contexts=5, irq=1, 4K
+granule, SMR=0 / S2CR fault / cbndx=255, no `0x02c` read, and sync
+counts 1/3/30.
+
+Final host run: `python -m unittest discover -s tools -p
+'test_polaris*.py' -q` with `POLARIS_CC_JSON` pointing at the local Zig
+`cc` and isolated temp/Zig caches: **Ran 237 tests in 3.046s, OK**.
+`git diff --check` and `py_compile` pass. No CI run and no device action
+were performed. SMMU attach, page tables, PAS13, CP and fence remain
+absent; the UI is still CPU-composited and this is not GPU
+acceleration.

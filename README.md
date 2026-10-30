@@ -28,7 +28,7 @@
 | “只有 4 核” | 已测 payload 明确写 `cpus=4`，日志为 `requested=4 selected=4 (limit=8)`；**不是已证实的 A75 PSCI 故障**。 | 已有八核 ADT/PSCI 上限；新增[八核拓扑校验](<tools/polaris_cpu_topology.py>)与 `mkpayload.py --check-polaris-cpus`，仅检查板型、MPIDR、连续 `cpus=1..8`。下一次获准的临时启动先试 `cpus=5`，查 CPU4 的 PSCI 返回、initCPU、SGI 和用户态，再试 6→8。 |
 | 上游 CPU 失败回退 | 对照 [Luoxueowo/ios-polaris 固定版本](https://github.com/Luoxueowo/ios-polaris/tree/44556dec6995b8d9bb72717cf546b92b6c3dddda)，其 0065/0078 的 PSCI 与八核上限本仓库已有；0088 跳过失败核后仅用 `num_cpus-skipped` 上报，无法排除 CPU ID 空洞或晚到从核，XNU 还会丢弃 `PE_cpu_start` 错误。其 README 对 A75 是否启用也有矛盾。 | **未直接合并不安全的 0088 补丁**；先验证连续 CPU 前缀。完整对照见 [Polaris 指南](<docs/POLARIS-MIX2S.md>)。 |
 | GPU 命令数据库 | 缺少已证明 XNU 归属的 ARC/BCM command-db 和这台机器的 13 档 DDR／2 档 CNOC HFI 实际投票。旧 0092 固定物理地址映射因归属不明已撤回。 | 仅完成来源核对与离线格式解析；静态 DTS 数值不是已聚合的 RPMh 命令。 |
-| GPU 硬件后端 | CX/MX/GX 与共享 GPUCC/GFXCC 的所有权／回退、HYP 保护的 SMMU CB5–7、PAS13 的 8 KiB zap 区及 GMU/HFI 顺序尚未落实。 | 0093 在第一个未实现阶段拒绝并保留 CPU 显示。[安全实现契约](<research/polaris/gmu-secure-implementation.md>)定义后续有界 CP sentinel／fence 测试；**没有可交付的加速镜像**。 |
+| GPU 硬件后端 | CX/MX/GX 与共享 GPUCC/GFXCC 的所有权／回退、尚未解析的 SMMU `qcom,protect` 范围（不是已证实的 CB5–7 归属）、PAS13 的 8 KiB zap 区及 GMU/HFI 顺序尚未落实。 | 0093 在第一个未实现阶段拒绝并保留 CPU 显示。[安全实现契约](<research/polaris/gmu-secure-implementation.md>)定义后续有界 CP sentinel／fence 测试；**没有可交付的加速镜像**。 |
 | 其他功能 | Wi‑Fi、蓝牙、蜂窝、音频、相机、传感器、GPS、SEP／Face ID 尚未实现或未在 Polaris 上验收。 | iOS 锁屏不是这些模块可用的证据。 |
 
 ### 下一步、代码与安全
