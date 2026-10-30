@@ -1,0 +1,249 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index effcc95..b0e9760 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -281,7 +281,7 @@ polaris_gpu_init(void)
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: build 0120-hfi4\n");
++	printf("POLARIS GPU: build 0121-hfi5\n");
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 4e2db37..407ec9c 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -495,7 +495,7 @@ pg_gmu_map(void)
+ }
+ 
+ /*
+- * 0120 bisection aid: make the console line and the persistent ring durable
++ * 0121 bisection aid: make the console line and the persistent ring durable
+  * before the next GMU/SMMU register access. A wedged interconnect leaves no
+  * chance for the once-a-second log thread to flush, so every checkpoint is
+  * synchronously written to the sweetlog area.
+@@ -503,7 +503,7 @@ pg_gmu_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0120 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0121 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1123,9 +1123,28 @@ pg_hfi_flush(void)
+ 	__sync_synchronize();
+ }
+ 
++/*
++ * 0121: the HFI table is mapped with ml_io_map(), i.e. Device memory.
++ * memset() is allowed to use DC ZVA for large zeroing, which is not
++ * architecturally safe on Device mappings. Clear with volatile 32-bit
++ * stores instead so every word becomes a normal device write.
++ */
++static void
++pg_hfi_zero_table(void)
++{
++	volatile uint32_t *p = (volatile uint32_t *)pg_hfi.va;
++	uint32_t i;
++
++	for (i = 0; i < PG_HFI_ALLOC_SIZE / 4u; i++) {
++		p[i] = 0;
++	}
++	__sync_synchronize();
++}
++
+ /*
+  * Build the three queue headers used by the A630 GMU firmware. The queue
+  * addresses are physical because no SMMU stage-1 mapping exists yet.
++ * The caller clears the table with pg_hfi_zero_table() first.
+  */
+ static void
+ pg_hfi_fill_table(void)
+@@ -1133,10 +1152,9 @@ pg_hfi_fill_table(void)
+ 	static const uint32_t types[PG_HFI_Q_COUNT] = {
+ 		PG_HFI_CMD_TYPE, PG_HFI_MSG_TYPE, PG_HFI_DBG_TYPE
+ 	};
+-	uint32_t *table = (uint32_t *)pg_hfi.va;
++	volatile uint32_t *table = (volatile uint32_t *)pg_hfi.va;
+ 	unsigned int i;
+ 
+-	memset(table, 0, PG_HFI_ALLOC_SIZE);
+ 	table[0] = 0;
+ 	table[1] = PG_HFI_TABLE_DWORDS;
+ 	table[2] = PG_HFI_HDR_DWORDS;
+@@ -1168,7 +1186,7 @@ pg_hfi_fill_table(void)
+ static void
+ pg_hfi_dump_queues(const char *why)
+ {
+-	uint32_t *table = (uint32_t *)pg_hfi.va;
++	volatile uint32_t *table = (volatile uint32_t *)pg_hfi.va;
+ 	unsigned int i;
+ 
+ 	if (table == 0) {
+@@ -1208,6 +1226,7 @@ pg_hfi_alloc(void)
+ 			    PG_HFI_ALLOC_SIZE);
+ 			return false;
+ 		}
++		pg_sync_checkpoint("hfi-before-map");
+ 		va = ml_io_map((vm_offset_t)pg_hfi_reserved_pa,
+ 		    PG_HFI_ALLOC_SIZE);
+ 		if (va == 0) {
+@@ -1215,11 +1234,17 @@ pg_hfi_alloc(void)
+ 			    pg_hfi_reserved_pa);
+ 			return false;
+ 		}
++		pg_sync_checkpoint("hfi-mapped");
+ 		pg_hfi.va = va;
+ 		pg_hfi.pa = pg_hfi_reserved_pa;
+ 		pg_hfi.size = PG_HFI_ALLOC_SIZE;
+ 		pg_hfi.uncached = true;
++		pg_sync_checkpoint("hfi-before-zero");
++		pg_hfi_zero_table();
++		pg_sync_checkpoint("hfi-zero-done");
++		pg_sync_checkpoint("hfi-before-fill");
+ 		pg_hfi_fill_table();
++		pg_sync_checkpoint("hfi-fill-done");
+ 		pg_hfi.ready = true;
+ 		printf("POLARIS PWR: HFI table reserved pa=0x%llx va=0x%llx "
+ 		    "size=%u\n", pg_hfi.pa, (uint64_t)pg_hfi.va,
+@@ -1252,7 +1277,12 @@ pg_hfi_alloc(void)
+ 	pg_hfi.pa = pa;
+ 	pg_hfi.size = PG_HFI_ALLOC_SIZE;
+ 	pg_hfi.uncached = false;
++	pg_sync_checkpoint("hfi-before-zero");
++	pg_hfi_zero_table();
++	pg_sync_checkpoint("hfi-zero-done");
++	pg_sync_checkpoint("hfi-before-fill");
+ 	pg_hfi_fill_table();
++	pg_sync_checkpoint("hfi-fill-done");
+ 	pg_hfi.ready = true;
+ 	printf("POLARIS PWR: HFI table allocated pa=0x%llx va=0x%llx size=%u\n",
+ 	    pa, (uint64_t)va, PG_HFI_ALLOC_SIZE);
+@@ -1462,7 +1492,7 @@ pg_hfi_ctrl_init(void)
+ int
+ polaris_gpu_hfi_start(void)
+ {
+-	uint32_t *table;
++	volatile uint32_t *table;
+ 	uint32_t info = 0, rd, wr, hdr, size, error;
+ 	uint32_t cmd_wr, cmd_wr_new;
+ 	uint32_t ack[PG_HFI_ACK_WORDS];
+@@ -1470,7 +1500,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0120-hfi4 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0121-hfi5 polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -1683,7 +1713,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0120 build polarispwr=%d\n", pwrlevel);
++	printf("POLARIS PWR: 0121 build polarispwr=%d\n", pwrlevel);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
+ 		return 0;
+@@ -1728,11 +1758,13 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	    "last=0x%08x\n", PG_GMU_FW_WORDS, itcm_first, itcm_last);
+ 	pg_sync_checkpoint("itcm-loaded");
+ 
+-	if (hfion != 0 && !pg_hfi_alloc()) {
+-		printf("POLARIS PWR: HFI table unavailable; CM3 held in reset\n");
+-		return 0;
+-	}
+ 	if (hfion != 0) {
++		pg_sync_checkpoint("hfi-before-alloc");
++		if (!pg_hfi_alloc()) {
++			printf("POLARIS PWR: HFI table unavailable; "
++			    "CM3 held in reset\n");
++			return 0;
++		}
+ 		pg_sync_checkpoint("hfi-alloc");
+ 	}
+ 	if (hfion != 0 && hfi_smmu != 0) {
+diff --git a/bsd/dev/polaris_gpu_validate.c b/bsd/dev/polaris_gpu_validate.c
+index c4fd072..9b29be1 100644
+--- a/bsd/dev/polaris_gpu_validate.c
++++ b/bsd/dev/polaris_gpu_validate.c
+@@ -15,10 +15,40 @@
+ 
+ extern bool polaris_touch_i2c_board(void);
+ 
+-#define PG_ZAP_BASE    0x8c415000ull
+-#define PG_ZAP_SIZE    0x2000ull
+-#define PG_SPLASH_BASE 0x9d400000ull
+-#define PG_SPLASH_SIZE 0x2400000ull
++#define PG_ZAP_BASE     0x8c415000ull
++#define PG_ZAP_SIZE     0x2000ull
++#define PG_SPLASH_BASE  0x9d400000ull
++#define PG_SPLASH_SIZE  0x2400000ull
++
++/*
++ * Platform carve-outs adjacent to the low-DRAM hole used for the HFI table.
++ * These come from this handset's recovery FDT reserved-memory nodes. The
++ * first candidate address (0x8bf80000) sat inside camera_region, so the
++ * kernel must refuse any HFI reservation that touches one of these ranges.
++ */
++#define PG_CAMERA_BASE  0x8bf00000ull
++#define PG_CAMERA_SIZE  0x500000ull
++#define PG_IPS_BASE     0x8c400000ull
++#define PG_IPS_SIZE     0x10000ull
++#define PG_IPA_BASE     0x8c410000ull
++#define PG_IPA_SIZE     0x5000ull
++#define PG_ADSP_BASE    0x8c500000ull
++#define PG_ADSP_SIZE    0x1e00000ull
++#define PG_WLAN_BASE    0x8e300000ull
++#define PG_WLAN_SIZE    0x100000ull
++
++static const struct pg_range {
++	uint64_t base;
++	uint64_t size;
++} pg_carveouts[] = {
++	{ PG_CAMERA_BASE, PG_CAMERA_SIZE },
++	{ PG_IPS_BASE,    PG_IPS_SIZE },
++	{ PG_IPA_BASE,    PG_IPA_SIZE },
++	{ PG_ZAP_BASE,    PG_ZAP_SIZE },
++	{ PG_ADSP_BASE,   PG_ADSP_SIZE },
++	{ PG_WLAN_BASE,   PG_WLAN_SIZE },
++	{ PG_SPLASH_BASE, PG_SPLASH_SIZE },
++};
+ 
+ /*
+  * The HFI queue table must live below 4 GiB because the A630 GMU reads its
+@@ -226,6 +256,7 @@ pg_validate_handoff(struct pg_handoff *out, const char **reason)
+ 	 */
+ 	{
+ 		uint64_t addr = 0, size = 0;
++		unsigned int k;
+ 
+ 		if (pg_pair(mmap, "GPU-HFI", &addr, &size)) {
+ 			if (size < PG_HFI_MIN_SIZE || size > UINT32_MAX) {
+@@ -240,12 +271,19 @@ pg_validate_handoff(struct pg_handoff *out, const char **reason)
+ 				*reason = "GPU-HFI reservation leaves low 4 GiB";
+ 				return false;
+ 			}
+-			if (pg_overlap(addr, size, out->dram_base, out->dram_size) ||
+-			    pg_overlap(addr, size, PG_ZAP_BASE, PG_ZAP_SIZE) ||
+-			    pg_overlap(addr, size, PG_SPLASH_BASE, PG_SPLASH_SIZE)) {
++			if (pg_overlap(addr, size, out->dram_base,
++			    out->dram_size)) {
+ 				*reason = "GPU-HFI reservation collides with managed RAM or a carve-out";
+ 				return false;
+ 			}
++			for (k = 0; k < sizeof(pg_carveouts) /
++			    sizeof(pg_carveouts[0]); k++) {
++				if (pg_overlap(addr, size, pg_carveouts[k].base,
++				    pg_carveouts[k].size)) {
++					*reason = "GPU-HFI reservation collides with a platform carve-out";
++					return false;
++				}
++			}
+ 			out->hfi_addr = addr;
+ 			out->hfi_size = (uint32_t)size;
+ 		}

@@ -19,6 +19,15 @@ from dataclasses import dataclass, field
 PAGE = 0x4000
 ZAP_BASE, ZAP_SIZE = 0x8c415000, 0x2000
 SPLASH_BASE, SPLASH_SIZE = 0x9d400000, 0x2400000
+CAMERA_BASE, CAMERA_SIZE = 0x8bf00000, 0x500000
+IPS_BASE, IPS_SIZE = 0x8c400000, 0x10000
+IPA_BASE, IPA_SIZE = 0x8c410000, 0x5000
+ADSP_BASE, ADSP_SIZE = 0x8c500000, 0x1e00000
+WLAN_BASE, WLAN_SIZE = 0x8e300000, 0x100000
+PLATFORM_RESERVED = ((CAMERA_BASE, CAMERA_SIZE), (IPS_BASE, IPS_SIZE),
+                     (IPA_BASE, IPA_SIZE), (ZAP_BASE, ZAP_SIZE),
+                     (ADSP_BASE, ADSP_SIZE), (WLAN_BASE, WLAN_SIZE),
+                     (SPLASH_BASE, SPLASH_SIZE))
 HFI_MIN_SIZE = 0x8000
 HFI_LIMIT = 1 << 32
 U64_MAX = (1 << 64) - 1
@@ -63,7 +72,7 @@ class Handoff:
     dram_base: int
     dram_size: int
     blobs: tuple
-    reserved: tuple = ((ZAP_BASE, ZAP_SIZE), (SPLASH_BASE, SPLASH_SIZE))
+    reserved: tuple = PLATFORM_RESERVED
     hfi_addr: int = 0
     hfi_size: int = 0
 
@@ -94,7 +103,7 @@ def match_set(sizes):
 
 
 def validate_handoff(identities, dram_base, dram_size, blobs,
-                     reserved=((ZAP_BASE, ZAP_SIZE), (SPLASH_BASE, SPLASH_SIZE)),
+                     reserved=PLATFORM_RESERVED,
                      hfi=None):
     """Fail closed on anything unexpected. Read-only by construction."""
     have = set(identities)

@@ -1745,11 +1745,13 @@ CPU-composited.
 
 0117 adds an optional `GPU-HFI` entry to the ADT `/chosen/memory-map`
 and maps that range with `ml_io_map` instead of `kmem_alloc_contig`.
-The reservation is the first gap after the camera carve-out:
-`0x8bf80000` + `0x8000`, verified against the handset recovery FDT
-(`camera_region` ends at `0x8bf50000`; `ips_fw_region` starts at
-`0x8c400000`; `linux,cma` is dynamically allocated and has no fixed
-`reg`). The A630 GMU requires the queue table below 4 GiB.
+Its candidate reservation was `0x8bf80000` + `0x8000`. That address was
+wrong: the recovery FDT puts `camera_region` at `0x8bf00000` + `0x500000`
+(ending at `0x8c400000`), so the whole table sat inside the camera
+carve-out (`ips_fw_region` starts at `0x8c400000`). 0121 moves the table
+to `0x8c420000` + `0x8000`, in the free hole between `gpu_region`
+(`0x8c415000` + `0x2000`) and `adsp_region` (`0x8c500000` + `0x1e00000`).
+The A630 GMU requires the queue table below 4 GiB.
 
 - `polaris_gpu_validate.c` parses `GPU-HFI`, requires at least
   `0x8000` bytes, 4 KiB alignment and a range entirely below 4 GiB,
@@ -1801,7 +1803,7 @@ no valid device result. Next isolate those two variables:
    `HFI table reservation missing` followed by the fail-closed `kr=3`
    path.
 2. The ADT `GPU-HFI` entry without `polarishfi=1` should boot unchanged
-   and report `handoff hfi=0x8bf80000+0x8000`.
+   and report `handoff hfi=0x8c420000+0x8000`.
 
 Only after those controls pass should the combined HFI run be repeated.
 GPU acceleration is still unavailable and the UI remains CPU-composited.
@@ -1824,3 +1826,33 @@ path and adds instrumentation, without changing the default GPU state:
 The host C tests now apply 0118 after 0117. No device result exists yet;
 CTRL_INIT, the INIT ACK, SMMU stage-1, PAS13, the CP ring and Mesa are all
 still required before the GPU can be called usable.
+
+### 2026-10-30: 0120 fresh ring localizes the crash to pg_hfi_alloc
+
+The 0120 pwr0 ring (SHA-256
+`47925c740936c3e1d4a952b6d820fc71c2d4c36656d40cd3f556680f6efdcc56`,
+total/flush `8832/0`) is fresh, not the known stale ring. Its last
+checkpoint is `itcm-loaded`; there is no `hfi-alloc`, no
+`HFI table reserved`, no `GMU boot complete`. The CM3 was therefore
+held in reset inside `pg_hfi_alloc()`: the first table write at
+`0x8bf80000` landed in `camera_region`, and `pg_hfi_fill_table()` also
+used `memset()` on an uncached Device mapping (a compiler may lower
+that to `DC ZVA`, which is not safe on Device memory).
+
+0121 fixes both:
+
+- the `GPU-HFI` reservation moves to `0x8c420000` + `0x8000`, in the
+  hole between `gpu_region` and `adsp_region`;
+- `pg_hfi_zero_table()` clears the 32 KiB table with volatile 32-bit
+  stores before the header is filled;
+- `pg_hfi_alloc()` emits `hfi-before-map`, `hfi-mapped`,
+  `hfi-before-zero`, `hfi-zero-done`, `hfi-before-fill` and
+  `hfi-fill-done` checkpoints, plus `hfi-before-alloc`/`hfi-alloc`
+  around the call;
+- the kernel validator and both host models now reject any HFI range
+  overlapping camera, ips, ipa_gsi, gpu, adsp, wlan or splash
+  carve-outs, not just ZAP/splash.
+
+This is still an HFI control-path milestone. SMMU stage-1/PAS13, the
+CP ring/fence and Mesa/IOSurface remain absent, so the UI stays
+CPU-composited until those stages work.

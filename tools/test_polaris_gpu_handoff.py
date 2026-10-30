@@ -49,8 +49,10 @@ class ValidateHandoffTests(unittest.TestCase):
         with self.assertRaises(h.HandoffError):
             h.validate_handoff(h.REQUIRED_IDENTITIES, DRAM_BASE, DRAM_SIZE, outside)
 
-    def test_refuses_overlap_with_zap_and_splash(self):
-        for base, size in ((h.ZAP_BASE, h.ZAP_SIZE), (h.SPLASH_BASE, h.SPLASH_SIZE)):
+    def test_refuses_overlap_with_platform_carveouts(self):
+        for base, size in ((h.CAMERA_BASE, h.CAMERA_SIZE),
+                           (h.ZAP_BASE, h.ZAP_SIZE),
+                           (h.SPLASH_BASE, h.SPLASH_SIZE)):
             collision = dict(
                 dram_base=base - 0x100000, dram_size=size + 0x800000,
                 blobs=blobs(starts=[base - 0x100000 + 0x1000 * (i + 1)
@@ -80,15 +82,16 @@ class ValidateHandoffTests(unittest.TestCase):
 
     def test_accepts_low_dram_hfi_reservation(self):
         result = h.validate_handoff(h.REQUIRED_IDENTITIES, DRAM_BASE, DRAM_SIZE,
-                                    blobs(), hfi=(0x8bf80000, 0x8000))
-        self.assertEqual(result.hfi_addr, 0x8bf80000)
+                                    blobs(), hfi=(0x8c420000, 0x8000))
+        self.assertEqual(result.hfi_addr, 0x8c420000)
         self.assertEqual(result.hfi_size, 0x8000)
 
     def test_refuses_bad_hfi_reservations(self):
-        for hfi in ((0x8bf80000, 0x4000),        # too small
-                    (0x8bf80008, 0x8000),        # misaligned
+        for hfi in ((0x8c420000, 0x4000),        # too small
+                    (0x8c420008, 0x8000),        # misaligned
                     (0x100000000, 0x8000),       # not low DRAM
                     (0x8c415000, 0x8000),        # collides with zap
+                    (0x8bf80000, 0x8000),        # collides with camera
                     (0x9d400000, 0x8000),        # collides with splash
                     (DRAM_BASE, 0x8000),         # inside XNU-managed RAM
                     (0xfffffffffffff000, 0x2000)):  # overflow

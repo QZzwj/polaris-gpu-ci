@@ -77,6 +77,9 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/*',
                         str(next(PATCHES.glob('0120-*.patch')))],
                        cwd=root, check=True, capture_output=True)
+        subprocess.run(['git', 'apply', '--include=bsd/dev/*',
+                        str(next(PATCHES.glob('0121-*.patch')))],
+                       cwd=root, check=True, capture_output=True)
         inc = root / 'include/sys'
         inc.mkdir(parents=True)
         (inc / 'types.h').write_text('#include <stdint.h>\n')
@@ -253,7 +256,7 @@ vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size) {
     extern uint32_t rh_regs[];
     if (phys == 0x179e0000 && size == 0x4000u) return (vm_offset_t)rh_regs;
     power_maps++;
-    if (phys == 0x8bf80000ull && size == sizeof(hfi_reserved_mem)) {
+    if (phys == 0x8c420000ull && size == sizeof(hfi_reserved_mem)) {
         if (hfi_map_fault_mode) return 0;
         return (vm_offset_t)hfi_reserved_mem;
     }
@@ -1561,9 +1564,9 @@ EXPORT int rh_sleep_wake_unchanged(void) {
     def test_hfi_boot_completes_ctrl_init(self):
         self.assertEqual(self._boot_gmu(), 1)
         log = self.lib.power_log().decode()
-        self.assertIn('POLARIS PWR: 0120 checkpoint cm3-up', log)
-        self.assertIn('POLARIS PWR: 0120 checkpoint after-ctrl-init', log)
-        self.assertIn('POLARIS PWR: 0120 checkpoint done', log)
+        self.assertIn('POLARIS PWR: 0121 checkpoint cm3-up', log)
+        self.assertIn('POLARIS PWR: 0121 checkpoint after-ctrl-init', log)
+        self.assertIn('POLARIS PWR: 0121 checkpoint done', log)
         self.assertIn('HFI ctrl initialized status=0x00000001', log)
         self.assertIn('GMU boot complete init=0xbabeface', log)
         self.assertIn('HFI ctrl initialized', log)
@@ -1635,62 +1638,69 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
 
     def test_hfi_reserved_region_is_mapped_without_kmem(self):
-        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x8000)), 1)
+        self.assertEqual(self._boot_gmu(reserve=(0x8c420000, 0x8000)), 1)
         log = self.lib.power_log().decode()
-        self.assertIn('HFI table reserved pa=0x8bf80000', log)
+        self.assertIn('HFI table reserved pa=0x8c420000', log)
+        self.assertIn('POLARIS PWR: 0121 checkpoint hfi-mapped', log)
+        self.assertIn('POLARIS PWR: 0121 checkpoint hfi-zero-done', log)
+        self.assertIn('POLARIS PWR: 0121 checkpoint hfi-fill-done', log)
         self.assertNotIn('HFI table reservation missing', log)
         self.assertEqual(self.lib.hfi_alloc_count_get(), 0)
         self.assertEqual(self.lib.hfi_flush_count_get(), 0)
-        self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x8bf80000)
+        self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x8c420000)
         self.assertEqual([self.lib.hfi_table_word(i) for i in range(6)],
                          [0, 42, 6, 12, 3, 3])
-        self.assertEqual(self.lib.hfi_table_word(7), 0x8bf80000 + 168)
+        self.assertEqual(self.lib.hfi_table_word(7), 0x8c420000 + 168)
 
     def test_hfi_reserved_region_too_small_fails_closed(self):
-        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x4000)), 0)
+        self.assertEqual(self._boot_gmu(reserve=(0x8c420000, 0x4000)), 0)
         log = self.lib.power_log().decode()
         self.assertIn('HFI reserved region too small (16384 < 32768)', log)
         self.assertIn('HFI table unavailable; CM3 held in reset', log)
         self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
 
     def test_hfi_reserved_map_failure_fails_closed(self):
-        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x8000),
+        self.assertEqual(self._boot_gmu(reserve=(0x8c420000, 0x8000),
                                         map_fault=1), 0)
         log = self.lib.power_log().decode()
-        self.assertIn('HFI table map failed pa=0x8bf80000', log)
+        self.assertIn('HFI table map failed pa=0x8c420000', log)
         self.assertIn('HFI table unavailable; CM3 held in reset', log)
         self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
         self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x5a5a5a5a)
 
     def test_hfi_reserved_path_sends_init_and_acks_uncached(self):
-        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x8000)), 1)
+        self.assertEqual(self._boot_gmu(reserve=(0x8c420000, 0x8000)), 1)
         self.assertEqual(self.lib.hfi_start(), 1)
         log = self.lib.power_log().decode()
-        self.assertIn('HFI INIT sent cmd=0x00100500 dbg=0x8bf84000', log)
+        self.assertIn('HFI INIT sent cmd=0x00100500 dbg=0x8c424000', log)
         self.assertIn('HFI ACK id=126 size=19 seq=1 error=0', log)
         self.assertEqual([self.lib.hfi_table_word(42 + i) for i in range(5)],
-                         [0x00100500, 0, 0x8bf84000, 0x4000, 1])
+                         [0x00100500, 0, 0x8c424000, 0x4000, 1])
         self.assertEqual(self.lib.hfi_table_word(28), 19)
         self.assertEqual(self.lib.hfi_flush_count_get(), 0)
 
     def test_handoff_accepts_and_reports_low_dram_hfi(self):
         self.lib.diag_reset(0, 1, 1)
-        self.lib.diag_set_hfi(0x8bf80000, 0x8000, 16)
+        self.lib.diag_set_hfi(0x8c420000, 0x8000, 16)
         log = self.lib.diag_run(1).decode()
-        self.assertIn('handoff hfi=0x8bf80000+0x8000 (low DRAM)', log)
+        self.assertIn('handoff hfi=0x8c420000+0x8000 (low DRAM)', log)
         self.assertNotIn('handoff refused', log)
         self.assertEqual(self.lib.hfi_alloc_count_get(), 0)
 
     def test_handoff_refuses_bad_hfi_reservations(self):
         for address, size, length, reason in (
-                (0x8bf80000, 0x4000, 16,
+                (0x8c420000, 0x4000, 16,
                  'GPU-HFI reservation has an invalid length'),
-                (0x8bf80008, 0x8000, 16,
+                (0x8c420008, 0x8000, 16,
                  'GPU-HFI reservation is not 4K aligned'),
                 (0x100000000, 0x8000, 16,
                  'GPU-HFI reservation leaves low 4 GiB'),
                 (0x8c415000, 0x8000, 16,
-                 'GPU-HFI reservation collides with managed RAM or a carve-out')):
+                 'GPU-HFI reservation collides with a platform carve-out'),
+                (0x8bf80000, 0x8000, 16,
+                 'GPU-HFI reservation collides with a platform carve-out'),
+                (0x9d400000, 0x8000, 16,
+                 'GPU-HFI reservation collides with a platform carve-out')):
             self.lib.diag_reset(0, 1, 1)
             self.lib.diag_set_hfi(address, size, length)
             log = self.lib.diag_run(1).decode()
