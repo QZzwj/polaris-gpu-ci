@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 46fdeef..6046ea0 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -692,6 +692,7 @@ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
++static bool sweet_log_on;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+@@ -809,10 +810,59 @@ sweet_log_start(void)
+ 		sweet_log_secs = SWEET_LOG_SECS;
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		sweet_log_on = true;
+ 		thread_deallocate(thread);
+ 	}
+ }
+ 
++/*
++ * Put the ring and its header on the medium before a register read that may
++ * wedge the SMMU. The log thread flushes about once a second, far too late:
++ * a read that stops the interconnect resets the phone before the first timed
++ * flush. Caller must not hold sweet_ufs_lock.
++ */
++void sweet_log_sync(void);
++
++void
++sweet_log_sync(void)
++{
++	uint64_t base, total;
++	uint32_t blk;
++
++	if (!sweet_log_on || !su.ready || !su.writable ||
++	    su.nblocks < SWEET_LOG_BLOCKS) {
++		return;
++	}
++	base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	total = os_atomic_load(&sweet_log_total, relaxed);
++	lck_mtx_lock(&sweet_ufs_lock);
++	for (blk = 0; blk < SWEET_LOG_SIZE / UFS_BLOCK;
++	    blk += BOUNCE_SIZE / UFS_BLOCK) {
++		uint32_t n = (uint32_t)MIN((uint64_t)(BOUNCE_SIZE / UFS_BLOCK),
++		    (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk));
++		memcpy((void *)(su.dma + DMA_BOUNCE),
++		    sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		if (ufs_write_blocks(base + 1 + blk, n)) {
++			break;
++		}
++	}
++	if (blk >= SWEET_LOG_SIZE / UFS_BLOCK) {
++		struct sweet_log_header h;
++		bzero(&h, sizeof(h));
++		memcpy(h.magic, "SWEETLOG", 8);
++		h.version = 1;
++		h.size = SWEET_LOG_SIZE;
++		h.total = total;
++		h.seq = 0;   /* 0 marks a synchronous flush */
++		bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++		memcpy((void *)(su.dma + DMA_BOUNCE), &h, sizeof(h));
++		if (!ufs_write_blocks(base, 1)) {
++			(void)ufs_sync_cache();
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 

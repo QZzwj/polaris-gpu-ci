@@ -132,6 +132,7 @@ static int power_gmu_bad_map;
 static int power_smmu_bad_map;
 static int power_model, power_clk_model, power_bus_model;
 static unsigned power_maps, power_writes, power_cfg_ahb_write_count;
+static unsigned smmu_syncs;
 static int rh_diag_arg = 1, rh_vote_arg, rh_level_arg;
 static char power_text[8192];
 static size_t power_text_len;
@@ -144,6 +145,11 @@ int pg_test_printf(const char *fmt, ...) {
     if (n > 0) power_text_len += (size_t)n < remaining ? (size_t)n : remaining - 1;
     return n;
 }
+EXPORT void sweet_log_sync(void) {
+    smmu_syncs++;
+    pg_test_printf("<smmu-sync>");
+}
+EXPORT unsigned smmu_sync_count(void) { return smmu_syncs; }
 bool polaris_touch_i2c_board(void) { return power_board != 0; }
 int PE_parse_boot_argn(const char *name, void *out, int size) {
     if (size != sizeof(power_enabled)) return 0;
@@ -285,6 +291,7 @@ EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     power_board = board;
     power_model = 0; power_clk_model = 0; power_bus_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
+    smmu_syncs = 0;
     pg_pwr_test_reset();
     power_pll_init();
     power_bus_init();
@@ -376,6 +383,7 @@ EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
     power_enabled = on; power_on_arg = on; power_smmu_arg = 0; power_board = board;
     power_model = model; power_clk_model = 0; power_bus_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
+    smmu_syncs = 0;
     pg_pwr_test_reset();
     power_pll_init();
     power_bus_init();
@@ -478,6 +486,7 @@ EXPORT void diag_reset(int historical, int enabled, int board) {
     power_enabled = enabled; power_on_arg = enabled; power_smmu_arg = 0;
     power_board = board;
     power_model = 0; power_writes = 0; pg_pwr_test_reset();
+    smmu_syncs = 0;
     power_gmu_init();
     power_smmu_init();
     diag_set_dram(0x100000000ull, 0x7cc00000ull);
@@ -650,6 +659,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.power_smmu_reg.restype = ctypes.c_uint
         cls.lib.power_smmu_set.argtypes = [ctypes.c_uint, ctypes.c_uint]
         cls.lib.power_smmu_unchanged.restype = ctypes.c_int
+        cls.lib.smmu_sync_count.restype = ctypes.c_uint
         cls.lib.power_bus_fault.argtypes = [ctypes.c_uint]
         cls.lib.power_bus_map_fault.argtypes = [ctypes.c_int]
         cls.lib.power_boot_optin.argtypes = [ctypes.c_int]
@@ -1202,6 +1212,21 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertNotIn('SMMU read begin off=0x024', log)
         self.assertNotIn('SMMU CB0', log)
 
+    def test_smmu_read_is_flushed_before_the_value(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_smmu_optin(1)
+        self.assertEqual(self.lib.smmu_probe(), 1)
+        log = self.lib.power_log().decode()
+        begin = log.index('SMMU read begin off=0x020 level=1')
+        sync = log.index('<smmu-sync>', begin)
+        value = log.index('SMMU IDR0=', begin)
+        self.assertLess(begin, sync)
+        self.assertLess(sync, value)
+        self.assertEqual(self.lib.smmu_sync_count(), 1)
+
     def test_smmu_level_two_stops_before_idr5(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
         self.assertEqual(self.lib.rails_enter(), 1)
@@ -1216,6 +1241,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertNotIn('SMMU read begin off=0x034', log)
         self.assertIn('SMMU read-only; level=2 contexts=5 smr=5 sid_bits=3 '
                       'irpt=8 granule=4K; no attach', log)
+        self.assertEqual(self.lib.smmu_sync_count(), 4)
 
     def test_smmu_reads_global_and_context_registers_without_any_write(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
@@ -1239,6 +1265,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
                       'S2CR=0x00000004 type=trans cbndx=4 FSR=0x00000000', log)
         self.assertIn('SMMU read-only; level=4 contexts=5 smr=5 sid_bits=3 '
                       'irpt=8 granule=4K; no attach', log)
+        self.assertEqual(self.lib.smmu_sync_count(), 31)
         self.assertEqual(self.lib.power_write_count(), writes)
         self.assertEqual(self.lib.power_smmu_unchanged(), 1)
 

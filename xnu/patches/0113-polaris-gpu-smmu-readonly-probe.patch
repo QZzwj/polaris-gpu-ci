@@ -103,10 +103,19 @@ index 086cfc6..f750f71 100644
 +
  #endif /* _BSD_DEV_POLARIS_GPU_PWR_H_ */
 diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
-index 37c407b..6bad450 100644
+index 37c407b..c91a045 100644
 --- a/bsd/dev/polaris_gpu_pwron.c
 +++ b/bsd/dev/polaris_gpu_pwron.c
-@@ -148,6 +148,47 @@ extern bool polaris_touch_i2c_board(void);
+@@ -35,6 +35,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern bool polaris_touch_i2c_board(void);
++/* bsd/dev/sweet_ufs.c: flush the console ring before a read that may wedge. */
++extern void sweet_log_sync(void);
+ 
+ /* Register constants below are relative to their mapped page. */
+ #define PG_GPUCC_PAGE_OFFSET 0x1000u
+@@ -148,6 +150,47 @@ extern bool polaris_touch_i2c_board(void);
  #error "the GMU register constants would leave the documented CSR window"
  #endif
  
@@ -154,7 +163,7 @@ index 37c407b..6bad450 100644
  /*
   * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
   * mainline agree on the Fabia table). PLL_MODE carries PLL_OUTCTRL(0),
-@@ -195,6 +236,7 @@ static volatile uint32_t *pg_pll_regs;
+@@ -195,6 +238,7 @@ static volatile uint32_t *pg_pll_regs;
  static volatile uint32_t *pg_gcc_axi_regs;
  static volatile uint32_t *pg_gcc_gfx_regs;
  static volatile uint32_t *pg_gmu_regs;
@@ -162,7 +171,7 @@ index 37c407b..6bad450 100644
  static uint32_t pg_cx_saved;
  static int pg_cx_owned;
  
-@@ -322,6 +364,23 @@ pg_gmu_map(void)
+@@ -322,6 +366,23 @@ pg_gmu_map(void)
  	return true;
  }
  
@@ -186,7 +195,7 @@ index 37c407b..6bad450 100644
  int
  polaris_gpu_rails_enter(void)
  {
-@@ -909,6 +968,137 @@ polaris_gpu_gmu_enter(void)
+@@ -909,6 +970,139 @@ polaris_gpu_gmu_enter(void)
  	return 1;
  }
  
@@ -197,8 +206,9 @@ index 37c407b..6bad450 100644
 + *
 + * The first version of this probe read every identification register in one
 + * burst and the machine stopped responding before sweetlog could flush a
-+ * single line. The probe is now staged behind its own `polarissmmu` opt-in and
-+ * prints one line immediately before every read:
++ * single line. The probe is now staged behind its own `polarissmmu` opt-in,
++ * prints one line immediately before every read and synchronously flushes the
++ * console ring to UFS before the register read can wedge the interconnect:
 + *
 + *   0 (default): do not map or read anything;
 + *   1: IDR0 only;
@@ -217,6 +227,7 @@ index 37c407b..6bad450 100644
 +pg_smmu_read(uint32_t off, unsigned int level)
 +{
 +	printf("POLARIS PWR: SMMU read begin off=0x%03x level=%u\n", off, level);
++	sweet_log_sync();
 +	return pg_rd32(pg_smmu_regs, off);
 +}
 +
@@ -324,7 +335,7 @@ index 37c407b..6bad450 100644
  #ifdef PG_PWR_TEST
  void
  pg_pwr_test_reset(void)
-@@ -925,6 +1115,7 @@ pg_pwr_test_reset(void)
+@@ -925,6 +1119,7 @@ pg_pwr_test_reset(void)
  	pg_gcc_axi_regs = NULL;
  	pg_gcc_gfx_regs = NULL;
  	pg_gmu_regs = NULL;
