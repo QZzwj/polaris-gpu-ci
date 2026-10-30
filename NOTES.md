@@ -1523,3 +1523,118 @@ CSR observation: `fw=not-started`, `hfi=not-initialized`. Nothing was
 written to the SMMU, no context bank was read, and no attach or PAS13
 work has started. The next step is level 2 (`IDR1..IDR3`) to derive
 `NUMCB`, page size and context-bank geometry.
+
+### 2026-10-30: 0113b/0113c capture the words before an SMMU reset
+
+Commits `fd1aa45` (`0113b`, synchronously flush the console ring before
+each SMMU read) and `4205689` (`0113c`, preserve the last 4 KiB of the
+ring in a block outside the next boot's ring rewrite) were built by CI
+run **40996016226** on branch `polaris-gpu-fixes-4205689d` (published
+remote `3dd637d9...`), which passed. The kernel SHA-256 is
+`6a10e2c1a2a7ebc19d87172b967be7577b93d0e60b284ba47ea1c04e4d2b04af`;
+`boot-polaris-0113-rails.img` is 18,141,184 B, SHA-256
+`ac868fac1ff32c2d392a4b06b31db4a504091bb823a6a0e0288afce5362ebf95`.
+The image was temporary-booted with `fastboot boot`; no partition was
+written.
+
+With `polarissmmu=2`, IDR0 still read `0x48016605`, but the handset
+stopped before the level-2 values reached the normal ring. The surviving
+4,096-byte last-words block (`lastwords-0113c-raw.bin`, SHA-256
+`d0a2ce685be854d051da05d8a8394c0ac16b3af85deb955ffa75bc31aa734091`)
+ends:
+
+```
+POLARIS PWR: SMMU probe level=2; read-only
+POLARIS PWR: SMMU read begin off=0x020 level=1
+POLARIS PWR: SMMU IDR0=0x48016605
+POLARIS PWR: SMMU read begin off=0x024 level=2
+POLARIS PWR: SMMU read begin off=0x028 level=2
+POLARIS PWR: SMMU read begin off=0x02c level=2
+```
+
+This is a 4 KiB observation window, not a complete ring, and no
+level-2 value was printed in this revision. The immediate reset after
+the `0x02c` marker is consistent with a blocking SMMU read, but the
+block alone does not prove which read caused it. 0114 later read
+`0x024` and `0x028` successfully, so the failure is not a stable
+property of those registers. No SMMU write or attach occurred.
+
+### 2026-10-30: 0114 scans the SMMU register offsets read-only
+
+Commit `718d3f2` adds per-read value logging and the
+`polarissmmusk=<hex,...>` offset override. CI run **40999321868** on
+branch `polaris-gpu-fixes-718d3f24` (published remote `5ea83327...`)
+passed. Kernel SHA-256 is
+`6fd4a0ef40484ccd84eccb0e069b514ab5c9b050e1a92a33c6654f4242126c77`.
+Both `boot-polaris-0114-rails.img` (SHA-256
+`43c95dae323fd3b5a4f4e179a257565afb57744cd2fcc6dd96c40a6c8232ad17`)
+and `boot-polaris-0114-smmu-map.img` (SHA-256
+`371e5dab900df28e71b543da8a583fcf5189f1c3d1c098bbb30b94da22b8c9ad`)
+were temporary `fastboot boot` runs only; no partition was written.
+
+The first 0114 rail run used `polarissmmusk=400,448,1000,...` and all
+listed reads returned zero. That list did not cover the identification
+and context-bank offsets, so it did not establish SMMU geometry. The
+separate `smmu-map` run used
+`polarissmmusk=024,028,800,804,808,80c,810,c00,c04,c08,c0c,c10` and
+recorded:
+
+```
+0x024=0x20008005
+0x028=0x00007511
+0x800..0x810=0x00000000
+0xc00..0xc10=0x000200ff
+```
+
+The five `0x800` words are the five SMRs and the five `0xc00` words are
+the five S2CRs. The raw values were not parsed into stream-ID/context
+geometry, no context was attached, and the code deliberately skipped
+`0x02c` after the 0113c reset. The ring is 4,198,400 B, SHA-256
+`8d176b8773941355437fd396371e2f049284fd136b947c2ce688432e14473294`
+(normalized text SHA-256
+`d0137a1799b30f57e2773fd0a91cf122574edb9df02d2c28a8dd40a09c09074e`).
+Nothing was written to the SMMU and the display remained
+CPU-composited.
+
+### 2026-10-30: 0115 cold-boots the GMU CM3; HFI still absent
+
+Commit `40f06a8` adds a separately gated CM3 cold boot:
+`polarisgpuon=1` and `polarisgmuboot=1` are both required, and a
+timeout returns CM3 to reset. The 32 KiB `a630_gmu.bin` is copied into
+ITCM and `FW_INIT_RESULT` must become `0xBABEFACE`. CI run
+**41004629222** on branch `polaris-gpu-fixes-40f06a83` (published
+remote `83880a0b12d380f9726aae3a102abc40f849d136`) passed.
+`boot-polaris-0115-gmuboot.img` is 18,141,184 B, SHA-256
+`790949e2d7abefbe821b00a0de328e12228cc4418f851dcca8ddeb508043f312`;
+the kernel is 12,318,568 B, SHA-256
+`11fb93dc3d4f96b6a2c83c4e9f2a0b89c91c60bfa1f504620ed5b4954bb0ad4b`.
+It was temporary-booted with `fastboot boot`; no partition was written.
+
+The 4,198,400-byte ring (`ring-0115-gmuboot-local.bin`, SHA-256
+`c6de6f1151b606e9c99c4db9bbbf3e74117c78bae76f6531cc9f8830d5839498`;
+normalized text SHA-256
+`a829298b4c785f69a0f9c4da21f5782db3d91c7ae25c2850534478b096296b95`)
+contains:
+
+```
+POLARIS PWR: GMU fw pa=0x102004000 size=32768 word0=0x00043f80 entry=0x00000009 last=0x00000000
+POLARIS PWR: GMU ITCM loaded 8192 words; readback first=0x00043f80 last=0x00000000
+POLARIS PWR: GMU boot complete init=0xbabeface fw_busy=0x00000000 cfg=0x00004052 general7=0x00000001 hfi_status=0x00000000; HFI not initialized
+POLARIS GPU: GMU firmware started; HFI not initialized
+POLARIS GPU: SMMU registers readable; no attach
+POLARIS GPU: idle unconfirmed; quarantined, CPU display unchanged
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+`FW_INIT_RESULT=0xBABEFACE` is direct evidence that the CM3 firmware
+started. HFI was intentionally not initialized: no queue table was
+built, `HFI_QTBL_ADDR`/`HFI_QTBL_INFO` and `HFI_CTRL_INIT` were not
+programmed, and no SMMU attach or page table exists. The summary's
+pre-boot `gmu_fw_state:"not-started"` is a snapshot from before the
+boot action; `gmu_boot_complete=true` is authoritative. After CM3
+starts, `gmu_quarantined=true` and
+`clocks_exit_restored=false`/`bus_exit_restored=false` are intentional:
+the unwind must not collapse CX or clocks under a running CM3. The
+handset reached normal SpringBoard traffic with no decoded panic or
+watchdog record. The UI is still CPU-composited and this is not GPU
+acceleration.
