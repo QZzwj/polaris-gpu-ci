@@ -74,6 +74,9 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/*',
                         str(next(PATCHES.glob('0119-*.patch')))],
                        cwd=root, check=True, capture_output=True)
+        subprocess.run(['git', 'apply', '--include=bsd/dev/*',
+                        str(next(PATCHES.glob('0120-*.patch')))],
+                       cwd=root, check=True, capture_output=True)
         inc = root / 'include/sys'
         inc.mkdir(parents=True)
         (inc / 'types.h').write_text('#include <stdint.h>\n')
@@ -1558,6 +1561,9 @@ EXPORT int rh_sleep_wake_unchanged(void) {
     def test_hfi_boot_completes_ctrl_init(self):
         self.assertEqual(self._boot_gmu(), 1)
         log = self.lib.power_log().decode()
+        self.assertIn('POLARIS PWR: 0120 checkpoint cm3-up', log)
+        self.assertIn('POLARIS PWR: 0120 checkpoint after-ctrl-init', log)
+        self.assertIn('POLARIS PWR: 0120 checkpoint done', log)
         self.assertIn('HFI ctrl initialized status=0x00000001', log)
         self.assertIn('GMU boot complete init=0xbabeface', log)
         self.assertIn('HFI ctrl initialized', log)

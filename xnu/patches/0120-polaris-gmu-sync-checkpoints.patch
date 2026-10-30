@@ -1,0 +1,309 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 0889941..effcc95 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -281,7 +281,7 @@ polaris_gpu_init(void)
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: build 0119-hfi3\n");
++	printf("POLARIS GPU: build 0120-hfi4\n");
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 6e8908d..4e2db37 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -494,6 +494,19 @@ pg_gmu_map(void)
+ 	return true;
+ }
+ 
++/*
++ * 0120 bisection aid: make the console line and the persistent ring durable
++ * before the next GMU/SMMU register access. A wedged interconnect leaves no
++ * chance for the once-a-second log thread to flush, so every checkpoint is
++ * synchronously written to the sweetlog area.
++ */
++static void
++pg_sync_checkpoint(const char *tag)
++{
++	printf("POLARIS PWR: 0120 checkpoint %s\n", tag);
++	sweet_log_sync();
++}
++
+ static bool
+ pg_smmu_map(void)
+ {
+@@ -1302,31 +1315,41 @@ pg_hfi_smmu_bypass(void)
+  * the CM3 is still held in reset, before HFI_CTRL_INIT.
+  */
+ static void
+-pg_gmu_power_config(void)
++pg_gmu_power_config(int level)
+ {
+-	uint32_t rpmh_before, rpmh_after;
+-
+-	pg_wr32(pg_gmu_regs, PG_GMU_SYS_BUS_CONFIG, 1, 3);
+-	pg_wr32(pg_gmu_regs, PG_GMU_ICACHE_CONFIG, 1, 3);
+-	pg_wr32(pg_gmu_regs, PG_GMU_DCACHE_CONFIG, 1, 3);
+-	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL,
+-	    PG_GMU_PWR_COL_IFPC_CTRL, 3);
+-	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_SPTPRAC_HYST,
+-	    PG_GMU_PWR_COL_SPTPRAC_HYST_VAL, 3);
+-	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL,
+-	    PG_GMU_PWR_COL_IFPC_CTRL | PG_GMU_PWR_COL_IFPC_ENABLE |
+-	    PG_GMU_PWR_COL_SPTPRAC_ENABLE, 3);
+-	rpmh_before = pg_rd32(pg_gmu_regs, PG_GMU_RPMH_CTRL);
+-	pg_wr32(pg_gmu_regs, PG_GMU_RPMH_CTRL,
+-	    rpmh_before | PG_GMU_RPMH_CTRL_VOTES, 3);
+-	rpmh_after = pg_rd32(pg_gmu_regs, PG_GMU_RPMH_CTRL);
+-	printf("POLARIS PWR: GMU power cfg bus=0x%08x icache=0x%08x "
+-	    "dcache=0x%08x pwr_col=0x%08x rpmh=0x%08x->0x%08x\n",
+-	    pg_rd32(pg_gmu_regs, PG_GMU_SYS_BUS_CONFIG),
+-	    pg_rd32(pg_gmu_regs, PG_GMU_ICACHE_CONFIG),
+-	    pg_rd32(pg_gmu_regs, PG_GMU_DCACHE_CONFIG),
+-	    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL),
+-	    rpmh_before, rpmh_after);
++	uint32_t rpmh_before = 0, rpmh_after = 0;
++
++	pg_sync_checkpoint("before-powercfg");
++	if (level >= 1) {
++		pg_wr32(pg_gmu_regs, PG_GMU_SYS_BUS_CONFIG, 1, 3);
++		pg_wr32(pg_gmu_regs, PG_GMU_ICACHE_CONFIG, 1, 3);
++		pg_wr32(pg_gmu_regs, PG_GMU_DCACHE_CONFIG, 1, 3);
++		pg_sync_checkpoint("after-bus");
++	}
++	if (level >= 2) {
++		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL,
++		    PG_GMU_PWR_COL_IFPC_CTRL, 3);
++		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_SPTPRAC_HYST,
++		    PG_GMU_PWR_COL_SPTPRAC_HYST_VAL, 3);
++		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL,
++		    PG_GMU_PWR_COL_IFPC_CTRL | PG_GMU_PWR_COL_IFPC_ENABLE |
++		    PG_GMU_PWR_COL_SPTPRAC_ENABLE, 3);
++		pg_sync_checkpoint("after-pwrcol");
++	}
++	if (level >= 3) {
++		rpmh_before = pg_rd32(pg_gmu_regs, PG_GMU_RPMH_CTRL);
++		pg_wr32(pg_gmu_regs, PG_GMU_RPMH_CTRL,
++		    rpmh_before | PG_GMU_RPMH_CTRL_VOTES, 3);
++		rpmh_after = pg_rd32(pg_gmu_regs, PG_GMU_RPMH_CTRL);
++		pg_sync_checkpoint("after-rpmh");
++		printf("POLARIS PWR: GMU power cfg bus=0x%08x icache=0x%08x "
++		    "dcache=0x%08x pwr_col=0x%08x rpmh=0x%08x->0x%08x\n",
++		    pg_rd32(pg_gmu_regs, PG_GMU_SYS_BUS_CONFIG),
++		    pg_rd32(pg_gmu_regs, PG_GMU_ICACHE_CONFIG),
++		    pg_rd32(pg_gmu_regs, PG_GMU_DCACHE_CONFIG),
++		    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL),
++		    rpmh_before, rpmh_after);
++	}
+ }
+ 
+ /*
+@@ -1447,7 +1470,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0119-hfi3 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0120-hfi4 polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -1457,13 +1480,16 @@ polaris_gpu_hfi_start(void)
+ 		return 0;
+ 	}
+ 	table = (uint32_t *)pg_hfi.va;
++	pg_sync_checkpoint("hfi-entry");
+ 
+ 	/*
+ 	 * A stale MSGQ bit from an earlier firmware boot would make the ACK
+ 	 * poll below succeed immediately and read an empty response queue.
+ 	 * Clear all pending GMU-to-host interrupts before queuing INIT.
+ 	 */
++	pg_sync_checkpoint("hfi-before-intr-clear");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_CLR, 0xffffffffu, 3);
++	pg_sync_checkpoint("hfi-after-intr-clear");
+ 	printf("POLARIS PWR: HFI pre-init intr=0x%08x mask=0x%08x "
+ 	    "qtbl_addr=0x%08x\n",
+ 	    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO),
+@@ -1471,6 +1497,7 @@ polaris_gpu_hfi_start(void)
+ 	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_QTBL_ADDR));
+ 	pg_hfi_dump_queues("pre-init");
+ 
++	pg_sync_checkpoint("hfi-before-queue");
+ 	cmd_wr = table[PG_HFI_CMD_WRITE_INDEX];
+ 	if (cmd_wr >= PG_HFI_Q_DWORDS) {
+ 		printf("POLARIS PWR: HFI cmd write index %u out of range; "
+@@ -1492,7 +1519,10 @@ polaris_gpu_hfi_start(void)
+ 	__sync_synchronize();
+ 	pg_hfi_flush();
+ 	__sync_synchronize();
++	pg_sync_checkpoint("hfi-queued");
++	pg_sync_checkpoint("hfi-before-intr-set");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_HOST2GMU_INTR_SET, 1, 3);
++	pg_sync_checkpoint("hfi-intr-set");
+ 	printf("POLARIS PWR: HFI INIT sent cmd=0x%08x dbg=0x%08x wr=%u->%u\n",
+ 	    PG_HFI_INIT_HDR, (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE),
+ 	    cmd_wr, cmd_wr_new);
+@@ -1513,6 +1543,7 @@ polaris_gpu_hfi_start(void)
+ 		pg_hfi_dump_queues("ack-timeout");
+ 		return 0;
+ 	}
++	pg_sync_checkpoint("hfi-ack");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_CLR, 1, 3);
+ 	__sync_synchronize();
+ 	pg_hfi_flush();
+@@ -1568,6 +1599,7 @@ polaris_gpu_hfi_start(void)
+ 	pg_hfi.ack_done = true;
+ 	printf("POLARIS PWR: HFI ACK id=126 size=%u seq=1 error=0 "
+ 	    "payload0=0x%08x\n", size, ack[3]);
++	pg_sync_checkpoint("hfi-done");
+ 	return 1;
+ }
+ 
+@@ -1604,6 +1636,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	int optin = 0, gpuon = 0, hfion = 0, hfi_smmu = 0;
+ 	int ctrl_ok = 0;
+ 	int gfx_ok = 0, sptprac_ok = 0;
++	int pwrlevel = 0;
+ 	vm_offset_t virt;
+ 
+ 	if (!pg_cx_owned || !pg_clk_owned || !pg_bus_owned ||
+@@ -1643,9 +1676,19 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		    pa);
+ 		return 0;
+ 	}
++	(void)PE_parse_boot_argn("polarispwr", &pwrlevel, sizeof(pwrlevel));
++	if (pwrlevel < 0) {
++		pwrlevel = 0;
++	}
++	if (pwrlevel > 6) {
++		pwrlevel = 6;
++	}
++	printf("POLARIS PWR: 0120 build polarispwr=%d\n", pwrlevel);
++	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
+ 		return 0;
+ 	}
++	pg_sync_checkpoint("gmu-mapped");
+ 	if (pg_gmu_fw_regs == NULL) {
+ 		virt = ml_io_map((vm_offset_t)pa, PG_GMU_FW_SIZE);
+ 		if (virt == 0) {
+@@ -1669,6 +1712,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	 * Hold the CM3 in reset while ITCM is rewritten. GENERAL_7 enables
+ 	 * TCM retention, as the vendor and mainline drivers both do.
+ 	 */
++	pg_sync_checkpoint("before-itcm");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_GENERAL_7, 1, 3);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_SYSRESET, 1, 3);
+ 	DELAY(1000);
+@@ -1682,42 +1726,64 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	    (uint32_t)PG_GMU_CM3_ITCM_START + (PG_GMU_FW_WORDS - 1u) * 4u);
+ 	printf("POLARIS PWR: GMU ITCM loaded %u words; readback first=0x%08x "
+ 	    "last=0x%08x\n", PG_GMU_FW_WORDS, itcm_first, itcm_last);
++	pg_sync_checkpoint("itcm-loaded");
+ 
+ 	if (hfion != 0 && !pg_hfi_alloc()) {
+ 		printf("POLARIS PWR: HFI table unavailable; CM3 held in reset\n");
+ 		return 0;
+ 	}
+-	if (hfion != 0 && hfi_smmu != 0 && !pg_hfi_smmu_bypass()) {
+-		printf("POLARIS PWR: HFI SMMU bypass unavailable; "
+-		    "CM3 held in reset\n");
+-		return 0;
++	if (hfion != 0) {
++		pg_sync_checkpoint("hfi-alloc");
++	}
++	if (hfion != 0 && hfi_smmu != 0) {
++		pg_sync_checkpoint("before-smmu-bypass");
++		if (!pg_hfi_smmu_bypass()) {
++			printf("POLARIS PWR: HFI SMMU bypass unavailable; "
++			    "CM3 held in reset\n");
++			return 0;
++		}
++		pg_sync_checkpoint("smmu-bypass");
+ 	}
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT, 0, 3);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_BOOT_CONFIG, 0x02u, 3);
++	pg_sync_checkpoint("before-qtbl");
+ 	if (hfion != 0) {
+ 		pg_wr32(pg_gmu_regs, PG_GMU_HFI_QTBL_ADDR,
+ 		    (uint32_t)pg_hfi.pa, 3);
+ 		pg_wr32(pg_gmu_regs, PG_GMU_HFI_QTBL_INFO, 1, 3);
+ 	}
++	pg_sync_checkpoint("after-qtbl");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_AHB_FENCE_RANGE_0,
+ 	    (1u << 31) | (0xau << 18) | 0xa0u, 3);
++	pg_sync_checkpoint("before-sfr");
+ 	if (hfion != 0) {
+ 		pg_wr32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR, PG_A630_CHIPID, 3);
+ 	}
++	pg_sync_checkpoint("after-sfr");
++	pg_sync_checkpoint("before-cm3-cfg");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_CFG, 0x4052u, 3);
+-	if (hfion != 0) {
++	pg_sync_checkpoint("after-cm3-cfg");
++	if (hfion != 0 && pwrlevel >= 6) {
++		pg_sync_checkpoint("before-pwr-col-cp-msg");
+ 		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG,
+ 		    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE) |
+ 		    (PG_HFI_DBG_SIZE / 4096u - 1u), 3);
++		pg_sync_checkpoint("after-pwr-col-cp-msg");
+ 		printf("POLARIS PWR: GMU PWR_COL_CP_MSG=0x%08x (dbg=0x%08x)\n",
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG),
+ 		    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE));
+ 	}
+-	pg_gmu_power_config();
++	pg_gmu_power_config(pwrlevel);
+ 
+ 	/* Release the CM3 and wait for the image's own init signature. */
+-	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_CP_RESP, 0, 3);
++	if (hfion != 0 && pwrlevel >= 6) {
++		pg_sync_checkpoint("before-pwr-col-cp-resp");
++		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_CP_RESP, 0, 3);
++		pg_sync_checkpoint("after-pwr-col-cp-resp");
++	}
++	pg_sync_checkpoint("before-cm3-release");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_SYSRESET, 0, 3);
++	pg_sync_checkpoint("after-cm3-release-write");
+ 	for (i = 0; i < 1000u; i++) {
+ 		last = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT);
+ 		if (last == 0xbabefaceu) {
+@@ -1744,15 +1810,26 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		    last, boot, cfg, busy);
+ 		return 0;
+ 	}
++	pg_sync_checkpoint("cm3-up");
+ 	boot = pg_rd32(pg_gmu_regs, PG_GMU_CM3_BOOT_CONFIG);
+ 	cfg = pg_rd32(pg_gmu_regs, PG_GMU_CM3_CFG);
+ 	busy = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_BUSY);
+ 	general7 = pg_rd32(pg_gmu_regs, PG_GMU_GENERAL_7);
+ 	init_result = last;
+ 	if (hfion != 0) {
+-		gfx_ok = pg_gmu_gfx_rail_on();
+-		sptprac_ok = pg_gmu_sptprac_enable();
++		if (pwrlevel >= 4) {
++			pg_sync_checkpoint("before-gfx-rail");
++			gfx_ok = pg_gmu_gfx_rail_on();
++			pg_sync_checkpoint("after-gfx-rail");
++		}
++		if (pwrlevel >= 5) {
++			pg_sync_checkpoint("before-sptprac");
++			sptprac_ok = pg_gmu_sptprac_enable();
++			pg_sync_checkpoint("after-sptprac");
++		}
++		pg_sync_checkpoint("before-ctrl-init");
+ 		ctrl_ok = pg_hfi_ctrl_init();
++		pg_sync_checkpoint("after-ctrl-init");
+ 	}
+ 	hfi_status = pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_STATUS);
+ 	if (hfion != 0) {
+@@ -1773,6 +1850,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		    "HFI not initialized\n", init_result, busy, cfg, general7,
+ 		    hfi_status);
+ 	}
++	pg_sync_checkpoint("done");
+ 	return 1;
+ }
+ 
