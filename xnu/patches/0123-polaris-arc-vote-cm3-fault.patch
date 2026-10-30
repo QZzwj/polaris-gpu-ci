@@ -1,0 +1,163 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 6086326..ae11fe1 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -281,7 +281,7 @@ polaris_gpu_init(void)
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: build 0122-hfi6\n");
++	printf("POLARIS GPU: build 0123-hfi7\n");
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index b4d68cb..a0805a5 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -178,6 +178,17 @@ extern void sweet_log_sync(void);
+ #define PG_GMU_PWR_COL_CP_MSG      PG_GMU_REG(0x1f900u)
+ #define PG_GMU_PWR_COL_CP_RESP     PG_GMU_REG(0x1f901u)
+ 
++/*
++ * 0123: the highest valid ARC selectors in polaris_gpu_arc_vote.c are 9
++ * (pg_gfx_levels, ten entries) and 4 (pg_mx_levels, five entries). Mainline
++ * takes the last gx_arc_votes entry, whose low and high bytes are exactly
++ * these two selectors. Selector 0 is OFF, so the 0122 code voted both rails
++ * off while asking the GMU to boot.
++ */
++#define PG_GMU_GX_VOTE_DEFAULT     9u
++#define PG_GMU_MX_VOTE_DEFAULT     4u
++#define PG_GMU_CM3_FAULT_MASK      (1u << 23)
++
+ /*
+  * GMU_RPMH_CTRL: RPMH_INTERFACE_ENABLE (bit 0), LLC/DDR/MX/CX/GFX vote
+  * enables (bits 4 and 8..11). Mainline sets all six before releasing CM3.
+@@ -495,7 +506,7 @@ pg_gmu_map(void)
+ }
+ 
+ /*
+- * 0122 bisection aid: make the console line and the persistent ring durable
++ * 0123 bisection aid: make the console line and the persistent ring durable
+  * before the next GMU/SMMU register access. A wedged interconnect leaves no
+  * chance for the once-a-second log thread to flush, so every checkpoint is
+  * synchronously written to the sweetlog area.
+@@ -503,7 +514,7 @@ pg_gmu_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0122 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0123 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1383,10 +1394,40 @@ pg_gmu_power_config(int level)
+ }
+ 
+ /*
+- * Mainline a6xx_gmu_gfx_rail_on(): select the default GX/MX vote and ask the
+- * GMU to bring the GX rail up through the legacy BOOT_SLUMBER OOB handshake
+- * (HOST2GMU bit 22, GMU2HOST ack bit 30). We have no OPP/ARC table yet, so
+- * vote index 0 is used; the ack is diagnostic and a timeout does not abort
++ * 0123: report and clear a CM3 firmware fault without masking the next step.
++ * BIT(23) of GMU2HOST_INTR_INFO is HFI_IRQ_CM3_FAULT_MASK in the vendor HFI
++ * header. The 0121/0122 runs ended with this bit set, so record the fault
++ * state around every pre-HFI handshake and let the following register reads
++ * show whether it comes back.
++ */
++static uint32_t
++pg_gmu_cm3_fault_probe(const char *tag)
++{
++	uint32_t info = pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO);
++	uint32_t after = 0;
++
++	if ((info & PG_GMU_CM3_FAULT_MASK) != 0) {
++		pg_wr32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_CLR,
++		    PG_GMU_CM3_FAULT_MASK, 3);
++		after = pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO);
++		printf("POLARIS PWR: CM3 fault %s info=0x%08x after_clr=0x%08x "
++		    "init=0x%08x busy=0x%08x cfg=0x%08x\n",
++		    tag, info, after,
++		    pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT),
++		    pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_BUSY),
++		    pg_rd32(pg_gmu_regs, PG_GMU_CM3_CFG));
++	} else {
++		printf("POLARIS PWR: CM3 fault %s clear info=0x%08x\n",
++		    tag, info);
++	}
++	return info;
++}
++
++/*
++ * Mainline a6xx_gmu_gfx_rail_on(): select the highest available GX/MX vote
++ * and ask the GMU to bring the GX rail up through the legacy BOOT_SLUMBER OOB
++ * handshake (HOST2GMU bit 22, GMU2HOST ack bit 30). Selector 0 is OFF in
++ * both local ARC tables; the ack is diagnostic and a timeout does not abort
+  * the HFI attempt.
+  */
+ static bool
+@@ -1396,8 +1437,8 @@ pg_gmu_gfx_rail_on(void)
+ 	unsigned int i;
+ 
+ 	pg_wr32(pg_gmu_regs, PG_GMU_BOOT_SLUMBER_OPTION, 0, 3);
+-	pg_wr32(pg_gmu_regs, PG_GMU_GX_VOTE_IDX, 0, 3);
+-	pg_wr32(pg_gmu_regs, PG_GMU_MX_VOTE_IDX, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_GX_VOTE_IDX, PG_GMU_GX_VOTE_DEFAULT, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_MX_VOTE_IDX, PG_GMU_MX_VOTE_DEFAULT, 3);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_HOST2GMU_INTR_SET, 1u << 22, 3);
+ 	for (i = 0; i < 20u; i++) {
+ 		info = pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO);
+@@ -1463,7 +1504,7 @@ pg_hfi_ctrl_init(void)
+ 	unsigned int i;
+ 
+ 	/*
+-	 * 0122: mainline a6xx_gmu_hfi_start() makes HFI_CTRL_INIT its first
++	 * 0123: mainline a6xx_gmu_hfi_start() makes HFI_CTRL_INIT its first
+ 	 * HFI-block access after the CM3 release. The 0121 path read five HFI
+ 	 * registers first and never returned from the first read. Do the write
+ 	 * first and put a durable checkpoint on both sides of every access so
+@@ -1531,7 +1572,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0122-hfi6 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0123-hfi7 polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -1744,7 +1785,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0122 build polarispwr=%d\n", pwrlevel);
++	printf("POLARIS PWR: 0123 build polarispwr=%d\n", pwrlevel);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
+ 		return 0;
+@@ -1874,6 +1915,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		return 0;
+ 	}
+ 	pg_sync_checkpoint("cm3-up");
++	pg_gmu_cm3_fault_probe("cm3-up");
+ 	boot = pg_rd32(pg_gmu_regs, PG_GMU_CM3_BOOT_CONFIG);
+ 	cfg = pg_rd32(pg_gmu_regs, PG_GMU_CM3_CFG);
+ 	busy = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_BUSY);
+@@ -1884,15 +1926,18 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 			pg_sync_checkpoint("before-gfx-rail");
+ 			gfx_ok = pg_gmu_gfx_rail_on();
+ 			pg_sync_checkpoint("after-gfx-rail");
++			pg_gmu_cm3_fault_probe("after-gfx-rail");
+ 		}
+ 		if (pwrlevel >= 5) {
+ 			pg_sync_checkpoint("before-sptprac");
+ 			sptprac_ok = pg_gmu_sptprac_enable();
+ 			pg_sync_checkpoint("after-sptprac");
++			pg_gmu_cm3_fault_probe("after-sptprac");
+ 		}
+ 		pg_sync_checkpoint("before-ctrl-init");
+ 		ctrl_ok = pg_hfi_ctrl_init();
+ 		pg_sync_checkpoint("after-ctrl-init");
++		pg_gmu_cm3_fault_probe("after-ctrl-init");
+ 	}
+ 	hfi_status = pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_STATUS);
+ 	if (hfion != 0) {
