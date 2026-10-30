@@ -1469,3 +1469,33 @@ writes, SMMU/PAS13 (`a630_zap`), GX, CP and fence are untouched. The UI
 remains CPU-composited and there is still no GPU acceleration. The next
 stage is SMMU + PAS13 plus an HFI queue inside GMU IOVA, before any CM3 or
 HFI write can be attempted.
+
+### 2026-10-30: 0113 SMMU probe hangs on first IDR0 read; 0113a stages it
+
+The first 0113 rails image produced no `POLARIS GPU:` or `POLARIS PWR:`
+lines at all. Its captured ring was a normal iOS boot with no
+`polarisgpu*` boot arguments and was therefore not evidence that the
+driver had run and then failed. The matching 0113 regression image did
+reach the refusal path and SpringBoard, so the 0113 kernel itself was
+not the cause. The rails-only difference was the new read of SMMU
+`IDR0` at `0x05040020`; the current working hypothesis is that this
+first read blocks the bus or resets the handset before the watchdog
+flush.
+
+Commit `51ae465` (`gpu: stage the GPU SMMU probe behind polarissmmu
+(0113a)`) keeps the probe read-only but makes it a separate opt-in:
+
+- `polarissmmu=0` (default) never maps or reads the SMMU window.
+- `polarissmmu=1` reads only `IDR0`; 2 adds `IDR1..3`; 3 adds
+  `IDR5..7` and the global fault registers; 4 adds context-bank
+  `CBAR/SMR/S2CR/CB_FSR`.
+- Before every individual read the driver prints
+  `POLARIS PWR: SMMU read begin off=0x%03x level=%u`. If the handset
+  dies again, the last ring line will identify the exact failing offset.
+- No SMMU write, page table, SMR/S2CR attach or context-bank ownership
+  is added.
+
+The host suite passes **197 tests**. The first device run will use
+`polarissmmu=1` only; higher levels are enabled one at a time after the
+previous level returns a value. A readable SMMU is still not GPU
+acceleration, and no attach or PAS13 work has started.
