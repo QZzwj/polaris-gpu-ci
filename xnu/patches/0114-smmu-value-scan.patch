@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index c91a045..bf3ebe6 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -983,10 +983,13 @@ polaris_gpu_gmu_enter(void)
+  *
+  *   0 (default): do not map or read anything;
+  *   1: IDR0 only;
+- *   2: IDR0..IDR3;
++ *   2: IDR0..IDR2 (IDR3 at 0x02c wedges this SMMU);
+  *   3: IDR0..IDR7 and the global fault registers;
+  *   4: additionally every context-bank CBAR/SMR/S2CR/FSR.
+  *
++ * polarissmmusk=<hex,hex,...> overrides the staged list and reads exactly
++ * those offsets, which keeps later probes out of the CI rebuild loop.
++ *
+  * The last "SMMU read begin" line in the persistent ring therefore names the
+  * exact register that did not answer. The context-bank geometry is derived
+  * from IDR1 the same way arm-smmu.c derives it; a geometry that would leave
+@@ -997,15 +1000,67 @@ polaris_gpu_gmu_enter(void)
+ static uint32_t
+ pg_smmu_read(uint32_t off, unsigned int level)
+ {
++	uint32_t value;
++
+ 	printf("POLARIS PWR: SMMU read begin off=0x%03x level=%u\n", off, level);
+ 	sweet_log_sync();
+-	return pg_rd32(pg_smmu_regs, off);
++	value = pg_rd32(pg_smmu_regs, off);
++	printf("POLARIS PWR: SMMU read value off=0x%03x level=%u value=0x%08x\n",
++	    off, level, value);
++	return value;
++}
++
++/*
++ * Comma-separated hex offsets, e.g. polarissmmusk=024,028,800,c00. Each
++ * read is flushed to the last-words block first, so the final begin line
++ * names the exact offset that did not answer.
++ */
++static void
++pg_smmu_scan(const char *spec)
++{
++	while (*spec != '\0') {
++		uint32_t off = 0;
++		unsigned int digits = 0;
++
++		while (*spec != '\0' && *spec != ',') {
++			char c = *spec++;
++			uint32_t d;
++
++			if (c >= '0' && c <= '9') {
++				d = (uint32_t)(c - '0');
++			} else if (c >= 'a' && c <= 'f') {
++				d = (uint32_t)(c - 'a') + 10u;
++			} else if (c >= 'A' && c <= 'F') {
++				d = (uint32_t)(c - 'A') + 10u;
++			} else if (c == 'x' || c == 'X') {
++				continue;
++			} else {
++				break;
++			}
++			off = (off << 4) | d;
++			digits++;
++		}
++		if (*spec == ',') {
++			spec++;
++		}
++		if (digits == 0) {
++			break;
++		}
++		if (off >= PG_SMMU_WINDOW) {
++			printf("POLARIS PWR: SMMU scan skip off=0x%x outside window\n",
++			    off);
++			continue;
++		}
++		(void)pg_smmu_read(off, 9);
++	}
++	printf("POLARIS PWR: SMMU scan complete\n");
+ }
+ 
+ int
+ polaris_gpu_smmu_probe(void)
+ {
+-	uint32_t idr0 = 0, idr1 = 0, idr2 = 0, idr3 = 0;
++	char skspec[96];
++	uint32_t idr0 = 0, idr1 = 0, idr2 = 0;
+ 	uint32_t idr5 = 0, idr6 = 0, idr7 = 0;
+ 	uint32_t gfar = 0, gfsr = 0, gfsynr0 = 0, gfsynr1 = 0;
+ 	uint32_t num_cb = 0, num_smr, num_irpt, sid_bits;
+@@ -1030,6 +1085,12 @@ polaris_gpu_smmu_probe(void)
+ 	if (!pg_smmu_map()) {
+ 		return 0;
+ 	}
++	if (PE_parse_boot_argn("polarissmmusk", skspec, sizeof(skspec)) &&
++	    skspec[0] != '\0') {
++		printf("POLARIS PWR: SMMU scan list=%s\n", skspec);
++		pg_smmu_scan(skspec);
++		return 1;
++	}
+ 
+ 	idr0 = pg_smmu_read(PG_SMMU_IDR0, 1);
+ 	num_smr = (idr0 >> PG_SMMU_IDR0_NUMSMRG_SHIFT) &
+@@ -1043,9 +1104,7 @@ polaris_gpu_smmu_probe(void)
+ 	if (level >= 2) {
+ 		idr1 = pg_smmu_read(PG_SMMU_IDR1, 2);
+ 		idr2 = pg_smmu_read(PG_SMMU_IDR2, 2);
+-		idr3 = pg_smmu_read(PG_SMMU_IDR3, 2);
+-		printf("POLARIS PWR: SMMU IDR1=0x%08x IDR2=0x%08x IDR3=0x%08x\n",
+-		    idr1, idr2, idr3);
++		printf("POLARIS PWR: SMMU IDR1=0x%08x IDR2=0x%08x\n", idr1, idr2);
+ 		num_cb = (idr1 >> PG_SMMU_IDR1_NUMCB_SHIFT) &
+ 		    PG_SMMU_IDR1_NUMCB_MASK;
+ 		pgshift = (idr1 & PG_SMMU_IDR1_PAGESIZE) ? 16u : 12u;
