@@ -1770,3 +1770,57 @@ The reservation is the first gap after the camera carve-out:
 0117 is still an HFI control-path milestone, not GPU acceleration.
 SMMU stage-1 attach, PAS13 zap, the CP SQE ring/fence and Mesa/IOSurface
 remain absent; the UI remains CPU-composited.
+
+### 2026-10-30: 0117-GMUBOOT reaches iOS and starts the A630 CM3
+
+`boot-polaris-0117-gmuboot.img` (SHA-256
+`78046b756bdea0916be1b231825e09ce64e32696bef1d08887697e4badeb2203`)
+was temporary-booted with `fastboot boot`; no partition was written.
+The handset reached the iOS UI, then was returned to FASTBOOT with the
+physical key chord and the persistent ring was read through the local
+recovery image (also temporary-booted; no writes).
+
+The ring (SHA-256
+`3ebf1bad33ffb2677b0375ff14a2ef566987a6c8abf91c31f903ef26a0ecb53c`)
+contains the first successful 0117 GMU cold boot:
+
+```
+POLARIS PWR: GMU fw pa=0x102004000 size=32768 word0=0x00043f80 entry=0x00000009 last=0x00000000
+POLARIS PWR: GMU ITCM loaded 8192 words; readback first=0x00043f80 last=0x00000000
+POLARIS PWR: GMU boot complete init=0xbabeface fw_busy=0x00000000 cfg=0x00004052 general7=0x00000001 hfi_status=0x00000000; HFI not initialized
+POLARIS GPU: GMU firmware started; HFI not initialized
+```
+
+This proves the 0117 kernel, power/clock/bus bring-up and the pinned
+32 KiB GMU image are sound on hardware. The earlier `0117-hfi` ring was
+byte-identical to the 0116 ring, so that run never produced new kernel
+logs; the ADT `GPU-HFI` entry / `polarishfi=1` path therefore still has
+no valid device result. Next isolate those two variables:
+
+1. `polarishfi=1` without the ADT entry should boot and report
+   `HFI table reservation missing` followed by the fail-closed `kr=3`
+   path.
+2. The ADT `GPU-HFI` entry without `polarishfi=1` should boot unchanged
+   and report `handoff hfi=0x8bf80000+0x8000`.
+
+Only after those controls pass should the combined HFI run be repeated.
+GPU acceleration is still unavailable and the UI remains CPU-composited.
+
+### 2026-10-30: 0118 HFI diagnostics and optional GMU SMMU bypass
+
+`0118-polaris-hfi-diag-smmu-bypass.patch` keeps the 0117 HFI reservation
+path and adds instrumentation, without changing the default GPU state:
+
+- `POLARIS GPU: build 0118-hfi2` identifies the image once `polarisgpu=1`
+  is seen; the no-opt-in path still writes and prints nothing.
+- HFI queue dumps now include read/write indexes. `pre-ctrl` and `pre-init`
+  dumps bracket CM3 release and message submission.
+- The ACK wait clears stale `GMU2HOST_INTR` bits first, so an old MSGQ bit
+  cannot make an empty response queue look like a valid ACK.
+- `polarishfismmu=1` optionally programs SMR[3]/S2CR[3] (SID 5) and
+  SMR[4]/S2CR[4] (SID 4) as bypass before CM3 release. The GPU SIDs 0/1/2
+  are untouched; this is diagnostic only and remains off by default.
+
+The host C tests now apply 0118 after 0117. No device result exists yet;
+CTRL_INIT, the INIT ACK, SMMU stage-1, PAS13, the CP ring and Mesa are all
+still required before the GPU can be called usable.
