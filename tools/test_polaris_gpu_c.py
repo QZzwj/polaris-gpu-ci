@@ -125,7 +125,7 @@ static uint32_t gmu_regs[0x30000 / 4], gmu_snapshot[0x30000 / 4];
 #define SMMU_WINDOW 0x10000u
 static uint32_t smmu_regs[SMMU_WINDOW / 4], smmu_snapshot[SMMU_WINDOW / 4];
 #define PLL1_PAGE_OFFSET 0x100u
-static int power_enabled, power_on_arg, power_board, power_bad_map;
+static int power_enabled, power_on_arg, power_smmu_arg, power_board, power_bad_map;
 static int power_pll_bad_map;
 static int power_bus_bad_map;
 static int power_gmu_bad_map;
@@ -162,6 +162,10 @@ int PE_parse_boot_argn(const char *name, void *out, int size) {
     if (!strcmp(name, "polarisgpuon")) {
         memcpy(out, &power_on_arg, sizeof(power_on_arg));
         return power_on_arg != 0;
+    }
+    if (!strcmp(name, "polarissmmu")) {
+        memcpy(out, &power_smmu_arg, sizeof(power_smmu_arg));
+        return power_smmu_arg != 0;
     }
     if (!strcmp(name, "polarisgpupwr")) {
         memcpy(out, &power_enabled, sizeof(power_enabled));
@@ -277,7 +281,8 @@ EXPORT const char *power_probe(unsigned write_probe, int enabled, int board) {
     power_regs[0x120 / 4] = 0x80000000;
     power_regs[0x124 / 4] = 0;
     memcpy(power_snapshot, power_regs, sizeof(power_regs));
-    power_enabled = enabled; power_on_arg = enabled; power_board = board;
+    power_enabled = enabled; power_on_arg = enabled; power_smmu_arg = 0;
+    power_board = board;
     power_model = 0; power_clk_model = 0; power_bus_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
     pg_pwr_test_reset();
@@ -368,7 +373,7 @@ EXPORT void power_rails_reset(unsigned gdscr, int model, int on, int board) {
     power_regs[0x98 / 4] = 0x80004220;
     power_regs[0x120 / 4] = 0x80000000;
     power_regs[0x124 / 4] = 0;
-    power_enabled = on; power_on_arg = on; power_board = board;
+    power_enabled = on; power_on_arg = on; power_smmu_arg = 0; power_board = board;
     power_model = model; power_clk_model = 0; power_bus_model = 0; power_writes = 0;
     power_maps = 0; power_bad_map = 0; power_text_len = 0; power_text[0] = 0;
     pg_pwr_test_reset();
@@ -385,6 +390,7 @@ EXPORT int bus_enter(void) { return polaris_gpu_bus_enter(); }
 EXPORT void bus_exit(void) { polaris_gpu_bus_exit(); }
 EXPORT int gmu_enter(void) { return polaris_gpu_gmu_enter(); }
 EXPORT int smmu_probe(void) { return polaris_gpu_smmu_probe(); }
+EXPORT void power_smmu_optin(int level) { power_smmu_arg = level; }
 EXPORT void power_clock_fault(unsigned mode) { power_clk_model = (int)mode; }
 EXPORT void power_bus_fault(unsigned mode) { power_bus_model = (int)mode; }
 EXPORT void power_bus_map_fault(int bad) { power_bus_bad_map = bad; }
@@ -469,7 +475,8 @@ EXPORT void diag_set_dram(uint64_t base, uint64_t size) {
 }
 EXPORT void diag_reset(int historical, int enabled, int board) {
     const unsigned sizes[6] = {31980, 32768, 6684, 148, 6536, 1968};
-    power_enabled = enabled; power_on_arg = enabled; power_board = board;
+    power_enabled = enabled; power_on_arg = enabled; power_smmu_arg = 0;
+    power_board = board;
     power_model = 0; power_writes = 0; pg_pwr_test_reset();
     power_gmu_init();
     power_smmu_init();
@@ -634,6 +641,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.smmu_probe.restype = ctypes.c_int
         cls.lib.power_gmu_map_fault.argtypes = [ctypes.c_int]
         cls.lib.power_smmu_map_fault.argtypes = [ctypes.c_int]
+        cls.lib.power_smmu_optin.argtypes = [ctypes.c_int]
         cls.lib.power_gmu_reg.argtypes = [ctypes.c_uint]
         cls.lib.power_gmu_reg.restype = ctypes.c_uint
         cls.lib.power_gmu_set.argtypes = [ctypes.c_uint, ctypes.c_uint]
@@ -1165,25 +1173,72 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.power_map_count(), maps)
         self.assertEqual(self.lib.power_write_count(), writes)
 
+    def test_smmu_default_is_not_opted_in_and_never_maps(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        maps = self.lib.power_map_count()
+        writes = self.lib.power_write_count()
+        self.assertEqual(self.lib.smmu_probe(), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('smmu probe not opted in; no access', log)
+        self.assertEqual(self.lib.power_map_count(), maps)
+        self.assertEqual(self.lib.power_write_count(), writes)
+
+    def test_smmu_level_one_reads_only_idr0(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_smmu_optin(1)
+        self.assertEqual(self.lib.smmu_probe(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('SMMU read begin off=0x020 level=1', log)
+        self.assertIn('SMMU IDR0=0x08080605', log)
+        self.assertIn('SMMU probe limited to level 1; context banks not read', log)
+        self.assertIn('SMMU read-only; level=1 contexts=0 smr=5 sid_bits=3 '
+                      'irpt=8 granule=unknown; no attach', log)
+        self.assertNotIn('SMMU read begin off=0x024', log)
+        self.assertNotIn('SMMU CB0', log)
+
+    def test_smmu_level_two_stops_before_idr5(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_smmu_optin(2)
+        self.assertEqual(self.lib.smmu_probe(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('SMMU read begin off=0x024 level=2', log)
+        self.assertIn('SMMU IDR1=0x00050005 IDR2=0x00001022 '
+                      'IDR3=0x00000000', log)
+        self.assertNotIn('SMMU read begin off=0x034', log)
+        self.assertIn('SMMU read-only; level=2 contexts=5 smr=5 sid_bits=3 '
+                      'irpt=8 granule=4K; no attach', log)
+
     def test_smmu_reads_global_and_context_registers_without_any_write(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
         self.assertEqual(self.lib.rails_enter(), 1)
         self.assertEqual(self.lib.clocks_enter(), 1)
         self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_smmu_optin(4)
         writes = self.lib.power_write_count()
         self.assertEqual(self.lib.smmu_probe(), 1)
         log = self.lib.power_log().decode()
-        self.assertIn('SMMU IDR0=0x08080605 IDR1=0x00050005 '
-                      'IDR2=0x00001022 IDR3=0x00000000 IDR5=0x00000002 '
-                      'IDR6=0x00000000 IDR7=0x00000000', log)
+        self.assertIn('SMMU IDR0=0x08080605', log)
+        self.assertIn('SMMU IDR1=0x00050005 IDR2=0x00001022 '
+                      'IDR3=0x00000000', log)
+        self.assertIn('SMMU IDR5=0x00000002 IDR6=0x00000000 '
+                      'IDR7=0x00000000', log)
         self.assertIn('SMMU GFAR=0x00000000 GFSR=0x00000000 '
                       'GFSYNR0=0x00000000 GFSYNR1=0x00000000', log)
         self.assertIn('SMMU CB0 CBAR=0x00000001 SMR=0x80070208 '
                       'S2CR=0x00000000 type=trans cbndx=0 FSR=0x00000000', log)
         self.assertIn('SMMU CB4 CBAR=0x04000005 SMR=0x80070208 '
                       'S2CR=0x00000004 type=trans cbndx=4 FSR=0x00000000', log)
-        self.assertIn('SMMU read-only; contexts=5 smr=5 sid_bits=3 irpt=8 '
-                      'granule=4K; no attach', log)
+        self.assertIn('SMMU read-only; level=4 contexts=5 smr=5 sid_bits=3 '
+                      'irpt=8 granule=4K; no attach', log)
         self.assertEqual(self.lib.power_write_count(), writes)
         self.assertEqual(self.lib.power_smmu_unchanged(), 1)
 
@@ -1192,6 +1247,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.rails_enter(), 1)
         self.assertEqual(self.lib.clocks_enter(), 1)
         self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_smmu_optin(4)
         self.lib.power_smmu_set(0x24, 0)  # IDR1.NUMCB = 0
         writes = self.lib.power_write_count()
         self.assertEqual(self.lib.smmu_probe(), 0)
@@ -1203,6 +1259,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.rails_enter(), 1)
         self.assertEqual(self.lib.clocks_enter(), 1)
         self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_smmu_optin(1)
         self.lib.power_smmu_map_fault(1)
         writes = self.lib.power_write_count()
         self.assertEqual(self.lib.smmu_probe(), 0)
@@ -1213,6 +1270,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
     def test_bringup_clocks_bus_gmu_read_then_hfi_refuses_and_unwinds(self):
         self.lib.diag_reset(0, 1, 1)
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.lib.power_smmu_optin(4)
         log = self.lib.diag_run(1).decode()
         self.assertIn('CX owned, rollback=0x00222001', log)
         self.assertIn('gmu clock source root on; cfg=0x00000300', log)
@@ -1222,7 +1280,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
                       'cfg=0x00000000 fw_busy=0x00000000 init=0x00000000', log)
         self.assertIn('POLARIS GPU: GMU registers readable; '
                       'firmware not started', log)
-        self.assertIn('POLARIS PWR: SMMU read-only; contexts=5 smr=5 '
+        self.assertIn('POLARIS PWR: SMMU read-only; level=4 contexts=5 smr=5 '
                       'sid_bits=3 irpt=8 granule=4K; no attach', log)
         self.assertIn('POLARIS GPU: SMMU registers readable; no attach', log)
         self.assertLess(log.index('POLARIS GPU: SMMU registers readable'),
