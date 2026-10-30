@@ -51,13 +51,17 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/polaris_gpu_diag.c',
                         str(next(PATCHES.glob('0092-*.patch')))],
                        cwd=root, check=True, capture_output=True)
-        for number in range(94, 116):
+        for number in range(94, 117):
             candidates = list(PATCHES.glob(f'{number:04}-*.patch'))
             if len(candidates) != 1:
                 raise RuntimeError(f'expected one patch for {number:04}, got {candidates}')
             subprocess.run(['git', 'apply', '--include=bsd/dev/*',
                             str(candidates[0])],
                            cwd=root, check=True, capture_output=True)
+            if number == 107:
+                subprocess.run(['git', 'apply', '--include=bsd/dev/*',
+                                str(next(PATCHES.glob('0107b-*.patch')))],
+                               cwd=root, check=True, capture_output=True)
         inc = root / 'include/sys'
         inc.mkdir(parents=True)
         (inc / 'types.h').write_text('#include <stdint.h>\n')
@@ -75,7 +79,31 @@ class GpuCTests(unittest.TestCase):
         (root / 'include/vm').mkdir()
         (root / 'include/vm/pmap.h').write_text(
             '#include <stdint.h>\n#include <stddef.h>\n'
-            'typedef uintptr_t vm_offset_t;\ntypedef size_t vm_size_t;\n')
+            'typedef uintptr_t vm_offset_t;\ntypedef size_t vm_size_t;\n'
+            'typedef uint64_t addr64_t;\ntypedef uint32_t ppnum_t;\n'
+            'typedef struct pmap *pmap_t;\n'
+            'struct pmap { int unused; };\n'
+            'extern pmap_t kernel_pmap;\n'
+            '#define PAGE_SHIFT 14\n'
+            '#define PAGE_SIZE (1u << PAGE_SHIFT)\n'
+            '#define PAGE_MASK (PAGE_SIZE - 1u)\n'
+            '#define ptoa_64(pn) ((uint64_t)(pn) << PAGE_SHIFT)\n'
+            'ppnum_t pmap_find_phys(pmap_t, addr64_t);\n')
+        (root / 'include/vm/vm_kern.h').write_text(
+            '#include <stdint.h>\n#include <stddef.h>\n'
+            'typedef uintptr_t vm_offset_t;\ntypedef size_t vm_size_t;\n'
+            'typedef int kern_return_t;\ntypedef void *vm_map_t;\n'
+            'extern vm_map_t kernel_map;\n'
+            '#define KERN_SUCCESS 0\n'
+            '#define KMA_DATA 0x1\n#define KMA_ZERO 0x2\n#define KMA_PERMANENT 0x4\n'
+            '#define VM_KERN_MEMORY_IOKIT 0\n'
+            'kern_return_t kmem_alloc_contig(vm_map_t, vm_offset_t *, vm_size_t,\n'
+            '    vm_offset_t, uint32_t, uint32_t, int, int);\n')
+        (root / 'include/arm').mkdir()
+        (root / 'include/arm/caches_internal.h').write_text(
+            '#include <stdint.h>\n'
+            'typedef uint64_t addr64_t;\n'
+            'void flush_dcache64(addr64_t, unsigned, int);\n')
         (root / 'include/kern').mkdir()
         (root / 'include/kern/clock.h').write_text(
             '#include <stdint.h>\n'
@@ -92,6 +120,8 @@ class GpuCTests(unittest.TestCase):
 #include <dev/polaris_rpmh.h>
 #include <pexpert/device_tree.h>
 #include <vm/pmap.h>
+#include <vm/vm_kern.h>
+#include <arm/caches_internal.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -135,15 +165,22 @@ static int power_gmu_bad_map;
 static int gmu_boot_arg, gmu_boot_fault;
 static unsigned gmu_itcm_writes, gmu_itcm_first, gmu_itcm_last;
 static unsigned gmu_bad_write;
+static int hfi_arg, hfi_alloc_fault_mode, hfi_pa_high_mode;
+static int hfi_ctrl_fault_mode, hfi_ack_fault_mode, hfi_ack_timeout_mode;
+static unsigned hfi_alloc_count, hfi_flush_count;
+static uint64_t hfi_pa = 0x80000000ull;
+static uint32_t hfi_mem[0x8000 / 4];
+static unsigned gmu_log_count, gmu_log_off[128], gmu_log_val[128];
 static int power_smmu_bad_map;
 static int power_model, power_clk_model, power_bus_model;
 static unsigned power_maps, power_writes, power_cfg_ahb_write_count;
 static unsigned smmu_syncs;
 static int rh_diag_arg = 1, rh_vote_arg, rh_level_arg;
-static char power_text[8192];
+static char power_text[65536];
 static size_t power_text_len;
 int pg_test_printf(const char *fmt, ...) {
     va_list ap;
+    if (power_text_len >= sizeof(power_text) - 1) return 0;
     size_t remaining = sizeof(power_text) - power_text_len;
     va_start(ap, fmt);
     int n = vsnprintf(power_text + power_text_len, remaining, fmt, ap);
@@ -178,6 +215,10 @@ int PE_parse_boot_argn(const char *name, void *out, int size) {
     if (!strcmp(name, "polarisgmuboot")) {
         memcpy(out, &gmu_boot_arg, sizeof(gmu_boot_arg));
         return gmu_boot_arg != 0;
+    }
+    if (!strcmp(name, "polarishfi")) {
+        memcpy(out, &hfi_arg, sizeof(hfi_arg));
+        return hfi_arg != 0;
     }
     if (!strcmp(name, "polarissmmu")) {
         memcpy(out, &power_smmu_arg, sizeof(power_smmu_arg));
@@ -223,6 +264,32 @@ vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size) {
     }
     return (vm_offset_t)power_regs;
 }
+pmap_t kernel_pmap;
+vm_map_t kernel_map = (vm_map_t)(uintptr_t)1;
+ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va) {
+    (void)pmap; (void)va;
+    if (hfi_pa_high_mode)
+        return (ppnum_t)(0x40000u);   /* 0x40000 << 14 == 4 GiB */
+    return (ppnum_t)(hfi_pa >> PAGE_SHIFT);
+}
+kern_return_t kmem_alloc_contig(vm_map_t map, vm_offset_t *addrp,
+    vm_size_t size, vm_offset_t mask, uint32_t max_pnum, uint32_t pnum_mask,
+    int flags, int tag) {
+    (void)map; (void)mask; (void)max_pnum; (void)pnum_mask;
+    (void)flags; (void)tag;
+    hfi_alloc_count++;
+    if (hfi_alloc_fault_mode == 1)
+        return 1;
+    if (size != sizeof(hfi_mem))
+        return 2;
+    memset(hfi_mem, 0, sizeof(hfi_mem));
+    *addrp = (vm_offset_t)hfi_mem;
+    return 0;
+}
+void flush_dcache64(addr64_t addr, unsigned count, int phys) {
+    (void)addr; (void)count; (void)phys;
+    hfi_flush_count++;
+}
 static void power_pll_init(void) {
     memset(pll_regs, 0, sizeof(pll_regs));
     memcpy(pll_snapshot, pll_regs, sizeof(pll_regs));
@@ -253,6 +320,8 @@ static void power_gmu_init(void) {
     gmu_regs[0x14600 / 4] = 0;          /* HFI_CTRL_STATUS */
     gmu_regs[0x14604 / 4] = 0x00010000; /* HFI_VERSION_INFO */
     gmu_regs[0x14610 / 4] = 0;          /* HFI_QTBL_INFO */
+    gmu_regs[0x14648 / 4] = 0;          /* GMU2HOST_INTR_INFO */
+    gmu_regs[0x1464c / 4] = 1;          /* GMU2HOST_INTR_MASK */
     gmu_regs[0x14730 / 4] = 0;          /* GENERAL_7 */
     gmu_regs[0x24c14 / 4] = 0;          /* AO_HOST_INTR_STATUS */
     gmu_regs[0x24c18 / 4] = 0;          /* AO_HOST_INTR_MASK */
@@ -268,17 +337,31 @@ static void power_gmu_init(void) {
     gmu_itcm_first = 0;
     gmu_itcm_last = 0;
     gmu_bad_write = 0;
+    hfi_arg = 0;
+    hfi_alloc_fault_mode = 0;
+    hfi_pa_high_mode = 0;
+    hfi_ctrl_fault_mode = 0;
+    hfi_ack_fault_mode = 0;
+    hfi_ack_timeout_mode = 0;
+    hfi_alloc_count = 0;
+    hfi_flush_count = 0;
+    hfi_pa = 0x80000000ull;
+    memset(hfi_mem, 0, sizeof(hfi_mem));
+    gmu_log_count = 0;
+    memset(gmu_log_off, 0, sizeof(gmu_log_off));
+    memset(gmu_log_val, 0, sizeof(gmu_log_val));
     power_gmu_bad_map = 0;
 }
 static void power_smmu_init(void) {
     for (unsigned i = 0; i < sizeof(smmu_regs) / sizeof(smmu_regs[0]); i++)
         smmu_regs[i] = 0x5a5a5a5a;
-    /* SMMU-500: 5 SMR groups, SID bits 3 (mask 0x7), 8 context IRQs,
-     * 5 context banks, 4 KiB granule (IDR1.PAGESIZE clear). */
-    smmu_regs[0x020 / 4] = 0x08080605;
-    smmu_regs[0x024 / 4] = 0x00050005;
-    smmu_regs[0x028 / 4] = 0x00001022;
-    smmu_regs[0x02c / 4] = 0x00000000;
+    /* Device IDR values: 5 SMR groups, SID bits 3, 1 context IRQ, 5
+     * context banks, 4 KiB granule (IDR1.PAGESIZE clear). */
+    smmu_regs[0x020 / 4] = 0x48016605; /* device IDR0 */
+    smmu_regs[0x024 / 4] = 0x20008005; /* device IDR1: 4K, NUMCB=5 */
+    smmu_regs[0x028 / 4] = 0x00007511; /* device IDR2 */
+    /* The remaining IDR and global fault values are synthetic parser
+     * coverage; they are not device observations. */
     smmu_regs[0x034 / 4] = 0x00000002;
     smmu_regs[0x038 / 4] = 0x00000000;
     smmu_regs[0x03c / 4] = 0x00000000;
@@ -287,10 +370,10 @@ static void power_smmu_init(void) {
     smmu_regs[0x050 / 4] = 0x00000000;
     smmu_regs[0x054 / 4] = 0x00000000;
     for (unsigned i = 0; i < 5; i++) {
-        smmu_regs[(0x800 + i * 4) / 4] = 0x80070208; /* VALID, mask 7, SID 0x208 */
-        smmu_regs[(0xc00 + i * 4) / 4] = i;          /* TRANS to CB i */
-        smmu_regs[(0x1000 + i * 4) / 4] = (i << 24) | (i + 1); /* CBAR */
-        smmu_regs[(0x8000 + i * 0x1000 + 0x58) / 4] = 0;       /* CB FSR */
+        smmu_regs[(0x800 + i * 4) / 4] = 0x00000000; /* device: SMR invalid */
+        smmu_regs[(0xc00 + i * 4) / 4] = 0x000200ff; /* device: FAULT, cbndx=0xff */
+        smmu_regs[(0x1000 + i * 4) / 4] = (i << 24) | (i + 1); /* synthetic CBAR */
+        smmu_regs[(0x8000 + i * 0x1000 + 0x58) / 4] = 0;       /* synthetic CB FSR */
     }
     memcpy(smmu_snapshot, smmu_regs, sizeof(smmu_regs));
     power_smmu_bad_map = 0;
@@ -327,17 +410,39 @@ EXPORT int power_memory_unchanged(void) {
 void pg_pwr_test_after_write(unsigned page, uint32_t off, uint32_t value) {
     power_writes++;
     if (page == 3) {
+        if (!(off >= 0x3000u && off < 0x3000u + 0x8000u) &&
+            gmu_log_count < 128u) {
+            gmu_log_off[gmu_log_count] = off;
+            gmu_log_val[gmu_log_count] = value;
+            gmu_log_count++;
+        }
         if (off >= 0x3000u && off < 0x3000u + 0x8000u) {
             if (gmu_itcm_writes == 0) gmu_itcm_first = off;
             gmu_itcm_last = off;
             gmu_itcm_writes++;
         } else if (off != 0x14730u && off != 0x14000u && off != 0x14070u &&
-                   off != 0x14004u && off != 0x140b4u && off != 0x24c44u) {
+                   off != 0x14004u && off != 0x140b4u && off != 0x24c44u &&
+                   off != 0x14608u && off != 0x14610u && off != 0x14614u &&
+                   off != 0x14618u && off != 0x14644u && off != 0x1464cu &&
+                   off != 0x14650u) {
             gmu_bad_write = off;
         }
         if (off == 0x14000u && value == 0 && gmu_itcm_writes == 8192u &&
             !gmu_boot_fault)
             gmu_regs[0x14070 / 4] = 0xbabefaceu;
+        if (off == 0x14618u && value == 1u && !hfi_ctrl_fault_mode)
+            gmu_regs[0x14600 / 4] |= 1u;
+        if (off == 0x14644u && (value & 1u))
+            gmu_regs[0x14648 / 4] &= ~1u;
+        if (off == 0x14650u && (value & 1u) && !hfi_ack_timeout_mode) {
+            uint32_t *t = hfi_mem;
+            t[1070] = 0x0002137eu;             /* id=126 size=19 type=2 */
+            t[1071] = 0x00100500u;             /* HFI_MSG_INIT */
+            t[1072] = (uint32_t)hfi_ack_fault_mode;
+            t[1073] = 0x11223344u;             /* synthetic payload */
+            t[29] = 19;                        /* MSG write index */
+            gmu_regs[0x14648 / 4] |= 1u;       /* GMU2HOST_INTR_INFO */
+        }
         return;
     }
     if (page == 2) {
@@ -439,6 +544,27 @@ EXPORT unsigned power_gmu_itcm_count(void) { return gmu_itcm_writes; }
 EXPORT unsigned power_gmu_itcm_first(void) { return gmu_itcm_first; }
 EXPORT unsigned power_gmu_itcm_last(void) { return gmu_itcm_last; }
 EXPORT unsigned power_gmu_bad_off(void) { return gmu_bad_write; }
+EXPORT void power_hfi_optin(int on) { hfi_arg = on; }
+EXPORT void hfi_enable(int on) { hfi_arg = on; }
+EXPORT int hfi_start(void) { return polaris_gpu_hfi_start(); }
+EXPORT void hfi_alloc_fault(unsigned mode) { hfi_alloc_fault_mode = (int)mode; }
+EXPORT void hfi_pa_high(int on) { hfi_pa_high_mode = on; }
+EXPORT void hfi_ctrl_fault(int on) { hfi_ctrl_fault_mode = on; }
+EXPORT void hfi_ack_fault(unsigned error) { hfi_ack_fault_mode = (int)error; }
+EXPORT void hfi_ack_timeout(int on) { hfi_ack_timeout_mode = on; }
+EXPORT unsigned hfi_table_word(unsigned i) {
+    return i < sizeof(hfi_mem) / sizeof(hfi_mem[0]) ? hfi_mem[i] : 0;
+}
+EXPORT unsigned hfi_table_pa(void) { return (unsigned)hfi_pa; }
+EXPORT unsigned hfi_alloc_count_get(void) { return hfi_alloc_count; }
+EXPORT unsigned hfi_flush_count_get(void) { return hfi_flush_count; }
+EXPORT unsigned gmu_write_count(void) { return gmu_log_count; }
+EXPORT unsigned gmu_write_off(unsigned i) {
+    return i < gmu_log_count ? gmu_log_off[i] : 0xffffffffu;
+}
+EXPORT unsigned gmu_write_val(unsigned i) {
+    return i < gmu_log_count ? gmu_log_val[i] : 0xffffffffu;
+}
 EXPORT unsigned power_gmu_fw_word(unsigned i) {
     return i < sizeof(gmu_fw_regs) / sizeof(gmu_fw_regs[0]) ? gmu_fw_regs[i] : 0;
 }
@@ -703,6 +829,24 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.power_gmu_bad_off.restype = ctypes.c_uint
         cls.lib.power_gmu_fw_word.argtypes = [ctypes.c_uint]
         cls.lib.power_gmu_fw_word.restype = ctypes.c_uint
+        cls.lib.power_hfi_optin.argtypes = [ctypes.c_int]
+        cls.lib.hfi_enable.argtypes = [ctypes.c_int]
+        cls.lib.hfi_start.restype = ctypes.c_int
+        cls.lib.hfi_alloc_fault.argtypes = [ctypes.c_uint]
+        cls.lib.hfi_pa_high.argtypes = [ctypes.c_int]
+        cls.lib.hfi_ctrl_fault.argtypes = [ctypes.c_int]
+        cls.lib.hfi_ack_fault.argtypes = [ctypes.c_uint]
+        cls.lib.hfi_ack_timeout.argtypes = [ctypes.c_int]
+        cls.lib.hfi_table_word.argtypes = [ctypes.c_uint]
+        cls.lib.hfi_table_word.restype = ctypes.c_uint
+        cls.lib.hfi_table_pa.restype = ctypes.c_uint
+        cls.lib.hfi_alloc_count_get.restype = ctypes.c_uint
+        cls.lib.hfi_flush_count_get.restype = ctypes.c_uint
+        cls.lib.gmu_write_count.restype = ctypes.c_uint
+        cls.lib.gmu_write_off.argtypes = [ctypes.c_uint]
+        cls.lib.gmu_write_off.restype = ctypes.c_uint
+        cls.lib.gmu_write_val.argtypes = [ctypes.c_uint]
+        cls.lib.gmu_write_val.restype = ctypes.c_uint
         cls.lib.smmu_probe.restype = ctypes.c_int
         cls.lib.power_gmu_map_fault.argtypes = [ctypes.c_int]
         cls.lib.power_smmu_map_fault.argtypes = [ctypes.c_int]
@@ -792,6 +936,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.probe(b'gfx.lvl', 1, 0, None), 0)
 
     def test_c_raw_references_do_not_claim_bank_assignment(self):
+        # 0x208 is the recovery DTB's SMMU provider phandle, not a SID.
         self.assertEqual([self.lib.ref_phandle(i) for i in range(5)], [0x208] * 5)
         self.assertEqual([self.lib.ref_arg(i) for i in range(5)], [0, 2, 1, 4, 5])
 
@@ -1292,6 +1437,152 @@ EXPORT int rh_sleep_wake_unchanged(void) {
                       'cfg=0x00004052 fw_busy=0x00000000; CM3 held in reset', log)
         self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
 
+    def _boot_gmu(self, hfi=True, ctrl_fault=0, alloc_fault=0, pa_high=0):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_gmu_boot_optin(1)
+        if hfi:
+            self.lib.power_hfi_optin(1)
+        if ctrl_fault:
+            self.lib.hfi_ctrl_fault(1)
+        if alloc_fault:
+            self.lib.hfi_alloc_fault(1)
+        if pa_high:
+            self.lib.hfi_pa_high(1)
+        return self.lib.gmu_boot(0x110010000, 0x8000)
+
+    def test_hfi_disabled_allocates_nothing(self):
+        self.assertEqual(self._boot_gmu(hfi=False), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI not initialized', log)
+        self.assertEqual(self.lib.hfi_alloc_count_get(), 0)
+        self.assertEqual(self.lib.hfi_flush_count_get(), 0)
+        self.assertEqual(self.lib.power_gmu_reg(0x14610), 0)
+        self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x5a5a5a5a)
+        self.assertEqual(self.lib.power_gmu_reg(0x14618), 0x5a5a5a5a)
+
+    def test_hfi_table_layout_matches_kgsl(self):
+        self.assertEqual(self._boot_gmu(), 1)
+        self.assertEqual(self.lib.hfi_table_pa(), 0x80000000)
+        self.assertEqual([self.lib.hfi_table_word(i) for i in range(6)],
+                         [0, 42, 6, 12, 3, 3])
+        types = [0x0a00, 0x0a04, 0x2805]
+        for i, qtype in enumerate(types):
+            base = 6 + 12 * i
+            q = [self.lib.hfi_table_word(base + j) for j in range(12)]
+            self.assertEqual(q, [1, (0x80000000 + 168 + 4112 * i) & 0xffffffff,
+                                 qtype, 1024, 0, 0, 1, 1, 1, 0, 0, 0])
+
+    def test_hfi_registers_written_in_boot_order(self):
+        self.assertEqual(self._boot_gmu(), 1)
+        writes = [(self.lib.gmu_write_off(i), self.lib.gmu_write_val(i))
+                  for i in range(self.lib.gmu_write_count())]
+        qtbl = writes.index((0x14614, 0x80000000))
+        info = writes.index((0x14610, 1))
+        sfr = writes.index((0x14608, 0x06030000))
+        release = max(i for i, (off, value) in enumerate(writes)
+                      if off == 0x14000 and value == 0)
+        ctrl = writes.index((0x14618, 1))
+        self.assertLess(qtbl, release)
+        self.assertLess(info, release)
+        self.assertLess(sfr, release)
+        self.assertLess(release, ctrl)
+        self.assertLess(qtbl, info)
+        self.assertLess(sfr, writes.index((0x140b4, 0x4052)))
+        self.assertEqual(self.lib.gmu_write_val(0), 1)   # GENERAL_7
+        self.assertEqual(self.lib.gmu_write_off(0), 0x14730)
+
+    def test_hfi_boot_completes_ctrl_init(self):
+        self.assertEqual(self._boot_gmu(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI ctrl initialized status=0x00000001', log)
+        self.assertIn('GMU boot complete init=0xbabeface', log)
+        self.assertIn('HFI ctrl initialized', log)
+        self.assertIn('HFI table pa=0x80000000', log)
+        self.assertIn('qtbl_info=0x00000001 sfr=0x06030000', log)
+        self.assertEqual(self.lib.power_gmu_reg(0x14600) & 1, 1)
+        self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x80000000)
+        self.assertEqual(self.lib.power_gmu_reg(0x14610), 1)
+        self.assertEqual(self.lib.power_gmu_reg(0x14608), 0x06030000)
+        self.assertEqual(self.lib.hfi_alloc_count_get(), 1)
+        self.assertGreater(self.lib.hfi_flush_count_get(), 0)
+
+    def test_hfi_start_sends_init_message(self):
+        self.assertEqual(self._boot_gmu(), 1)
+        self.assertEqual(self.lib.hfi_start(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI INIT sent cmd=0x00100500 dbg=0x80004000', log)
+        self.assertEqual([self.lib.hfi_table_word(42 + i) for i in range(5)],
+                         [0x00100500, 0, 0x80004000, 0x4000, 1])
+        self.assertEqual(self.lib.hfi_table_word(17), 5)
+
+    def test_hfi_ack_success_advances_msg_read_index(self):
+        self.assertEqual(self._boot_gmu(), 1)
+        self.assertEqual(self.lib.hfi_start(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI ACK id=126 size=19 seq=1 error=0 '
+                      'payload0=0x11223344', log)
+        self.assertEqual(self.lib.hfi_table_word(28), 19)
+        self.assertEqual(self.lib.hfi_table_word(29), 19)
+        self.assertEqual(self.lib.power_gmu_reg(0x14648) & 1, 0)
+
+    def test_hfi_ack_error_is_reported(self):
+        self.assertEqual(self._boot_gmu(), 1)
+        self.lib.hfi_ack_fault(5)
+        self.assertEqual(self.lib.hfi_start(), 0)
+        self.assertIn('HFI ACK error=5', self.lib.power_log().decode())
+        self.assertEqual(self.lib.power_gmu_reg(0x14648) & 1, 0)
+
+    def test_hfi_ack_timeout_is_reported(self):
+        self.assertEqual(self._boot_gmu(), 1)
+        self.lib.hfi_ack_timeout(1)
+        self.assertEqual(self.lib.hfi_start(), 0)
+        self.assertIn('HFI ACK timeout info=0x00000000',
+                      self.lib.power_log().decode())
+
+    def test_hfi_ctrl_timeout_blocks_start(self):
+        self.assertEqual(self._boot_gmu(ctrl_fault=1), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI CTRL_INIT timeout status=0x00000000', log)
+        self.assertIn('HFI ctrl not initialized', log)
+        self.assertEqual(self.lib.hfi_start(), 0)
+        self.assertIn('HFI not ready; GMU boot or CTRL_INIT missing',
+                      self.lib.power_log().decode())
+
+    def test_hfi_allocation_failure_holds_cm3_in_reset(self):
+        self.assertEqual(self._boot_gmu(alloc_fault=1), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI table allocation failed kr=1', log)
+        self.assertIn('HFI table unavailable; CM3 held in reset', log)
+        self.assertEqual(self.lib.hfi_alloc_count_get(), 1)
+        self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
+        self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x5a5a5a5a)
+
+    def test_hfi_rejects_physical_address_above_4gib(self):
+        self.assertEqual(self._boot_gmu(pa_high=1), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI table pa=0x100000000 is not 4K-aligned below 4 GiB',
+                      log)
+        self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
+
+    def test_hfi_start_without_gmu_boot_is_refused(self):
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.assertEqual(self.lib.rails_enter(), 1)
+        self.assertEqual(self.lib.clocks_enter(), 1)
+        self.assertEqual(self.lib.bus_enter(), 1)
+        self.lib.power_gmu_boot_optin(0)
+        self.lib.power_hfi_optin(1)
+        self.assertEqual(self.lib.gmu_boot(0x110010000, 0x8000), 0)
+        self.assertEqual(self.lib.hfi_start(), 0)
+        self.assertIn('HFI not ready; GMU boot or CTRL_INIT missing',
+                      self.lib.power_log().decode())
+        writes = [self.lib.gmu_write_off(i)
+                  for i in range(self.lib.gmu_write_count())]
+        self.assertNotIn(0x14650, writes)
+        self.assertEqual(self.lib.hfi_alloc_count_get(), 0)
+
     def test_smmu_refuses_without_bus_before_mapping(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
         self.assertEqual(self.lib.rails_enter(), 1)
@@ -1325,10 +1616,10 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.smmu_probe(), 1)
         log = self.lib.power_log().decode()
         self.assertIn('SMMU read begin off=0x020 level=1', log)
-        self.assertIn('SMMU IDR0=0x08080605', log)
+        self.assertIn('SMMU IDR0=0x48016605', log)
         self.assertIn('SMMU probe limited to level 1; context banks not read', log)
         self.assertIn('SMMU read-only; level=1 contexts=0 smr=5 sid_bits=3 '
-                      'irpt=8 granule=unknown; no attach', log)
+                      'irpt=1 granule=unknown; no attach', log)
         self.assertNotIn('SMMU read begin off=0x024', log)
         self.assertNotIn('SMMU CB0', log)
 
@@ -1356,10 +1647,11 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertEqual(self.lib.smmu_probe(), 1)
         log = self.lib.power_log().decode()
         self.assertIn('SMMU read begin off=0x024 level=2', log)
-        self.assertIn('SMMU IDR1=0x00050005 IDR2=0x00001022', log)
+        self.assertIn('SMMU IDR1=0x20008005 IDR2=0x00007511', log)
         self.assertNotIn('SMMU read begin off=0x034', log)
+        self.assertNotIn('SMMU read begin off=0x02c', log)
         self.assertIn('SMMU read-only; level=2 contexts=5 smr=5 sid_bits=3 '
-                      'irpt=8 granule=4K; no attach', log)
+                      'irpt=1 granule=4K; no attach', log)
         self.assertEqual(self.lib.smmu_sync_count(), 3)
 
     def test_smmu_reads_global_and_context_registers_without_any_write(self):
@@ -1371,18 +1663,19 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         writes = self.lib.power_write_count()
         self.assertEqual(self.lib.smmu_probe(), 1)
         log = self.lib.power_log().decode()
-        self.assertIn('SMMU IDR0=0x08080605', log)
-        self.assertIn('SMMU IDR1=0x00050005 IDR2=0x00001022', log)
+        self.assertIn('SMMU IDR0=0x48016605', log)
+        self.assertIn('SMMU IDR1=0x20008005 IDR2=0x00007511', log)
         self.assertIn('SMMU IDR5=0x00000002 IDR6=0x00000000 '
                       'IDR7=0x00000000', log)
         self.assertIn('SMMU GFAR=0x00000000 GFSR=0x00000000 '
                       'GFSYNR0=0x00000000 GFSYNR1=0x00000000', log)
-        self.assertIn('SMMU CB0 CBAR=0x00000001 SMR=0x80070208 '
-                      'S2CR=0x00000000 type=trans cbndx=0 FSR=0x00000000', log)
-        self.assertIn('SMMU CB4 CBAR=0x04000005 SMR=0x80070208 '
-                      'S2CR=0x00000004 type=trans cbndx=4 FSR=0x00000000', log)
+        self.assertIn('SMMU CB0 CBAR=0x00000001 SMR=0x00000000 '
+                      'S2CR=0x000200ff type=fault cbndx=255 FSR=0x00000000', log)
+        self.assertIn('SMMU CB4 CBAR=0x04000005 SMR=0x00000000 '
+                      'S2CR=0x000200ff type=fault cbndx=255 FSR=0x00000000', log)
         self.assertIn('SMMU read-only; level=4 contexts=5 smr=5 sid_bits=3 '
-                      'irpt=8 granule=4K; no attach', log)
+                      'irpt=1 granule=4K; no attach', log)
+        self.assertNotIn('SMMU read begin off=0x02c', log)
         self.assertEqual(self.lib.smmu_sync_count(), 30)
         self.assertEqual(self.lib.power_write_count(), writes)
         self.assertEqual(self.lib.power_smmu_unchanged(), 1)
@@ -1427,7 +1720,7 @@ EXPORT int rh_sleep_wake_unchanged(void) {
                       'firmware not started', log)
         self.assertIn('POLARIS GPU: gmu boot not opted in; skipped', log)
         self.assertIn('POLARIS PWR: SMMU read-only; level=4 contexts=5 smr=5 '
-                      'sid_bits=3 irpt=8 granule=4K; no attach', log)
+                      'sid_bits=3 irpt=1 granule=4K; no attach', log)
         self.assertIn('POLARIS GPU: SMMU registers readable; no attach', log)
         self.assertLess(log.index('POLARIS GPU: SMMU registers readable'),
                         log.index('POLARIS GPU: HFI backend not implemented'))
@@ -1460,6 +1753,37 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertNotIn('clocks exit restored', log)
         self.assertEqual(self.lib.power_reg(0x6c), 0x80222000)
         self.assertEqual(self.lib.power_gmu_reg(0x14070), 0xbabeface)
+
+    def test_bringup_hfi_success_still_quarantines(self):
+        self.lib.diag_reset(0, 1, 1)
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.lib.power_smmu_optin(4)
+        self.lib.power_gmu_boot_optin(1)
+        self.lib.power_hfi_optin(1)
+        log = self.lib.diag_run(1).decode()
+        self.assertIn('POLARIS GPU: GMU firmware started; '
+                      'HFI ctrl stage attempted', log)
+        self.assertIn('POLARIS PWR: HFI ACK id=126 size=19 seq=1 error=0', log)
+        self.assertIn('POLARIS GPU: HFI initialized', log)
+        self.assertIn('POLARIS GPU: idle unconfirmed; quarantined, '
+                      'CPU display unchanged', log)
+        self.assertNotIn('rails exit collapsed', log)
+        self.assertNotIn('clocks exit restored', log)
+
+    def test_bringup_hfi_ack_timeout_quarantines(self):
+        self.lib.diag_reset(0, 1, 1)
+        self.lib.power_rails_reset(0x00222001, 1, 1, 1)
+        self.lib.power_smmu_optin(4)
+        self.lib.power_gmu_boot_optin(1)
+        self.lib.power_hfi_optin(1)
+        self.lib.hfi_ack_timeout(1)
+        log = self.lib.diag_run(1).decode()
+        self.assertIn('HFI ACK timeout info=0x00000000', log)
+        self.assertIn('POLARIS GPU: HFI not initialized; '
+                      'acceleration unavailable', log)
+        self.assertIn('POLARIS GPU: idle unconfirmed; quarantined, '
+                      'CPU display unchanged', log)
+        self.assertNotIn('rails exit collapsed', log)
 
     def test_bringup_without_gpuon_writes_nothing(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)

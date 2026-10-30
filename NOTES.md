@@ -1638,3 +1638,39 @@ the unwind must not collapse CX or clocks under a running CM3. The
 handset reached normal SpringBoard traffic with no decoded panic or
 watchdog record. The UI is still CPU-composited and this is not GPU
 acceleration.
+
+### 2026-10-30: 0116 builds the GMU HFI queues and sends INIT
+
+0116 adds the first HFI control-path milestone on top of 0115's CM3 cold
+boot. It is gated by `polarishfi=1` and still requires `polarisgpuon=1
+polarisgmuboot=1`; without the new gate no queue memory is allocated and
+no HFI register is written.
+
+- `polaris_gpu_pwron.c` allocates a 32 KiB contiguous, page-aligned HFI
+  table with `kmem_alloc_contig`, flushes it, and programs
+  `HFI_QTBL_INFO`/`HFI_QTBL_ADDR` before `HFI_CTRL_INIT`. The table
+  header is `{0,42,6,12,3,3}`; the three queue headers start at table
+  dwords 42, 1070 and 2098 (types `0xA00`/`0xA04`/`0x2805`, depth 1024).
+- `HFI_SFR_ADDR` is `0x06030000`, the A630 chip ID from the SDM845 GPU
+  node. The earlier `0x03020000` value used during drafting was wrong
+  and is not in the patch.
+- The INIT message occupies CMD-queue table dwords 42..46:
+  `{0x00100500, 0, pa+0x4000, 0x4000, 1}`; the write index advances
+  to 5 and `HOST2GMU_INTR_SET` bit 0 is raised. The ACK is 19 dwords
+  with header `0x0002137e` (id 126, size 19, type 2); it is consumed
+  from the MSG queue and the read index is advanced.
+- CTRL_INIT has a 200 ms bound and the ACK a 1 s bound. Allocation
+  failure, a PA at or above 4 GiB, CTRL timeout, or ACK error/timeout
+  all return failure; the GPU gate then quarantines without touching
+  the display. Success prints `POLARIS GPU: HFI initialized`, which is
+  still not acceleration.
+- `tools/test_polaris_gpu_c.py` now exercises the queue layout,
+  register write order, INIT contents and ACK paths in the C harness:
+  **155 tests OK** with `-Wall -Wextra -Werror`.
+- `xnu/patches/0116-polaris-hfi-init.patch` (3 files, +372/-13) applies
+  forward and reverses cleanly against the 0115 baseline `05fa852`.
+
+0116 does not make the GPU usable: HFI `FW_VERSION`/`PERF_TBL`/
+`BW_VOTE_TBL`/`TEST`, SMMU stage-1 attach (S2CR is still all-BYPASS),
+PAS13 zap, the CP SQE ring/fence, and Mesa/IOSurface are later stages.
+The UI remains CPU-composited.
