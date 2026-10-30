@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 PAGE = 0x4000
 ZAP_BASE, ZAP_SIZE = 0x8c415000, 0x2000
 SPLASH_BASE, SPLASH_SIZE = 0x9d400000, 0x2400000
+HFI_MIN_SIZE = 0x8000
+HFI_LIMIT = 1 << 32
 U64_MAX = (1 << 64) - 1
 
 REQUIRED_IDENTITIES = ('xiaomi,polaris', 'qcom,sdm845')
@@ -62,6 +64,8 @@ class Handoff:
     dram_size: int
     blobs: tuple
     reserved: tuple = ((ZAP_BASE, ZAP_SIZE), (SPLASH_BASE, SPLASH_SIZE))
+    hfi_addr: int = 0
+    hfi_size: int = 0
 
     def blob(self, name):
         for b in self.blobs:
@@ -90,7 +94,8 @@ def match_set(sizes):
 
 
 def validate_handoff(identities, dram_base, dram_size, blobs,
-                     reserved=((ZAP_BASE, ZAP_SIZE), (SPLASH_BASE, SPLASH_SIZE))):
+                     reserved=((ZAP_BASE, ZAP_SIZE), (SPLASH_BASE, SPLASH_SIZE)),
+                     hfi=None):
     """Fail closed on anything unexpected. Read-only by construction."""
     have = set(identities)
     for want in REQUIRED_IDENTITIES:
@@ -124,7 +129,22 @@ def validate_handoff(identities, dram_base, dram_size, blobs,
             if overlaps(blob.addr, reserve, other, other_reserve):
                 raise HandoffError(f'{blob.name} overlaps {other:#x}')
         seen.append((blob.addr, reserve))
-    return Handoff(set_name, note, dram_base, dram_size, tuple(ordered), tuple(reserved))
+    hfi_addr = hfi_size = 0
+    if hfi is not None:
+        hfi_addr, hfi_size = hfi
+        if hfi_size < HFI_MIN_SIZE or hfi_size > U64_MAX:
+            raise HandoffError('GPU-HFI reservation has an invalid length')
+        if not hfi_addr or hfi_addr & 0xfff:
+            raise HandoffError('GPU-HFI reservation is not 4K aligned')
+        if hfi_addr > U64_MAX - hfi_size or hfi_addr + hfi_size > HFI_LIMIT:
+            raise HandoffError('GPU-HFI reservation leaves low 4 GiB')
+        if overlaps(dram_base, dram_size, hfi_addr, hfi_size):
+            raise HandoffError('GPU-HFI reservation overlaps managed RAM')
+        for base, size in reserved:
+            if overlaps(hfi_addr, hfi_size, base, size):
+                raise HandoffError(f'GPU-HFI reservation collides with reserved 0x{base:x}')
+    return Handoff(set_name, note, dram_base, dram_size, tuple(ordered),
+                   tuple(reserved), hfi_addr, hfi_size)
 
 
 # --- ownership ledger -------------------------------------------------------

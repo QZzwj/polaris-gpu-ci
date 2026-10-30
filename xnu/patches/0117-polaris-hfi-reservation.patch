@@ -1,0 +1,232 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 00a2bda..50655c7 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -168,7 +168,9 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 			return true;
+ 		}
+ 		if (!polaris_gpu_gmu_boot(polaris_gpu_handoff.blob[1].addr,
+-		    polaris_gpu_handoff.blob[1].size)) {
++		    polaris_gpu_handoff.blob[1].size,
++		    (uint32_t)polaris_gpu_handoff.hfi_addr,
++		    polaris_gpu_handoff.hfi_size)) {
+ 			printf("POLARIS GPU: GMU boot refused; no ownership claimed\n");
+ 			return false;
+ 		}
+@@ -296,6 +298,8 @@ polaris_gpu_init(void)
+ 	    polaris_gpu_handoff.set_name, polaris_gpu_handoff.set_note,
+ 	    polaris_gpu_handoff.dram_base, polaris_gpu_handoff.dram_size,
+ 	    polaris_gpu_handoff.blob[0].addr);
++	printf("POLARIS GPU: handoff hfi=0x%llx+0x%x (low DRAM)\n",
++	    polaris_gpu_handoff.hfi_addr, polaris_gpu_handoff.hfi_size);
+ 	{
+ 		unsigned int rows = 0, refs = 0;
+ 
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index fcbd553..29cb5e5 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -55,11 +55,14 @@ int polaris_gpu_gmu_enter(void);
+  * 0xBABEFACE signature. Requires CX, clocks and bus owned above and the
+  * separate `polarisgmuboot=1` opt-in; without it the stage performs no
+  * access. With `polarishfi=1` it also builds the three HFI queues and runs
+- * HFI_CTRL_INIT; without that opt-in it starts the CM3 but leaves HFI
+- * untouched. It does not attach the SMMU or make the GPU usable, and on
+- * timeout it puts the CM3 back in reset and returns false.
++ * HFI_CTRL_INIT. hfi_pa/hfi_size describe the optional low-DRAM GPU-HFI
++ * reservation from the handoff; when zero the HFI path falls back to the
++ * legacy kmem_alloc_contig attempt. Without the opt-in the CM3 starts but
++ * HFI is untouched. It does not attach the SMMU or make the GPU usable, and
++ * on timeout it puts the CM3 back in reset and returns false.
+  */
+-int polaris_gpu_gmu_boot(uint64_t pa, uint32_t size);
++int polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
++    uint32_t hfi_pa, uint32_t hfi_size);
+ 
+ /*
+  * HFI INIT stage: send HFI_MSG_INIT through the CMD queue and consume its
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 85c09b7..86a2e4c 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -341,12 +341,16 @@ struct pg_hfi_state {
+ 	vm_offset_t va;
+ 	uint64_t pa;
+ 	uint32_t size;
++	bool uncached;
+ 	bool ready;
+ 	bool initialized;
+ 	bool ack_done;
+ };
+ 
+ static struct pg_hfi_state pg_hfi;
++/* Handoff-owned low-DRAM reservation, zero when the ADT has none. */
++static uint32_t pg_hfi_reserved_pa;
++static uint32_t pg_hfi_reserved_size;
+ 
+ #ifdef PG_PWR_TEST
+ extern void pg_pwr_test_after_write(unsigned, uint32_t, uint32_t);
+@@ -1057,7 +1061,10 @@ pg_hfi_flush(void)
+ 	if (pg_hfi.va == 0) {
+ 		return;
+ 	}
+-	flush_dcache64((addr64_t)pg_hfi.pa, PG_HFI_ALLOC_SIZE, 1);
++	if (!pg_hfi.uncached) {
++		flush_dcache64((addr64_t)pg_hfi.pa, PG_HFI_ALLOC_SIZE, 1);
++	}
++	__sync_synchronize();
+ }
+ 
+ /*
+@@ -1113,6 +1120,33 @@ pg_hfi_alloc(void)
+ 	if (pg_hfi.ready) {
+ 		return true;
+ 	}
++	if (pg_hfi_reserved_pa != 0) {
++		if (pg_hfi_reserved_size < PG_HFI_ALLOC_SIZE) {
++			printf("POLARIS PWR: HFI reserved region too small "
++			    "(%u < %u)\n", pg_hfi_reserved_size,
++			    PG_HFI_ALLOC_SIZE);
++			return false;
++		}
++		va = ml_io_map((vm_offset_t)pg_hfi_reserved_pa,
++		    PG_HFI_ALLOC_SIZE);
++		if (va == 0) {
++			printf("POLARIS PWR: HFI table map failed pa=0x%08x\n",
++			    pg_hfi_reserved_pa);
++			return false;
++		}
++		pg_hfi.va = va;
++		pg_hfi.pa = pg_hfi_reserved_pa;
++		pg_hfi.size = PG_HFI_ALLOC_SIZE;
++		pg_hfi.uncached = true;
++		pg_hfi_fill_table();
++		pg_hfi.ready = true;
++		printf("POLARIS PWR: HFI table reserved pa=0x%llx va=0x%llx "
++		    "size=%u\n", pg_hfi.pa, (uint64_t)pg_hfi.va,
++		    PG_HFI_ALLOC_SIZE);
++		return true;
++	}
++	printf("POLARIS PWR: HFI table reservation missing; "
++	    "falling back to kmem_alloc_contig\n");
+ 	max_pnum = (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1ull);
+ 	kr = kmem_alloc_contig(kernel_map, &va, PG_HFI_ALLOC_SIZE, PAGE_MASK,
+ 	    max_pnum, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+@@ -1136,6 +1170,7 @@ pg_hfi_alloc(void)
+ 	pg_hfi.va = va;
+ 	pg_hfi.pa = pa;
+ 	pg_hfi.size = PG_HFI_ALLOC_SIZE;
++	pg_hfi.uncached = false;
+ 	pg_hfi_fill_table();
+ 	pg_hfi.ready = true;
+ 	printf("POLARIS PWR: HFI table allocated pa=0x%llx va=0x%llx size=%u\n",
+@@ -1288,7 +1323,8 @@ polaris_gpu_hfi_start(void)
+  * the reservation is owned by the handoff for the life of the boot.
+  */
+ int
+-polaris_gpu_gmu_boot(uint64_t pa, uint32_t size)
++polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
++    uint32_t hfi_pa, uint32_t hfi_size)
+ {
+ 	uint32_t fw0, fw1, fwlast;
+ 	uint32_t itcm_first, itcm_last;
+@@ -1318,6 +1354,10 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size)
+ 	if (hfion != 1) {
+ 		hfion = 0;
+ 	}
++	if (hfion != 0) {
++		pg_hfi_reserved_pa = hfi_pa;
++		pg_hfi_reserved_size = hfi_size;
++	}
+ 	if (size != PG_GMU_FW_SIZE) {
+ 		printf("POLARIS PWR: gmu boot refused; size=%u expected=%u\n",
+ 		    size, PG_GMU_FW_SIZE);
+@@ -1661,6 +1701,8 @@ pg_pwr_test_reset(void)
+ 	pg_bus_memnoc_saved = 0;
+ 	memset(&pg_pll_saved, 0, sizeof(pg_pll_saved));
+ 	memset(&pg_hfi, 0, sizeof(pg_hfi));
++	pg_hfi_reserved_pa = 0;
++	pg_hfi_reserved_size = 0;
+ }
+ #endif
+ 
+diff --git a/bsd/dev/polaris_gpu_validate.c b/bsd/dev/polaris_gpu_validate.c
+index bdc9457..c4fd072 100644
+--- a/bsd/dev/polaris_gpu_validate.c
++++ b/bsd/dev/polaris_gpu_validate.c
+@@ -20,6 +20,15 @@ extern bool polaris_touch_i2c_board(void);
+ #define PG_SPLASH_BASE 0x9d400000ull
+ #define PG_SPLASH_SIZE 0x2400000ull
+ 
++/*
++ * The HFI queue table must live below 4 GiB because the A630 GMU reads its
++ * queue addresses as 32-bit physical addresses. This XNU instance manages
++ * only the upper DDR bank (dram-base is 0x100000000), so kmem_alloc_contig
++ * cannot provide such a page: the reservation comes from the boot ADT.
++ */
++#define PG_HFI_MIN_SIZE 0x8000ull
++#define PG_HFI_LIMIT    0x100000000ull
++
+ static const char *const pg_blob_name[PG_BLOB_COUNT] = {
+ 	"GPU-SQE", "GPU-GMU", "GPU-ZAP-MDT",
+ 	"GPU-ZAP-B00", "GPU-ZAP-B01", "GPU-ZAP-B02",
+@@ -206,6 +215,41 @@ pg_validate_handoff(struct pg_handoff *out, const char **reason)
+ 			}
+ 		}
+ 	}
++
++	/*
++	 * Optional low-DRAM HFI reservation. It is not part of the registered
++	 * firmware set and absence is not an error, but when present every
++	 * property is enforced: 4 KiB alignment, at least the 32 KiB table,
++	 * entirely below 4 GiB, and no overlap with XNU-managed RAM or any
++	 * carve-out this driver knows about. The kernel maps it with
++	 * ml_io_map(); no allocator ever hands out memory from this range.
++	 */
++	{
++		uint64_t addr = 0, size = 0;
++
++		if (pg_pair(mmap, "GPU-HFI", &addr, &size)) {
++			if (size < PG_HFI_MIN_SIZE || size > UINT32_MAX) {
++				*reason = "GPU-HFI reservation has an invalid length";
++				return false;
++			}
++			if (addr == 0 || (addr & 0xfffull) != 0) {
++				*reason = "GPU-HFI reservation is not 4K aligned";
++				return false;
++			}
++			if (addr > UINT64_MAX - size || addr + size > PG_HFI_LIMIT) {
++				*reason = "GPU-HFI reservation leaves low 4 GiB";
++				return false;
++			}
++			if (pg_overlap(addr, size, out->dram_base, out->dram_size) ||
++			    pg_overlap(addr, size, PG_ZAP_BASE, PG_ZAP_SIZE) ||
++			    pg_overlap(addr, size, PG_SPLASH_BASE, PG_SPLASH_SIZE)) {
++				*reason = "GPU-HFI reservation collides with managed RAM or a carve-out";
++				return false;
++			}
++			out->hfi_addr = addr;
++			out->hfi_size = (uint32_t)size;
++		}
++	}
+ 	return true;
+ }
+ 
+diff --git a/bsd/dev/polaris_gpu_validate.h b/bsd/dev/polaris_gpu_validate.h
+index d7da8fd..e28c6b2 100644
+--- a/bsd/dev/polaris_gpu_validate.h
++++ b/bsd/dev/polaris_gpu_validate.h
+@@ -25,6 +25,13 @@ struct pg_handoff {
+ 	uint64_t dram_base;
+ 	uint64_t dram_size;
+ 	struct pg_handoff_blob blob[PG_BLOB_COUNT];
++	/*
++	 * Optional low-DRAM HFI queue-table reservation from /chosen/memory-map
++	 * "GPU-HFI". Zero when the boot did not provide one; the HFI path then
++	 * falls back to the old kmem_alloc_contig attempt and fails closed.
++	 */
++	uint64_t hfi_addr;
++	uint32_t hfi_size;
+ };
+ 
+ /*

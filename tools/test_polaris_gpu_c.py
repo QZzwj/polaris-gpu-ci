@@ -65,6 +65,9 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/*',
                         str(next(PATCHES.glob('0116b-*.patch')))],
                        cwd=root, check=True, capture_output=True)
+        subprocess.run(['git', 'apply', '--include=bsd/dev/*',
+                        str(next(PATCHES.glob('0117-*.patch')))],
+                       cwd=root, check=True, capture_output=True)
         inc = root / 'include/sys'
         inc.mkdir(parents=True)
         (inc / 'types.h').write_text('#include <stdint.h>\n')
@@ -173,6 +176,9 @@ static int hfi_ctrl_fault_mode, hfi_ack_fault_mode, hfi_ack_timeout_mode;
 static unsigned hfi_alloc_count, hfi_flush_count;
 static uint64_t hfi_pa = 0x80000000ull;
 static uint32_t hfi_mem[0x8000 / 4];
+static uint32_t hfi_reserved_mem[0x8000 / 4];
+static uint32_t hfi_reserve_pa, hfi_reserve_size;
+static int hfi_map_fault_mode;
 static unsigned gmu_log_count, gmu_log_off[128], gmu_log_val[128];
 static int power_smmu_bad_map;
 static int power_model, power_clk_model, power_bus_model;
@@ -238,6 +244,10 @@ vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size) {
     extern uint32_t rh_regs[];
     if (phys == 0x179e0000 && size == 0x4000u) return (vm_offset_t)rh_regs;
     power_maps++;
+    if (phys == 0x8bf80000ull && size == sizeof(hfi_reserved_mem)) {
+        if (hfi_map_fault_mode) return 0;
+        return (vm_offset_t)hfi_reserved_mem;
+    }
     if (phys == 0x05090000 && size == sizeof(pll_regs)) {
         if (power_pll_bad_map) return 0;
         return (vm_offset_t)pll_regs;
@@ -350,6 +360,9 @@ static void power_gmu_init(void) {
     hfi_flush_count = 0;
     hfi_pa = 0x80000000ull;
     memset(hfi_mem, 0, sizeof(hfi_mem));
+    memset(hfi_reserved_mem, 0, sizeof(hfi_reserved_mem));
+    hfi_reserve_pa = hfi_reserve_size = 0;
+    hfi_map_fault_mode = 0;
     gmu_log_count = 0;
     memset(gmu_log_off, 0, sizeof(gmu_log_off));
     memset(gmu_log_val, 0, sizeof(gmu_log_val));
@@ -438,7 +451,7 @@ void pg_pwr_test_after_write(unsigned page, uint32_t off, uint32_t value) {
         if (off == 0x14644u && (value & 1u))
             gmu_regs[0x14648 / 4] &= ~1u;
         if (off == 0x14650u && (value & 1u) && !hfi_ack_timeout_mode) {
-            uint32_t *t = hfi_mem;
+            uint32_t *t = hfi_reserve_pa ? hfi_reserved_mem : hfi_mem;
             t[1070] = 0x0002137eu;             /* id=126 size=19 type=2 */
             t[1071] = 0x00100500u;             /* HFI_MSG_INIT */
             t[1072] = (uint32_t)hfi_ack_fault_mode;
@@ -540,7 +553,14 @@ EXPORT void clocks_exit(void) { polaris_gpu_clocks_exit(); }
 EXPORT int bus_enter(void) { return polaris_gpu_bus_enter(); }
 EXPORT void bus_exit(void) { polaris_gpu_bus_exit(); }
 EXPORT int gmu_enter(void) { return polaris_gpu_gmu_enter(); }
-EXPORT int gmu_boot(uint64_t pa, unsigned size) { return polaris_gpu_gmu_boot(pa, size); }
+EXPORT int gmu_boot(uint64_t pa, unsigned size) {
+    return polaris_gpu_gmu_boot(pa, size, hfi_reserve_pa, hfi_reserve_size);
+}
+EXPORT void hfi_reserve(uint64_t pa, unsigned size) {
+    hfi_reserve_pa = (uint32_t)pa;
+    hfi_reserve_size = size;
+}
+EXPORT void hfi_map_fault(int on) { hfi_map_fault_mode = on; }
 EXPORT void power_gmu_boot_optin(int on) { gmu_boot_arg = on; }
 EXPORT void power_gmu_boot_fault(unsigned mode) { gmu_boot_fault = (int)mode; }
 EXPORT unsigned power_gmu_itcm_count(void) { return gmu_itcm_writes; }
@@ -556,7 +576,8 @@ EXPORT void hfi_ctrl_fault(int on) { hfi_ctrl_fault_mode = on; }
 EXPORT void hfi_ack_fault(unsigned error) { hfi_ack_fault_mode = (int)error; }
 EXPORT void hfi_ack_timeout(int on) { hfi_ack_timeout_mode = on; }
 EXPORT unsigned hfi_table_word(unsigned i) {
-    return i < sizeof(hfi_mem) / sizeof(hfi_mem[0]) ? hfi_mem[i] : 0;
+    const uint32_t *table = hfi_reserve_pa ? hfi_reserved_mem : hfi_mem;
+    return i < sizeof(hfi_mem) / sizeof(hfi_mem[0]) ? table[i] : 0;
 }
 EXPORT unsigned hfi_table_pa(void) { return (unsigned)hfi_pa; }
 EXPORT unsigned hfi_alloc_count_get(void) { return hfi_alloc_count; }
@@ -618,6 +639,8 @@ static const char *const blob_names[6] = {
 static uint64_t dt_dram[2];
 static unsigned char dt_blob[6][17];
 static unsigned dt_blob_len[6], dt_reads;
+static unsigned char dt_hfi[17];
+static unsigned dt_hfi_len;
 void polaris_gpu_diag(void);
 void polaris_gpu_init(void);
 int SecureDTLookupEntry(DTEntry parent, const char *path, DTEntry *out) {
@@ -644,6 +667,11 @@ int SecureDTGetProperty(DTEntry node, const char *name, const void **out, unsign
             return kSuccess;
         }
     }
+    if (!strcmp(name, "GPU-HFI") && dt_hfi_len) {
+        *out = &dt_hfi[1];
+        *len = dt_hfi_len;
+        return kSuccess;
+    }
     return -1;
 }
 EXPORT void diag_set_blob(unsigned i, uint64_t addr, uint64_t size, unsigned len) {
@@ -655,6 +683,11 @@ EXPORT void diag_set_blob(unsigned i, uint64_t addr, uint64_t size, unsigned len
 EXPORT void diag_set_dram(uint64_t base, uint64_t size) {
     dt_dram[0] = base; dt_dram[1] = size;
 }
+EXPORT void diag_set_hfi(uint64_t addr, uint64_t size, unsigned len) {
+    memcpy(&dt_hfi[1], &addr, 8);
+    memcpy(&dt_hfi[9], &size, 8);
+    dt_hfi_len = len;
+}
 EXPORT void diag_reset(int historical, int enabled, int board) {
     const unsigned sizes[6] = {31980, 32768, 6684, 148, 6536, 1968};
     power_enabled = enabled; power_on_arg = enabled; power_smmu_arg = 0;
@@ -664,6 +697,7 @@ EXPORT void diag_reset(int historical, int enabled, int board) {
     smmu_syncs = 0;
     power_gmu_init();
     power_smmu_init();
+    dt_hfi_len = 0;
     diag_set_dram(0x100000000ull, 0x7cc00000ull);
     for (unsigned i = 0; i < 6; i++)
         diag_set_blob(i, 0x110000000ull + i * 0x10000ull,
@@ -840,6 +874,8 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.hfi_ctrl_fault.argtypes = [ctypes.c_int]
         cls.lib.hfi_ack_fault.argtypes = [ctypes.c_uint]
         cls.lib.hfi_ack_timeout.argtypes = [ctypes.c_int]
+        cls.lib.hfi_reserve.argtypes = [ctypes.c_uint64, ctypes.c_uint]
+        cls.lib.hfi_map_fault.argtypes = [ctypes.c_int]
         cls.lib.hfi_table_word.argtypes = [ctypes.c_uint]
         cls.lib.hfi_table_word.restype = ctypes.c_uint
         cls.lib.hfi_table_pa.restype = ctypes.c_uint
@@ -885,6 +921,8 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         cls.lib.diag_set_blob.argtypes = [ctypes.c_uint, ctypes.c_uint64,
                                          ctypes.c_uint64, ctypes.c_uint]
         cls.lib.diag_set_dram.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+        cls.lib.diag_set_hfi.argtypes = [ctypes.c_uint64, ctypes.c_uint64,
+                                        ctypes.c_uint]
         cls.lib.diag_run.argtypes = [ctypes.c_uint]
         cls.lib.diag_run.restype = ctypes.c_char_p
         for name in ('rh_reset', 'rh_claim_mock', 'rh_snapshot_mock', 'rh_send_mock',
@@ -1440,7 +1478,8 @@ EXPORT int rh_sleep_wake_unchanged(void) {
                       'cfg=0x00004052 fw_busy=0x00000000; CM3 held in reset', log)
         self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
 
-    def _boot_gmu(self, hfi=True, ctrl_fault=0, alloc_fault=0, pa_high=0):
+    def _boot_gmu(self, hfi=True, ctrl_fault=0, alloc_fault=0, pa_high=0,
+                  reserve=None, map_fault=0):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)
         self.assertEqual(self.lib.rails_enter(), 1)
         self.assertEqual(self.lib.clocks_enter(), 1)
@@ -1454,6 +1493,10 @@ EXPORT int rh_sleep_wake_unchanged(void) {
             self.lib.hfi_alloc_fault(1)
         if pa_high:
             self.lib.hfi_pa_high(1)
+        if reserve:
+            self.lib.hfi_reserve(*reserve)
+        if map_fault:
+            self.lib.hfi_map_fault(1)
         return self.lib.gmu_boot(0x110010000, 0x8000)
 
     def test_hfi_disabled_allocates_nothing(self):
@@ -1569,6 +1612,69 @@ EXPORT int rh_sleep_wake_unchanged(void) {
         self.assertIn('HFI table pa=0x100000000 is not 4K-aligned below 4 GiB',
                       log)
         self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
+
+    def test_hfi_reserved_region_is_mapped_without_kmem(self):
+        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x8000)), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI table reserved pa=0x8bf80000', log)
+        self.assertNotIn('HFI table reservation missing', log)
+        self.assertEqual(self.lib.hfi_alloc_count_get(), 0)
+        self.assertEqual(self.lib.hfi_flush_count_get(), 0)
+        self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x8bf80000)
+        self.assertEqual([self.lib.hfi_table_word(i) for i in range(6)],
+                         [0, 42, 6, 12, 3, 3])
+        self.assertEqual(self.lib.hfi_table_word(7), 0x8bf80000 + 168)
+
+    def test_hfi_reserved_region_too_small_fails_closed(self):
+        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x4000)), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI reserved region too small (16384 < 32768)', log)
+        self.assertIn('HFI table unavailable; CM3 held in reset', log)
+        self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
+
+    def test_hfi_reserved_map_failure_fails_closed(self):
+        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x8000),
+                                        map_fault=1), 0)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI table map failed pa=0x8bf80000', log)
+        self.assertIn('HFI table unavailable; CM3 held in reset', log)
+        self.assertEqual(self.lib.power_gmu_reg(0x14000), 1)
+        self.assertEqual(self.lib.power_gmu_reg(0x14614), 0x5a5a5a5a)
+
+    def test_hfi_reserved_path_sends_init_and_acks_uncached(self):
+        self.assertEqual(self._boot_gmu(reserve=(0x8bf80000, 0x8000)), 1)
+        self.assertEqual(self.lib.hfi_start(), 1)
+        log = self.lib.power_log().decode()
+        self.assertIn('HFI INIT sent cmd=0x00100500 dbg=0x8bf84000', log)
+        self.assertIn('HFI ACK id=126 size=19 seq=1 error=0', log)
+        self.assertEqual([self.lib.hfi_table_word(42 + i) for i in range(5)],
+                         [0x00100500, 0, 0x8bf84000, 0x4000, 1])
+        self.assertEqual(self.lib.hfi_table_word(28), 19)
+        self.assertEqual(self.lib.hfi_flush_count_get(), 0)
+
+    def test_handoff_accepts_and_reports_low_dram_hfi(self):
+        self.lib.diag_reset(0, 1, 1)
+        self.lib.diag_set_hfi(0x8bf80000, 0x8000, 16)
+        log = self.lib.diag_run(1).decode()
+        self.assertIn('handoff hfi=0x8bf80000+0x8000 (low DRAM)', log)
+        self.assertNotIn('handoff refused', log)
+        self.assertEqual(self.lib.hfi_alloc_count_get(), 0)
+
+    def test_handoff_refuses_bad_hfi_reservations(self):
+        for address, size, length, reason in (
+                (0x8bf80000, 0x4000, 16,
+                 'GPU-HFI reservation has an invalid length'),
+                (0x8bf80008, 0x8000, 16,
+                 'GPU-HFI reservation is not 4K aligned'),
+                (0x100000000, 0x8000, 16,
+                 'GPU-HFI reservation leaves low 4 GiB'),
+                (0x8c415000, 0x8000, 16,
+                 'GPU-HFI reservation collides with managed RAM or a carve-out')):
+            self.lib.diag_reset(0, 1, 1)
+            self.lib.diag_set_hfi(address, size, length)
+            log = self.lib.diag_run(1).decode()
+            self.assertIn('handoff refused (' + reason, log)
+            self.assertEqual(self.lib.power_map_count(), 0)
 
     def test_hfi_start_without_gmu_boot_is_refused(self):
         self.lib.power_rails_reset(0x00222001, 1, 1, 1)

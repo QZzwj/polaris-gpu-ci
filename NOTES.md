@@ -1718,3 +1718,55 @@ Final host run: `python -m unittest discover -s tools -p
 were performed. SMMU attach, page tables, PAS13, CP and fence remain
 absent; the UI is still CPU-composited and this is not GPU
 acceleration.
+
+### 2026-10-30: 0116-HFI device result and the low-DRAM root cause
+
+`boot-polaris-0116-hfi.img` was temporary-booted with `fastboot boot`
+(no partition written). The 4,198,400-byte ring
+`ring-0116-hfi-local.bin` (SHA-256
+`597adf6e7e319cc4031d87fe8b5a0a6778f4255276041adf5203313330fa190f`)
+contains the observed failure:
+
+```
+POLARIS PWR: HFI table allocation failed kr=3
+POLARIS PWR: HFI table unavailable; CM3 held in reset
+POLARIS GPU: GMU boot refused; no ownership claimed
+```
+
+`kr=3` is `KERN_NOSPACE`. XNU's managed DRAM starts at
+`dram-base=0x100000000`; `kmem_alloc_contig` cannot return a page below
+`max_pnum=0x100000` (4 GiB), so the 32 KiB HFI queue table could never
+be allocated. The CM3 itself had already started
+(`FW_INIT_RESULT=0xBABEFACE` in the same ring), but the HFI control
+path correctly stayed fail-closed and held CM3 in reset. The UI stayed
+CPU-composited.
+
+### 2026-10-30: 0117 reserves the HFI table in low DRAM
+
+0117 adds an optional `GPU-HFI` entry to the ADT `/chosen/memory-map`
+and maps that range with `ml_io_map` instead of `kmem_alloc_contig`.
+The reservation is the first gap after the camera carve-out:
+`0x8bf80000` + `0x8000`, verified against the handset recovery FDT
+(`camera_region` ends at `0x8bf50000`; `ips_fw_region` starts at
+`0x8c400000`; `linux,cma` is dynamically allocated and has no fixed
+`reg`). The A630 GMU requires the queue table below 4 GiB.
+
+- `polaris_gpu_validate.c` parses `GPU-HFI`, requires at least
+  `0x8000` bytes, 4 KiB alignment and a range entirely below 4 GiB,
+  and rejects overlap with managed DRAM, ZAP or splash. A missing entry
+  is not fatal and keeps the 0116 allocation fallback.
+- `polaris_gpu_pwron.c` maps the reservation uncached, skips
+  `flush_dcache64` for it, and keeps CM3 in reset on any mapping
+  failure. The table header/queue layout and INIT/ACK path are
+  unchanged from 0116.
+- `tools/mkpayload.py` can add pure ADT memory-map entries without
+  appending payload bytes, so the reservation never becomes a blob
+  above 4 GiB. `tools/polaris_gpu_preflight.py` and
+  `tools/polaris_gpu_handoff.py` validate the same range.
+- Host tests: **Ran 251 tests in 2.534s, OK** with Windows
+  `C:\Python314\python.exe`, local Zig `cc`, and isolated temp/Zig
+  caches.
+
+0117 is still an HFI control-path milestone, not GPU acceleration.
+SMMU stage-1 attach, PAS13 zap, the CP SQE ring/fence and Mesa/IOSurface
+remain absent; the UI remains CPU-composited.

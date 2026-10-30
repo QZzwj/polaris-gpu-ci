@@ -145,7 +145,8 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=(),
+          memory_map_entries=()):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -181,6 +182,17 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
         if name == 'RAMDisk':
             ramdisk = (hex(pa), hex(size))
 
+    # Pure ADT reservations: describe an externally owned physical range
+    # without appending any payload bytes or segment.
+    for name, phys, size in memory_map_entries:
+        if not name or name in seen or not name.isascii() or len(name) > 64:
+            raise ValueError(f'invalid or duplicate memory-map name: {name!r}')
+        if (not isinstance(phys, int) or not isinstance(size, int) or
+                phys < 0 or size <= 0 or phys + size > 1 << 64):
+            raise ValueError(f'invalid memory-map range: {name!r}')
+        seen.add(name)
+        adt_blob = add_memory_map_entry(adt_blob, name, phys, size)
+
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
     seg_table = []
@@ -202,7 +214,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
-                segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
+                segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs],
+                memory_map_entries=[(n, hex(p), hex(s)) for n, p, s in memory_map_entries])
     return bytes(out), info
 
 
