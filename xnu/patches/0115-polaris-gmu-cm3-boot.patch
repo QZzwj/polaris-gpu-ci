@@ -1,0 +1,351 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index b8b3dd4..2719b49 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -23,6 +23,7 @@ enum polaris_gpu_stage {
+ 	POLARIS_GPU_CLOCKS,
+ 	POLARIS_GPU_BUS,
+ 	POLARIS_GPU_GMU,
++	POLARIS_GPU_GMU_BOOT,
+ 	POLARIS_GPU_SMMU_PROBE,
+ 	POLARIS_GPU_HFI,
+ 	POLARIS_GPU_SMMU,
+@@ -49,6 +50,7 @@ struct polaris_gpu_context {
+ #define POLARIS_GPU_OWN_CX	(1u << 0)
+ #define POLARIS_GPU_OWN_CLOCKS	(1u << 1)
+ #define POLARIS_GPU_OWN_BUS	(1u << 2)
++#define POLARIS_GPU_OWN_GMU	(1u << 3)
+ 
+ static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
+ 
+@@ -56,8 +58,8 @@ static struct polaris_gpu_context polaris_gpu = { POLARIS_GPU_OFF, 0, 0 };
+ static struct pg_handoff polaris_gpu_handoff;
+ 
+ static const char *const polaris_gpu_stage_name[POLARIS_GPU_STAGE_COUNT] = {
+-	"board", "firmware", "rails", "clocks", "bus", "GMU", "SMMU-probe",
+-	"HFI", "SMMU", "PAS13", "CP", "fence"
++	"board", "firmware", "rails", "clocks", "bus", "GMU", "GMU-boot",
++	"SMMU-probe", "HFI", "SMMU", "PAS13", "CP", "fence"
+ };
+ 
+ /*
+@@ -146,6 +148,34 @@ polaris_gpu_enter(struct polaris_gpu_context *ctx, enum polaris_gpu_stage stage)
+ 		printf("POLARIS GPU: GMU registers readable; firmware not started\n");
+ 		return true;
+ 	}
++	if (stage == POLARIS_GPU_GMU_BOOT) {
++		int bootopt = 0;
++
++		/*
++		 * Cold-boot the CM3 only when separately opted in. Without the
++		 * opt-in this stage is a pure no-op so the SMMU probe below
++		 * still runs and the old read-only path is preserved exactly.
++		 * Once the firmware is running the gate owns a resource it
++		 * cannot release, so a later failure must quarantine instead
++		 * of collapsing CX or the GMU clocks.
++		 */
++		(void)PE_parse_boot_argn("polarisgmuboot", &bootopt,
++		    sizeof(bootopt));
++		if (bootopt != 1) {
++			printf("POLARIS GPU: gmu boot not opted in; skipped\n");
++			ctx->completed++;
++			return true;
++		}
++		if (!polaris_gpu_gmu_boot(polaris_gpu_handoff.blob[1].addr,
++		    polaris_gpu_handoff.blob[1].size)) {
++			printf("POLARIS GPU: GMU boot refused; no ownership claimed\n");
++			return false;
++		}
++		ctx->owned |= POLARIS_GPU_OWN_GMU;
++		ctx->completed++;
++		printf("POLARIS GPU: GMU firmware started; HFI not initialized\n");
++		return true;
++	}
+ 	if (stage == POLARIS_GPU_SMMU_PROBE) {
+ 		/*
+ 		 * Read the GPU SMMU global and context registers. Nothing is
+@@ -255,11 +285,12 @@ polaris_gpu_init(void)
+ 	/*
+ 	 * CX is now owned. The clocks stage brings up the GMU clock source and
+ 	 * CX branch; the bus stage then enables the two GCC branches feeding
+-	 * the GMU. The GMU stage maps the CSR window read-only; the SMMU probe
+-	 * stage reads the SMMU register file without programming it. The HFI
+-	 * stage still has no backend, so the gate must refuse there and unwind
+-	 * must release bus, clocks and then CX in reverse order rather than
+-	 * leave ownerless resources powered.
++	 * the GMU. The GMU stage maps the CSR window read-only. The GMU boot
++	 * stage cold-boots the CM3 only when `polarisgmuboot=1` is present;
++	 * without it the stage is skipped. The SMMU probe stage reads the SMMU
++	 * register file without programming it. The HFI stage still has no
++	 * backend, so the gate must refuse there. If the CM3 was started the
++	 * unwind below must quarantine rather than collapse CX and the clocks.
+ 	 */
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_CLOCKS)) {
+ 		goto fail;
+@@ -270,10 +301,12 @@ polaris_gpu_init(void)
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_GMU)) {
+ 		goto fail;
+ 	}
++	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_GMU_BOOT)) {
++		goto fail;
++	}
+ 	/*
+-	 * The GMU and SMMU probes above only read registers: neither started
+-	 * the CM3 firmware nor left a transaction in flight, so the idle
+-	 * precondition for unwinding is trivially satisfied.
++	 * The SMMU probe above only reads registers and leaves no transaction
++	 * in flight.
+ 	 */
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_SMMU_PROBE)) {
+ 		goto fail;
+@@ -283,7 +316,19 @@ polaris_gpu_init(void)
+ 	}
+ 	goto fail;
+ fail:
+-	polaris_gpu_unwind(&polaris_gpu, true);
++	polaris_gpu_unwind(&polaris_gpu,
++	    (polaris_gpu.owned & POLARIS_GPU_OWN_GMU) == 0);
+ 	printf("POLARIS GPU: acceleration unavailable; CPU display unchanged\n");
+ }
++
++#ifdef PG_PWR_TEST
++/* Host tests share one process; clear only the static gate state. */
++void
++polaris_gpu_test_reset(void)
++{
++	polaris_gpu.state = POLARIS_GPU_OFF;
++	polaris_gpu.completed = 0;
++	polaris_gpu.owned = 0;
++}
++#endif
+ #endif
+diff --git a/bsd/dev/polaris_gpu_pwr.h b/bsd/dev/polaris_gpu_pwr.h
+index f750f71..4329238 100644
+--- a/bsd/dev/polaris_gpu_pwr.h
++++ b/bsd/dev/polaris_gpu_pwr.h
+@@ -5,6 +5,8 @@
+ #ifndef _BSD_DEV_POLARIS_GPU_PWR_H_
+ #define _BSD_DEV_POLARIS_GPU_PWR_H_
+ 
++#include <sys/types.h>
++
+ void polaris_gpu_pwr_probe(void);
+ 
+ /*
+@@ -47,6 +49,17 @@ void polaris_gpu_bus_exit(void);
+  */
+ int polaris_gpu_gmu_enter(void);
+ 
++/*
++ * GMU cold-boot stage: copy the 32 KiB GPU-GMU image from the handoff page
++ * into CM3 ITCM and release CM3 reset, then poll FW_INIT_RESULT for the
++ * 0xBABEFACE signature. Requires CX, clocks and bus owned above and the
++ * separate `polarisgmuboot=1` opt-in; without it the stage performs no
++ * access. This starts the CM3 but does not build an HFI queue, attach the
++ * SMMU or make the GPU usable; on timeout it puts the CM3 back in reset and
++ * returns false.
++ */
++int polaris_gpu_gmu_boot(uint64_t pa, uint32_t size);
++
+ /*
+  * SMMU probe stage: map the GPU SMMU register file (0x05040000 + 0x10000)
+  * read-only and record the global identification and per-context-bank
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index bf3ebe6..b1a7003 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -133,19 +133,29 @@ extern void sweet_log_sync(void);
+ #define PG_GMU_CM3_FW_BUSY         PG_GMU_REG(0x1f81au)
+ #define PG_GMU_CM3_FW_INIT_RESULT  PG_GMU_REG(0x1f81cu)
+ #define PG_GMU_CM3_CFG             PG_GMU_REG(0x1f82du)
++#define PG_GMU_CM3_ITCM_START      PG_GMU_REG(0x1b400u)
++#define PG_GMU_CM3_DTCM_START      PG_GMU_REG(0x1c400u)
+ #define PG_GMU_CX_ALWAYS_ON_CNT_L  PG_GMU_REG(0x1f888u)
+ #define PG_GMU_CX_ALWAYS_ON_CNT_H  PG_GMU_REG(0x1f889u)
+ #define PG_GMU_HFI_CTRL_STATUS     PG_GMU_REG(0x1f980u)
+ #define PG_GMU_HFI_VERSION_INFO    PG_GMU_REG(0x1f981u)
++#define PG_GMU_HFI_SFR_ADDR        PG_GMU_REG(0x1f982u)
+ #define PG_GMU_HFI_QTBL_INFO       PG_GMU_REG(0x1f984u)
+ #define PG_GMU_GENERAL_7           PG_GMU_REG(0x1f9ccu)
+ #define PG_GMU_AO_HOST_INTR_STATUS PG_GMU_REG(0x23b05u)
+ #define PG_GMU_AO_HOST_INTR_MASK   PG_GMU_REG(0x23b06u)
+ #define PG_GMU_RSCC_CONTROL_ACK    PG_GMU_REG(0x23b08u)
+ #define PG_GMU_GPU_CX_BUSY_STATUS  PG_GMU_REG(0x23b0cu)
++#define PG_GMU_AHB_FENCE_RANGE_0   PG_GMU_REG(0x23b11u)
+ #define PG_GMU_AHB_FENCE_STATUS    PG_GMU_REG(0x23b13u)
+ 
+-#if PG_GMU_OFF(0x1a880u) >= PG_GMU_WINDOW || \
++#define PG_GMU_FW_SIZE   32768u
++#define PG_GMU_FW_WORDS  (PG_GMU_FW_SIZE / 4u)
++#define PG_GMU_FW_ALIGN  0x4000ull
++
++#if PG_GMU_OFF(0x1b400u) >= PG_GMU_WINDOW || \
++    (PG_GMU_OFF(0x1b400u) + PG_GMU_FW_SIZE) > PG_GMU_WINDOW || \
++    PG_GMU_OFF(0x1a880u) >= PG_GMU_WINDOW || \
+     (PG_GMU_OFF(0x23b13u) + 4u) > PG_GMU_WINDOW
+ #error "the GMU register constants would leave the documented CSR window"
+ #endif
+@@ -238,6 +248,7 @@ static volatile uint32_t *pg_pll_regs;
+ static volatile uint32_t *pg_gcc_axi_regs;
+ static volatile uint32_t *pg_gcc_gfx_regs;
+ static volatile uint32_t *pg_gmu_regs;
++static volatile uint32_t *pg_gmu_fw_regs;
+ static volatile uint32_t *pg_smmu_regs;
+ static uint32_t pg_cx_saved;
+ static int pg_cx_owned;
+@@ -970,6 +981,147 @@ polaris_gpu_gmu_enter(void)
+ 	return 1;
+ }
+ 
++/*
++ * CM3 cold boot: copy the 32 KiB legacy GMU image into ITCM and release the
++ * CM3 reset. This is the first stage that writes the GMU register file.
++ *
++ * The sequence mirrors the vendor a6xx_gmu_fw_start()/a6xx_gmu_start() path
++ * for a630 (legacy TCM load, no block header):
++ *   GENERAL_7=1, SYSRESET=1, load ITCM, clear FW_INIT_RESULT, BOOT_CONFIG=2,
++ *   AHB_FENCE_RANGE_0, CM3_CFG=0x4052, SYSRESET=0, poll FW_INIT_RESULT for
++ *   0xBABEFACE. The image itself contains that constant at 0x1AEC/0x2EC0, so
++ * no DTCM mask probe is needed; the vendor mask is all ones.
++ *
++ * Deliberately absent: HFI_QTBL_ADDR/HFI_QTBL_INFO (no queue is built yet),
++ * PWR_COL_CP_MSG (no log IOVA exists), HFI_CTRL_INIT (HFI is a later stage)
++ * and HFI_SFR_ADDR (this tree has no chip-id source). A magic value only
++ * proves the CM3 executed the image; it does not make the GPU usable.
++ *
++ * The firmware page stays mapped: XNU has no ml_io_unmap() counterpart and
++ * the reservation is owned by the handoff for the life of the boot.
++ */
++int
++polaris_gpu_gmu_boot(uint64_t pa, uint32_t size)
++{
++	uint32_t fw0, fw1, fwlast;
++	uint32_t itcm_first, itcm_last;
++	uint32_t boot, cfg, busy, init_result, general7, hfi_status;
++	uint32_t last = 0;
++	unsigned int i;
++	int optin = 0, gpuon = 0;
++	vm_offset_t virt;
++
++	if (!pg_cx_owned || !pg_clk_owned || !pg_bus_owned ||
++	    pg_cx_regs == NULL) {
++		printf("POLARIS PWR: gmu boot refused; bus not owned\n");
++		return 0;
++	}
++	(void)PE_parse_boot_argn("polarisgpuon", &gpuon, sizeof(gpuon));
++	if (gpuon != 1) {
++		printf("POLARIS PWR: gmu boot refused; rails not opted in\n");
++		return 0;
++	}
++	(void)PE_parse_boot_argn("polarisgmuboot", &optin, sizeof(optin));
++	if (optin != 1) {
++		printf("POLARIS PWR: gmu boot not opt-in; CM3 untouched\n");
++		return 0;
++	}
++	if (size != PG_GMU_FW_SIZE) {
++		printf("POLARIS PWR: gmu boot refused; size=%u expected=%u\n",
++		    size, PG_GMU_FW_SIZE);
++		return 0;
++	}
++	if ((pa & (PG_GMU_FW_ALIGN - 1ull)) != 0) {
++		printf("POLARIS PWR: gmu boot refused; pa=0x%llx not page aligned\n",
++		    pa);
++		return 0;
++	}
++	if (!pg_gmu_map()) {
++		return 0;
++	}
++	if (pg_gmu_fw_regs == NULL) {
++		virt = ml_io_map((vm_offset_t)pa, PG_GMU_FW_SIZE);
++		if (virt == 0) {
++			printf("POLARIS PWR: cannot map GMU firmware at 0x%llx; "
++			    "boot skipped\n", pa);
++			return 0;
++		}
++		pg_gmu_fw_regs = (volatile uint32_t *)virt;
++	}
++	fw0 = pg_rd32(pg_gmu_fw_regs, 0);
++	fw1 = pg_rd32(pg_gmu_fw_regs, 4);
++	fwlast = pg_rd32(pg_gmu_fw_regs, (PG_GMU_FW_WORDS - 1u) * 4u);
++	printf("POLARIS PWR: GMU fw pa=0x%llx size=%u word0=0x%08x entry=0x%08x "
++	    "last=0x%08x\n", pa, size, fw0, fw1, fwlast);
++	if ((fw1 & 1u) == 0) {
++		printf("POLARIS PWR: GMU fw entry 0x%08x is not Thumb; "
++		    "loading anyway\n", fw1);
++	}
++
++	/*
++	 * Hold the CM3 in reset while ITCM is rewritten. GENERAL_7 enables
++	 * TCM retention, as the vendor and mainline drivers both do.
++	 */
++	pg_wr32(pg_gmu_regs, PG_GMU_GENERAL_7, 1, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_CM3_SYSRESET, 1, 3);
++	DELAY(1000);
++	for (i = 0; i < PG_GMU_FW_WORDS; i++) {
++		pg_wr32(pg_gmu_regs, (uint32_t)PG_GMU_CM3_ITCM_START + i * 4u,
++		    pg_rd32(pg_gmu_fw_regs, i * 4u), 3);
++	}
++	__sync_synchronize();
++	itcm_first = pg_rd32(pg_gmu_regs, PG_GMU_CM3_ITCM_START);
++	itcm_last = pg_rd32(pg_gmu_regs,
++	    (uint32_t)PG_GMU_CM3_ITCM_START + (PG_GMU_FW_WORDS - 1u) * 4u);
++	printf("POLARIS PWR: GMU ITCM loaded %u words; readback first=0x%08x "
++	    "last=0x%08x\n", PG_GMU_FW_WORDS, itcm_first, itcm_last);
++
++	pg_wr32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_CM3_BOOT_CONFIG, 0x02u, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_AHB_FENCE_RANGE_0,
++	    (1u << 31) | (0xau << 18) | 0xa0u, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_CM3_CFG, 0x4052u, 3);
++
++	/* Release the CM3 and wait for the image's own init signature. */
++	pg_wr32(pg_gmu_regs, PG_GMU_CM3_SYSRESET, 0, 3);
++	for (i = 0; i < 1000u; i++) {
++		last = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT);
++		if (last == 0xbabefaceu) {
++			break;
++		}
++		DELAY(100);
++	}
++	if (last != 0xbabefaceu) {
++		for (i = 0; i < 900u; i++) {
++			last = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT);
++			if (last == 0xbabefaceu) {
++				break;
++			}
++			DELAY(1000);
++		}
++	}
++	if (last != 0xbabefaceu) {
++		pg_wr32(pg_gmu_regs, PG_GMU_CM3_SYSRESET, 1, 3);
++		boot = pg_rd32(pg_gmu_regs, PG_GMU_CM3_BOOT_CONFIG);
++		cfg = pg_rd32(pg_gmu_regs, PG_GMU_CM3_CFG);
++		busy = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_BUSY);
++		printf("POLARIS PWR: GMU boot timed out; init=0x%08x boot=0x%08x "
++		    "cfg=0x%08x fw_busy=0x%08x; CM3 held in reset\n",
++		    last, boot, cfg, busy);
++		return 0;
++	}
++	boot = pg_rd32(pg_gmu_regs, PG_GMU_CM3_BOOT_CONFIG);
++	cfg = pg_rd32(pg_gmu_regs, PG_GMU_CM3_CFG);
++	busy = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_BUSY);
++	general7 = pg_rd32(pg_gmu_regs, PG_GMU_GENERAL_7);
++	hfi_status = pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_STATUS);
++	init_result = last;
++	printf("POLARIS PWR: GMU boot complete init=0x%08x fw_busy=0x%08x "
++	    "cfg=0x%08x general7=0x%08x hfi_status=0x%08x; HFI not initialized\n",
++	    init_result, busy, cfg, general7, hfi_status);
++	return 1;
++}
++
+ /*
+  * Map the GPU SMMU register file and record what the vendor firmware left
+  * behind. No SMR, S2CR, CBAR, SCTLR or TLB register is written and no page
+@@ -1178,6 +1330,7 @@ pg_pwr_test_reset(void)
+ 	pg_gcc_axi_regs = NULL;
+ 	pg_gcc_gfx_regs = NULL;
+ 	pg_gmu_regs = NULL;
++	pg_gmu_fw_regs = NULL;
+ 	pg_smmu_regs = NULL;
+ 	pg_bus_owned = 0;
+ 	pg_bus_axi_saved = 0;

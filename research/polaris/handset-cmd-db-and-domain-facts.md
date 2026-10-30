@@ -151,3 +151,22 @@ mapping that got 0092 withdrawn.
 
 Still open, unchanged: owned CX/GX power with rollback, PAS13 SCM contract, GMU
 ITCM load, HFI v1, SMMU programming, CP sentinel/fence, and any userland graphics.
+
+## 9. What 0115 adds: GMU CM3 cold boot (2026-10-30)
+
+`xnu/patches/0115-polaris-gmu-cm3-boot.patch` adds a gated CM3 boot stage:
+
+- The pinned 32 KiB `a630_gmu.bin` (handoff blob 1) is copied into CM3 ITCM at
+  `0x3000..0xAFFC` (8192 words), then `SYSRESET` is released with
+  `BOOT_CONFIG=0x02` and `CM3_CFG=0x4052`; `FW_INIT_RESULT` must read
+  `0xBABEFACE`. Entry word is `0x00043F80` (Thumb), word 1 is `0x00000009`.
+- The GMU CSR window is `0x0506a000 + 0x30000`; ITCM starts at offset `0x3000`
+  and DTCM at `0x4000`. The image must be exactly 32768 bytes and page aligned.
+- It requires both `polarisgpuon=1` and `polarisgmuboot=1`. Without the second
+  opt-in it prints `gmu boot not opted in; skipped` and performs no access.
+- A timeout puts CM3 back into reset and claims no ownership. After a successful
+  start, any later failure quarantines instead of collapsing CX, clocks or bus.
+- Deliberately not programmed: `HFI_SFR_ADDR` (no chip-id source in this tree),
+  QTBL, `PWR_COL_CP_MSG` and `HFI_CTRL_INIT`. There is still no HFI queue, no
+  SMMU attach, no PAS13 zap, no CP ring and no rendering: GMU boot complete is
+  not GPU usable.
