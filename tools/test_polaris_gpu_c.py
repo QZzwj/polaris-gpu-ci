@@ -71,6 +71,9 @@ class GpuCTests(unittest.TestCase):
         subprocess.run(['git', 'apply', '--include=bsd/dev/*',
                         str(next(PATCHES.glob('0118-*.patch')))],
                        cwd=root, check=True, capture_output=True)
+        subprocess.run(['git', 'apply', '--include=bsd/dev/*',
+                        str(next(PATCHES.glob('0119-*.patch')))],
+                       cwd=root, check=True, capture_output=True)
         inc = root / 'include/sys'
         inc.mkdir(parents=True)
         (inc / 'types.h').write_text('#include <stdint.h>\n')
@@ -443,7 +446,11 @@ void pg_pwr_test_after_write(unsigned page, uint32_t off, uint32_t value) {
                    off != 0x14004u && off != 0x140b4u && off != 0x24c44u &&
                    off != 0x14608u && off != 0x14610u && off != 0x14614u &&
                    off != 0x14618u && off != 0x14644u && off != 0x1464cu &&
-                   off != 0x14650u) {
+                   off != 0x14650u && off != 0x13000u && off != 0x13004u &&
+                   off != 0x1303cu && off != 0x14300u && off != 0x14308u &&
+                   off != 0x14340u && off != 0x143a0u && off != 0x14400u &&
+                   off != 0x14404u && off != 0x8fe0u && off != 0x8fe4u &&
+                   off != 0x8fe8u && off != 0x204u) {
             gmu_bad_write = off;
         }
         if (off == 0x14000u && value == 0 && gmu_itcm_writes == 8192u &&
@@ -451,8 +458,13 @@ void pg_pwr_test_after_write(unsigned page, uint32_t off, uint32_t value) {
             gmu_regs[0x14070 / 4] = 0xbabefaceu;
         if (off == 0x14618u && value == 1u && !hfi_ctrl_fault_mode)
             gmu_regs[0x14600 / 4] |= 1u;
-        if (off == 0x14644u && (value & 1u))
-            gmu_regs[0x14648 / 4] &= ~1u;
+        if (off == 0x14644u && value)
+            gmu_regs[0x14648 / 4] &= ~value;
+        if (off == 0x14650u && (value & (1u << 22)))
+            gmu_regs[0x14648 / 4] |= (1u << 30);
+        if (off == 0x204u && value == 0x00778000u)
+            gmu_regs[0x14340 / 4] =
+                (gmu_regs[0x14340 / 4] & ~0x38u) | 0x28u;
         if (off == 0x14650u && (value & 1u) && !hfi_ack_timeout_mode) {
             uint32_t *t = hfi_reserve_pa ? hfi_reserved_mem : hfi_mem;
             t[1070] = 0x0002137eu;             /* id=126 size=19 type=2 */

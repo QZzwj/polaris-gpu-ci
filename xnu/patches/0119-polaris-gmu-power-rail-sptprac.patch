@@ -1,0 +1,342 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 8c784af..0889941 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -281,7 +281,7 @@ polaris_gpu_init(void)
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: build 0118-hfi2\n");
++	printf("POLARIS GPU: build 0119-hfi3\n");
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 28fd9c6..6e8908d 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -159,6 +159,44 @@ extern void sweet_log_sync(void);
+ #define PG_GMU_AHB_FENCE_RANGE_0   PG_GMU_REG(0x23b11u)
+ #define PG_GMU_AHB_FENCE_STATUS    PG_GMU_REG(0x23b13u)
+ 
++/*
++ * Mainline a6xx_gmu_power_config()/a6xx_gmu_gfx_rail_on()/
++ * a6xx_sptprac_enable() registers. All of these are programmed before
++ * HFI_CTRL_INIT; 0118 omitted them and the HFI block never left reset.
++ */
++#define PG_GMU_SYS_BUS_CONFIG      PG_GMU_REG(0x1f40fu)
++#define PG_GMU_ICACHE_CONFIG       PG_GMU_REG(0x1f400u)
++#define PG_GMU_DCACHE_CONFIG       PG_GMU_REG(0x1f401u)
++#define PG_GMU_PWR_COL_INTER_FRAME_CTRL PG_GMU_REG(0x1f8c0u)
++#define PG_GMU_PWR_COL_SPTPRAC_HYST PG_GMU_REG(0x1f8c2u)
++#define PG_GMU_GX_SPTPRAC_POWER_CONTROL PG_GMU_REG(0x1a881u)
++#define PG_GMU_SPTPRAC_PWR_CLK_STATUS   PG_GMU_REG(0x1f8d0u)
++#define PG_GMU_BOOT_SLUMBER_OPTION PG_GMU_REG(0x1cbf8u)
++#define PG_GMU_GX_VOTE_IDX         PG_GMU_REG(0x1cbf9u)
++#define PG_GMU_MX_VOTE_IDX         PG_GMU_REG(0x1cbfau)
++#define PG_GMU_RPMH_CTRL           PG_GMU_REG(0x1f8e8u)
++#define PG_GMU_PWR_COL_CP_MSG      PG_GMU_REG(0x1f900u)
++#define PG_GMU_PWR_COL_CP_RESP     PG_GMU_REG(0x1f901u)
++
++/*
++ * GMU_RPMH_CTRL: RPMH_INTERFACE_ENABLE (bit 0), LLC/DDR/MX/CX/GFX vote
++ * enables (bits 4 and 8..11). Mainline sets all six before releasing CM3.
++ */
++#define PG_GMU_RPMH_CTRL_VOTES     0x00000f11u
++
++/* PWR_COL_INTER_FRAME_CTRL power-collapse timing from mainline. */
++#define PG_GMU_PWR_COL_IFPC_CTRL   0x09c40400u
++#define PG_GMU_PWR_COL_IFPC_ENABLE 0x1u
++#define PG_GMU_PWR_COL_SPTPRAC_ENABLE 0x4u
++
++/* PWR_COL_SPTPRAC_HYST value from mainline (GMU_PWR_COL_HYST). */
++#define PG_GMU_PWR_COL_SPTPRAC_HYST_VAL 0x000a1680u
++
++/* GX_SPTPRAC_POWER_CONTROL value and its status handshake. */
++#define PG_GMU_SPTPRAC_POWER_ON    0x00778000u
++#define PG_GMU_SPTPRAC_STATUS_MASK 0x38u
++#define PG_GMU_SPTPRAC_STATUS_ON   0x28u
++
+ #define PG_GMU_FW_SIZE   32768u
+ #define PG_GMU_FW_WORDS  (PG_GMU_FW_SIZE / 4u)
+ #define PG_GMU_FW_ALIGN  0x4000ull
+@@ -1258,6 +1296,102 @@ pg_hfi_smmu_bypass(void)
+ 	return true;
+ }
+ 
++/*
++ * Mainline a6xx_gmu_power_config(): disable the GMU WB/RB buffers, program
++ * the power-collapse timing and enable the RPMh GPU client. This runs while
++ * the CM3 is still held in reset, before HFI_CTRL_INIT.
++ */
++static void
++pg_gmu_power_config(void)
++{
++	uint32_t rpmh_before, rpmh_after;
++
++	pg_wr32(pg_gmu_regs, PG_GMU_SYS_BUS_CONFIG, 1, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_ICACHE_CONFIG, 1, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_DCACHE_CONFIG, 1, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL,
++	    PG_GMU_PWR_COL_IFPC_CTRL, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_SPTPRAC_HYST,
++	    PG_GMU_PWR_COL_SPTPRAC_HYST_VAL, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL,
++	    PG_GMU_PWR_COL_IFPC_CTRL | PG_GMU_PWR_COL_IFPC_ENABLE |
++	    PG_GMU_PWR_COL_SPTPRAC_ENABLE, 3);
++	rpmh_before = pg_rd32(pg_gmu_regs, PG_GMU_RPMH_CTRL);
++	pg_wr32(pg_gmu_regs, PG_GMU_RPMH_CTRL,
++	    rpmh_before | PG_GMU_RPMH_CTRL_VOTES, 3);
++	rpmh_after = pg_rd32(pg_gmu_regs, PG_GMU_RPMH_CTRL);
++	printf("POLARIS PWR: GMU power cfg bus=0x%08x icache=0x%08x "
++	    "dcache=0x%08x pwr_col=0x%08x rpmh=0x%08x->0x%08x\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_SYS_BUS_CONFIG),
++	    pg_rd32(pg_gmu_regs, PG_GMU_ICACHE_CONFIG),
++	    pg_rd32(pg_gmu_regs, PG_GMU_DCACHE_CONFIG),
++	    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_INTER_FRAME_CTRL),
++	    rpmh_before, rpmh_after);
++}
++
++/*
++ * Mainline a6xx_gmu_gfx_rail_on(): select the default GX/MX vote and ask the
++ * GMU to bring the GX rail up through the legacy BOOT_SLUMBER OOB handshake
++ * (HOST2GMU bit 22, GMU2HOST ack bit 30). We have no OPP/ARC table yet, so
++ * vote index 0 is used; the ack is diagnostic and a timeout does not abort
++ * the HFI attempt.
++ */
++static bool
++pg_gmu_gfx_rail_on(void)
++{
++	uint32_t info = 0;
++	unsigned int i;
++
++	pg_wr32(pg_gmu_regs, PG_GMU_BOOT_SLUMBER_OPTION, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_GX_VOTE_IDX, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_MX_VOTE_IDX, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_HOST2GMU_INTR_SET, 1u << 22, 3);
++	for (i = 0; i < 20u; i++) {
++		info = pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO);
++		if ((info & (1u << 30)) != 0) {
++			break;
++		}
++		DELAY(1000);
++	}
++	pg_wr32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_CLR, 1u << 30, 3);
++	printf("POLARIS PWR: GMU gfx rail OOB option=%u gx=%u mx=%u "
++	    "ack=%u info=0x%08x\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_BOOT_SLUMBER_OPTION),
++	    pg_rd32(pg_gmu_regs, PG_GMU_GX_VOTE_IDX),
++	    pg_rd32(pg_gmu_regs, PG_GMU_MX_VOTE_IDX),
++	    (info & (1u << 30)) != 0, info);
++	return (info & (1u << 30)) != 0;
++}
++
++/*
++ * Mainline a6xx_sptprac_enable(): for A630 the CPU, not the GMU, owns SPTP
++ * power collapse, so GX_SPTPRAC_POWER_CONTROL must be written and the
++ * SPTPRAC clock status polled to 0x28 before HFI starts.
++ */
++static bool
++pg_gmu_sptprac_enable(void)
++{
++	uint32_t status = 0;
++	unsigned int i;
++
++	pg_wr32(pg_gmu_regs, PG_GMU_GX_SPTPRAC_POWER_CONTROL,
++	    PG_GMU_SPTPRAC_POWER_ON, 3);
++	for (i = 0; i < 100u; i++) {
++		status = pg_rd32(pg_gmu_regs, PG_GMU_SPTPRAC_PWR_CLK_STATUS);
++		if ((status & PG_GMU_SPTPRAC_STATUS_MASK) ==
++		    PG_GMU_SPTPRAC_STATUS_ON) {
++			break;
++		}
++		DELAY(1000);
++	}
++	printf("POLARIS PWR: GMU SPTPRAC control=0x%08x status=0x%08x %s\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_GX_SPTPRAC_POWER_CONTROL), status,
++	    ((status & PG_GMU_SPTPRAC_STATUS_MASK) ==
++	    PG_GMU_SPTPRAC_STATUS_ON) ? "on" : "timeout");
++	return (status & PG_GMU_SPTPRAC_STATUS_MASK) ==
++	    PG_GMU_SPTPRAC_STATUS_ON;
++}
++
+ static bool
+ pg_hfi_ctrl_init(void)
+ {
+@@ -1307,12 +1441,13 @@ polaris_gpu_hfi_start(void)
+ {
+ 	uint32_t *table;
+ 	uint32_t info = 0, rd, wr, hdr, size, error;
++	uint32_t cmd_wr, cmd_wr_new;
+ 	uint32_t ack[PG_HFI_ACK_WORDS];
+ 	unsigned int i;
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0118-hfi2 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0119-hfi3 polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -1336,19 +1471,31 @@ polaris_gpu_hfi_start(void)
+ 	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_QTBL_ADDR));
+ 	pg_hfi_dump_queues("pre-init");
+ 
+-	table[PG_HFI_CMD_DATA_DWORD + 0] = PG_HFI_INIT_HDR;
+-	table[PG_HFI_CMD_DATA_DWORD + 1] = 0;
+-	table[PG_HFI_CMD_DATA_DWORD + 2] = (uint32_t)(pg_hfi.pa +
+-	    PG_HFI_TABLE_SIZE);
+-	table[PG_HFI_CMD_DATA_DWORD + 3] = PG_HFI_DBG_SIZE;
+-	table[PG_HFI_CMD_DATA_DWORD + 4] = 1;
+-	table[PG_HFI_CMD_WRITE_INDEX] = 5;
++	cmd_wr = table[PG_HFI_CMD_WRITE_INDEX];
++	if (cmd_wr >= PG_HFI_Q_DWORDS) {
++		printf("POLARIS PWR: HFI cmd write index %u out of range; "
++		    "resetting to 0\n", cmd_wr);
++		cmd_wr = 0;
++	}
++	table[PG_HFI_CMD_DATA_DWORD + cmd_wr] = PG_HFI_INIT_HDR;
++	table[PG_HFI_CMD_DATA_DWORD +
++	    ((cmd_wr + 1u) % PG_HFI_Q_DWORDS)] = 0;
++	table[PG_HFI_CMD_DATA_DWORD +
++	    ((cmd_wr + 2u) % PG_HFI_Q_DWORDS)] =
++	    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE);
++	table[PG_HFI_CMD_DATA_DWORD +
++	    ((cmd_wr + 3u) % PG_HFI_Q_DWORDS)] = PG_HFI_DBG_SIZE;
++	table[PG_HFI_CMD_DATA_DWORD +
++	    ((cmd_wr + 4u) % PG_HFI_Q_DWORDS)] = 1;
++	cmd_wr_new = (cmd_wr + 5u) % PG_HFI_Q_DWORDS;
++	table[PG_HFI_CMD_WRITE_INDEX] = cmd_wr_new;
+ 	__sync_synchronize();
+ 	pg_hfi_flush();
+ 	__sync_synchronize();
+ 	pg_wr32(pg_gmu_regs, PG_GMU_HOST2GMU_INTR_SET, 1, 3);
+-	printf("POLARIS PWR: HFI INIT sent cmd=0x%08x dbg=0x%08x\n",
+-	    PG_HFI_INIT_HDR, table[PG_HFI_CMD_DATA_DWORD + 2]);
++	printf("POLARIS PWR: HFI INIT sent cmd=0x%08x dbg=0x%08x wr=%u->%u\n",
++	    PG_HFI_INIT_HDR, (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE),
++	    cmd_wr, cmd_wr_new);
+ 
+ 	for (i = 0; i < PG_HFI_ACK_TIMEOUT_US / 1000u; i++) {
+ 		info = pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO);
+@@ -1380,12 +1527,15 @@ polaris_gpu_hfi_start(void)
+ 	}
+ 	hdr = table[PG_HFI_MSG_DATA_DWORD + rd];
+ 	size = (hdr >> 8) & 0xffu;
+-	if (size != PG_HFI_ACK_WORDS) {
++	if (size < 3u || size > PG_HFI_ACK_WORDS) {
+ 		printf("POLARIS PWR: HFI ACK invalid hdr=0x%08x size=%u rd=%u "
+ 		    "wr=%u\n", hdr, size, rd, wr);
+ 		pg_hfi_dump_queues("bad-size");
+ 		return 0;
+ 	}
++	for (i = 0; i < PG_HFI_ACK_WORDS; i++) {
++		ack[i] = 0;
++	}
+ 	for (i = 0; i < size; i++) {
+ 		ack[i] = table[PG_HFI_MSG_DATA_DWORD +
+ 		    ((rd + i) % PG_HFI_Q_DWORDS)];
+@@ -1395,26 +1545,29 @@ polaris_gpu_hfi_start(void)
+ 	pg_hfi_flush();
+ 
+ 	if ((ack[0] & 0xffu) != PG_HFI_ACK_ID ||
+-	    ((ack[0] >> 8) & 0xffu) != PG_HFI_ACK_WORDS ||
+ 	    ((ack[0] >> 16) & 0xfu) != PG_HFI_ACK_TYPE ||
+ 	    ack[1] != PG_HFI_INIT_HDR) {
+ 		printf("POLARIS PWR: HFI ACK invalid hdr=0x%08x ret=0x%08x "
+-		    "rd=%u wr=%u intr=0x%08x\n", ack[0], ack[1], rd, wr,
++		    "size=%u rd=%u wr=%u intr=0x%08x\n", ack[0], ack[1], size,
++		    rd, wr,
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO));
+-		for (i = 0; i < PG_HFI_ACK_WORDS; i++) {
++		for (i = 0; i < size; i++) {
+ 			printf("POLARIS PWR: HFI ACK[%u]=0x%08x\n", i, ack[i]);
+ 		}
+ 		pg_hfi_dump_queues("bad-hdr");
+ 		return 0;
+ 	}
+ 	error = ack[2];
++	for (i = 0; i < size; i++) {
++		printf("POLARIS PWR: HFI ACK[%u]=0x%08x\n", i, ack[i]);
++	}
+ 	if (error != 0) {
+ 		printf("POLARIS PWR: HFI ACK error=%u\n", error);
+ 		return 0;
+ 	}
+ 	pg_hfi.ack_done = true;
+-	printf("POLARIS PWR: HFI ACK id=126 size=19 seq=1 error=0 "
+-	    "payload0=0x%08x\n", ack[3]);
++	printf("POLARIS PWR: HFI ACK id=126 size=%u seq=1 error=0 "
++	    "payload0=0x%08x\n", size, ack[3]);
+ 	return 1;
+ }
+ 
+@@ -1429,11 +1582,12 @@ polaris_gpu_hfi_start(void)
+  *   0xBABEFACE. The image itself contains that constant at 0x1AEC/0x2EC0, so
+  * no DTCM mask probe is needed; the vendor mask is all ones.
+  *
+- * With `polarishfi=1` this revision also builds the three HFI queues, writes
+- * QTBL_ADDR/QTBL_INFO/SFR, releases CM3 and runs HFI_CTRL_INIT. The INIT
+- * message and ACK are a separate stage. PWR_COL_CP_MSG is still absent, as
+- * are SMMU/PAS/CP; a firmware magic or HFI ACK alone does not make the GPU
+- * usable.
++ * With `polarishfi=1` this revision builds the three HFI queues, programs
++ * the mainline GMU power/RPMh/RPMH_CTRL registers and PWR_COL_CP_MSG,
++ * releases CM3, performs the legacy BOOT_SLUMBER OOB and SPTPRAC handshakes,
++ * then runs HFI_CTRL_INIT and sends the INIT message. SMMU stage-1, PAS13
++ * and the CP ring remain later stages; a firmware magic or HFI ACK alone
++ * does not make the GPU usable.
+  *
+  * The firmware page stays mapped: XNU has no ml_io_unmap() counterpart and
+  * the reservation is owned by the handoff for the life of the boot.
+@@ -1449,6 +1603,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	unsigned int i;
+ 	int optin = 0, gpuon = 0, hfion = 0, hfi_smmu = 0;
+ 	int ctrl_ok = 0;
++	int gfx_ok = 0, sptprac_ok = 0;
+ 	vm_offset_t virt;
+ 
+ 	if (!pg_cx_owned || !pg_clk_owned || !pg_bus_owned ||
+@@ -1550,8 +1705,18 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		pg_wr32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR, PG_A630_CHIPID, 3);
+ 	}
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_CFG, 0x4052u, 3);
++	if (hfion != 0) {
++		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG,
++		    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE) |
++		    (PG_HFI_DBG_SIZE / 4096u - 1u), 3);
++		printf("POLARIS PWR: GMU PWR_COL_CP_MSG=0x%08x (dbg=0x%08x)\n",
++		    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG),
++		    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE));
++	}
++	pg_gmu_power_config();
+ 
+ 	/* Release the CM3 and wait for the image's own init signature. */
++	pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_CP_RESP, 0, 3);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_SYSRESET, 0, 3);
+ 	for (i = 0; i < 1000u; i++) {
+ 		last = pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT);
+@@ -1585,6 +1750,8 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	general7 = pg_rd32(pg_gmu_regs, PG_GMU_GENERAL_7);
+ 	init_result = last;
+ 	if (hfion != 0) {
++		gfx_ok = pg_gmu_gfx_rail_on();
++		sptprac_ok = pg_gmu_sptprac_enable();
+ 		ctrl_ok = pg_hfi_ctrl_init();
+ 	}
+ 	hfi_status = pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_STATUS);
+@@ -1594,10 +1761,12 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		    init_result, busy, cfg, general7, hfi_status,
+ 		    ctrl_ok ? "initialized" : "not initialized");
+ 		printf("POLARIS PWR: HFI table pa=0x%llx va=0x%llx ctrl=0x%08x "
+-		    "qtbl_info=0x%08x sfr=0x%08x\n", pg_hfi.pa,
++		    "qtbl_info=0x%08x sfr=0x%08x gfx=%d sptprac=%d\n",
++		    pg_hfi.pa,
+ 		    (uint64_t)pg_hfi.va, hfi_status,
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_HFI_QTBL_INFO),
+-		    pg_rd32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR));
++		    pg_rd32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR),
++		    gfx_ok, sptprac_ok);
+ 	} else {
+ 		printf("POLARIS PWR: GMU boot complete init=0x%08x fw_busy=0x%08x "
+ 		    "cfg=0x%08x general7=0x%08x hfi_status=0x%08x; "
