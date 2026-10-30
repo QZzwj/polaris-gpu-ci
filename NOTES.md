@@ -1499,3 +1499,27 @@ The host suite passes **197 tests**. The first device run will use
 `polarissmmu=1` only; higher levels are enabled one at a time after the
 previous level returns a value. A readable SMMU is still not GPU
 acceleration, and no attach or PAS13 work has started.
+
+### 2026-10-30: 0113a level 1 SMMU read succeeds on device
+
+CI run **40983718557** built the staged kernel; `kernel.release.sweet`
+SHA-256 `f940c0d8dd0f8e44aecd83f2ff38ae80c5ca856409f565762f6f5f42eafe0fe1`.
+The rails image (`polarissmmu=1`, level 1) temporary-booted on the
+Polaris handset, reached the iOS UI, and the persistent ring recorded:
+
+```
+POLARIS PWR: SMMU probe level=1; read-only
+POLARIS PWR: SMMU read begin off=0x020 level=1
+POLARIS PWR: SMMU IDR0=0x48016605
+POLARIS PWR: SMMU probe limited to level 1; context banks not read
+POLARIS PWR: SMMU read-only; level=1 contexts=0 smr=5 sid_bits=3 irpt=1 granule=unknown; no attach
+POLARIS GPU: SMMU registers readable; no attach
+```
+
+So the 0113 first-read hang does not reproduce once the probe is staged
+behind `polarissmmu`; `IDR0` reads `0x48016605` (`NUMSMRG=5`,
+`NUMSIDB=3`, `NUMIRPT=1`). The same run also confirms the earlier GMU
+CSR observation: `fw=not-started`, `hfi=not-initialized`. Nothing was
+written to the SMMU, no context bank was read, and no attach or PAS13
+work has started. The next step is level 2 (`IDR1..IDR3`) to derive
+`NUMCB`, page size and context-bank geometry.
