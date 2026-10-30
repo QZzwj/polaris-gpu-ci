@@ -30,7 +30,7 @@ PLATFORM_RESERVED = (
     ('camera', CAMERA_BASE, CAMERA_SIZE),
     ('ips_fw', IPS_BASE, IPS_SIZE),
     ('ipa_gsi', IPA_BASE, IPA_SIZE),
-    ('gpu_region', ZAP_BASE, ZAP_SIZE),
+    ('zap', ZAP_BASE, ZAP_SIZE),
     ('adsp', ADSP_BASE, ADSP_SIZE),
     ('wlan_fw', WLAN_BASE, WLAN_SIZE),
     ('splash', SPLASH_BASE, SPLASH_SIZE),
