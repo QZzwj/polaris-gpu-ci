@@ -1,0 +1,319 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index b34732d..b7a73dd 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -381,6 +381,48 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_sCR0_CLIENTPD       (1u << 0)
+ #define PG_SMMU_ACR_CACHE_LOCK      (1u << 26)
+ 
++/*
++ * 0128 stage-1 register layout. GR1 is at +(1 << pgshift) = +0x1000:
++ * CBAR(n) = GR1 + 4n, CBA2R(n) = GR1 + 0x800 + 4n. CB n lives at
++ * +0x8000 + n * 0x1000. Offsets and the SCTLR value are taken from the
++ * vendor arm-smmu-vendor.c (CBAR_S1_BPSHCFG_NSH, CBAR_S1_MEMATTR_WB,
++ * SCTLR_CFIE|CFRE|AFE|TRE|HUPCF|SHCFG_NSH|S1_ASIDPNE|M, CFCFG cleared so a
++ * fault terminates instead of stalling the GMU).
++ */
++#define PG_SMMU_GR1                 0x1000u
++#define PG_SMMU_CBAR(n)             (PG_SMMU_GR1 + ((n) * 4u))
++#define PG_SMMU_CBA2R(n)            (PG_SMMU_GR1 + 0x800u + ((n) * 4u))
++#define PG_SMMU_CB(n, r)            (PG_SMMU_CB_BASE + ((n) * 0x1000u) + (r))
++
++#define PG_SMMU_CB_SCTLR            0x000u
++#define PG_SMMU_CB_TTBCR2           0x010u
++#define PG_SMMU_CB_TTBR0_LO         0x020u
++#define PG_SMMU_CB_TTBR0_HI         0x024u
++#define PG_SMMU_CB_TTBR1_LO         0x028u
++#define PG_SMMU_CB_TTBCR            0x030u
++#define PG_SMMU_CB_CONTEXTIDR       0x034u
++#define PG_SMMU_CB_S1_MAIR0         0x038u
++#define PG_SMMU_CB_S1_MAIR1         0x03cu
++#define PG_SMMU_CB_FAR_LO           0x060u
++#define PG_SMMU_CB_FAR_HI           0x064u
++
++#define PG_SMMU_CBAR_S1_TRANS_S2_BYPASS (1u << 16)
++#define PG_SMMU_CBAR_S1_BPSHCFG_NSH (3u << 8)
++#define PG_SMMU_CBAR_S1_MEMATTR_WB  (0xfu << 12)
++#define PG_SMMU_CBAR_S1_S2BYPASS    (PG_SMMU_CBAR_S1_TRANS_S2_BYPASS | \
++                                     PG_SMMU_CBAR_S1_BPSHCFG_NSH | \
++                                     PG_SMMU_CBAR_S1_MEMATTR_WB)
++
++#define PG_SMMU_SCTLR_S1            0x00C01167u
++#define PG_SMMU_S2CR_S1_TRANS(cb)   (PG_SMMU_S2CR_SHCFG_NSH | \
++                                     ((cb) & PG_SMMU_S2CR_CBNDX_MASK))
++
++/* One 4 KiB granule AArch32 short-descriptor L1 table covers 4 GiB. */
++#define PG_SMMU_S1_PT_SIZE          0x4000u
++#define PG_SMMU_S1_SECTION_SIZE     0x00100000u
++#define PG_SMMU_S1_SECTIONS         4u
++#define PG_SMMU_S1_DESC_FLAGS       0x00010c06u
++
+ /*
+  * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
+  * mainline agree on the Fabia table). PLL_MODE carries PLL_OUTCTRL(0),
+@@ -603,7 +645,7 @@ pg_pdc_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0127 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0128 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1712,6 +1754,199 @@ pg_hfi_smmu_bypass(void)
+ 	return true;
+ }
+ 
++/*
++ * 0128: real stage-1 translation for the two GMU SIDs. 0127 proved that the
++ * secure monitor turns a BYPASS S2CR store into FAULT (TYPE 1 -> 2), so the
++ * CM3 cannot reach the physical HFI table without a page table. Build a
++ * 16 KiB AArch32 short-descriptor L1 table that maps the 4 MiB window
++ * containing the HFI reservation one-to-one, point one idle context bank at
++ * it, and route SID 5/4 (SMR3/SMR4) through that bank with TYPE=TRANS.
++ * Diagnostic and opt-in through polarishfismmu=3; a forced TYPE or a
++ * missing idle CB stops before the CM3 is released.
++ */
++static bool
++pg_hfi_smmu_stage1(void)
++{
++	static const unsigned int order[PG_SMMU_MAX_LEVEL + 1u] = {
++		PG_SMMU_MAX_LEVEL, PG_SMMU_MAX_LEVEL - 1u, 2u, 1u, 0u
++	};
++	vm_offset_t va = 0;
++	ppnum_t pn, max_pnum;
++	uint64_t pt_pa, win_pa;
++	volatile uint32_t *pt;
++	uint32_t i, idx, first, cbndx = 0, s2cr3, s2cr4, val;
++	uint32_t cbar, sctlr, fsr;
++	bool have_cb = false;
++	kern_return_t kr;
++
++	if (!pg_smmu_map() || !pg_hfi.ready) {
++		printf("POLARIS PWR: SMMU S1 missing SMMU map or HFI table\n");
++		return false;
++	}
++	if (pg_hfi.pa + PG_HFI_ALLOC_SIZE > 0x100000000ull) {
++		printf("POLARIS PWR: SMMU S1 HFI pa=0x%llx is not below 4 GiB\n",
++		    pg_hfi.pa);
++		return false;
++	}
++
++	/*
++	 * TTBR0 must point at a 16 KiB-aligned L1 table whose descriptors are
++	 * indexed by VA[31:20]. The allocation is contiguous, zero-filled and
++	 * physically aligned to its own size.
++	 */
++	pg_sync_checkpoint("s1-pt-alloc");
++	max_pnum = (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1ull);
++	kr = kmem_alloc_contig(kernel_map, &va, PG_SMMU_S1_PT_SIZE, 0x3fffull,
++	    max_pnum, (ppnum_t)((PG_SMMU_S1_PT_SIZE >> PAGE_SHIFT) - 1u),
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS || va == 0) {
++		printf("POLARIS PWR: SMMU S1 page table allocation failed "
++		    "kr=%d\n", kr);
++		return false;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (pn == 0) {
++		printf("POLARIS PWR: SMMU S1 page table has no physical page\n");
++		return false;
++	}
++	pt_pa = ptoa_64(pn);
++	if ((pt_pa & (PG_SMMU_S1_PT_SIZE - 1u)) != 0 ||
++	    pt_pa + PG_SMMU_S1_PT_SIZE > 0x100000000ull) {
++		printf("POLARIS PWR: SMMU S1 page table pa=0x%llx is not "
++		    "16K-aligned below 4 GiB\n", pt_pa);
++		return false;
++	}
++
++	pt = (volatile uint32_t *)va;
++	for (i = 0; i < PG_SMMU_S1_PT_SIZE / 4u; i++) {
++		pt[i] = 0;
++	}
++	first = (uint32_t)(pg_hfi.pa >> 20);
++	win_pa = (uint64_t)first << 20;
++	for (i = 0; i < PG_SMMU_S1_SECTIONS; i++) {
++		idx = first + i;
++		if (idx >= PG_SMMU_S1_PT_SIZE / 4u) {
++			break;
++		}
++		pt[idx] = ((uint32_t)(win_pa +
++		    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) & 0xfff00000u) |
++		    PG_SMMU_S1_DESC_FLAGS;
++	}
++	flush_dcache64((addr64_t)pt_pa, PG_SMMU_S1_PT_SIZE, 1);
++	__sync_synchronize();
++	pg_sync_checkpoint("s1-pt-filled");
++	printf("POLARIS PWR: SMMU S1 pt pa=0x%llx win=0x%08x first=%u "
++	    "desc[%u]=0x%08x desc[%u]=0x%08x\n", pt_pa, (uint32_t)win_pa,
++	    first, first, pt[first], first + 1u, pt[first + 1u]);
++
++	/* Dump every candidate bank before choosing one. */
++	pg_sync_checkpoint("s1-cb-probe");
++	for (i = 0; i <= PG_SMMU_MAX_LEVEL; i++) {
++		cbar = pg_rd32(pg_smmu_regs, PG_SMMU_CBAR(i));
++		sctlr = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_SCTLR));
++		fsr = pg_rd32(pg_smmu_regs, PG_SMMU_CB(i, PG_SMMU_CB_FSR));
++		printf("POLARIS PWR: SMMU S1 CB%u CBAR=0x%08x SCTLR=0x%08x "
++		    "FSR=0x%08x\n", i, cbar, sctlr, fsr);
++	}
++	for (i = 0; i <= PG_SMMU_MAX_LEVEL; i++) {
++		unsigned int n = order[i];
++
++		cbar = pg_rd32(pg_smmu_regs, PG_SMMU_CBAR(n));
++		sctlr = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(n, PG_SMMU_CB_SCTLR));
++		if (cbar == 0 && sctlr == 0) {
++			cbndx = n;
++			have_cb = true;
++			break;
++		}
++	}
++	if (!have_cb) {
++		printf("POLARIS PWR: SMMU S1 no idle context bank\n");
++		pg_sync_checkpoint("s1-cb-none");
++		return false;
++	}
++	printf("POLARIS PWR: SMMU S1 selected CB%u\n", cbndx);
++
++	/* Disable, clear fault state, then program the bank exactly as vendor. */
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FSR),
++	    0xffffffffu, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CBA2R(cbndx), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CBAR(cbndx),
++	    PG_SMMU_CBAR_S1_S2BYPASS, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_LO),
++	    (uint32_t)pt_pa, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_HI), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR1_LO), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR2), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_CONTEXTIDR), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR0), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR1), 0, 3);
++	pg_sync_checkpoint("s1-cb-programmed");
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR),
++	    PG_SMMU_SCTLR_S1, 3);
++	printf("POLARIS PWR: SMMU S1 CB%u programmed CBAR=0x%08x SCTLR=0x%08x "
++	    "TTBR0=0x%08x TTBCR=0x%08x FSR=0x%08x\n", cbndx,
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CBAR(cbndx)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_LO)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FSR)));
++
++	/*
++	 * TYPE=0 selects stage-1 translation through CBNDX. The 0127 run
++	 * showed a BYPASS store becoming TYPE=2; if TRANS is rewritten the
++	 * same way, stop here and leave the bank disabled.
++	 */
++	val = PG_SMMU_S2CR_S1_TRANS(cbndx);
++	pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(3), val, 3);
++	s2cr3 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(3));
++	pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(4), val, 3);
++	s2cr4 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(4));
++	printf("POLARIS PWR: SMMU S1 S2CR write=0x%08x readback3=0x%08x "
++	    "readback4=0x%08x\n", val, s2cr3, s2cr4);
++	if (((s2cr3 >> PG_SMMU_S2CR_TYPE_SHIFT) &
++	    PG_SMMU_S2CR_TYPE_MASK) != 0u ||
++	    (s2cr3 & PG_SMMU_S2CR_CBNDX_MASK) != cbndx ||
++	    ((s2cr4 >> PG_SMMU_S2CR_TYPE_SHIFT) &
++	    PG_SMMU_S2CR_TYPE_MASK) != 0u ||
++	    (s2cr4 & PG_SMMU_S2CR_CBNDX_MASK) != cbndx) {
++		pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR),
++		    0, 3);
++		printf("POLARIS PWR: SMMU S1 S2CR forced by secure monitor; "
++		    "CB%u disabled, CM3 must stay reset\n", cbndx);
++		pg_sync_checkpoint("s1-s2cr-forced");
++		return false;
++	}
++	pg_sync_checkpoint("s1-s2cr-written");
++
++	pg_wr32(pg_smmu_regs, PG_SMMU_SMR(3), PG_SMMU_SMR_VALID | 5u, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_SMR(4), PG_SMMU_SMR_VALID | 4u, 3);
++	__sync_synchronize();
++	pg_sync_checkpoint("s1-smr-written");
++	pg_wr32(pg_smmu_regs, PG_SMMU_TLBIALLNSNH, 1, 3);
++	for (i = 0; i < 100u; i++) {
++		if ((pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS) & 1u) == 0) {
++			break;
++		}
++		DELAY(10);
++	}
++	printf("POLARIS PWR: SMMU S1 done SMR3=0x%08x SMR4=0x%08x "
++	    "S2CR3=0x%08x S2CR4=0x%08x tlb=0x%08x CBFSR=0x%08x "
++	    "CBFAR=0x%08x\n",
++	    pg_rd32(pg_smmu_regs, PG_SMMU_SMR(3)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_SMR(4)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(3)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(4)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FSR)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FAR_LO)));
++	pg_sync_checkpoint("s1-done");
++	return true;
++}
++
+ /*
+  * Mainline a6xx_gmu_power_config(): disable the GMU WB/RB buffers, program
+  * the power-collapse timing and enable the RPMh GPU client. This runs while
+@@ -2054,7 +2289,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0127-smmu-acr polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0128-smmu-s1 polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -2244,7 +2479,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		hfion = 0;
+ 	}
+ 	(void)PE_parse_boot_argn("polarishfismmu", &hfi_smmu, sizeof(hfi_smmu));
+-	if (hfi_smmu != 1) {
++	if (hfi_smmu != 1 && hfi_smmu != 3) {
+ 		hfi_smmu = 0;
+ 	}
+ 	(void)PE_parse_boot_argn("polarisrpmh", &rpmh_on, sizeof(rpmh_on));
+@@ -2272,7 +2507,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0127 build polarispwr=%d rpmh=%d\n", pwrlevel,
++	printf("POLARIS PWR: 0128 build polarispwr=%d rpmh=%d\n", pwrlevel,
+ 	    rpmh_on);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
+@@ -2333,13 +2568,23 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		pg_sync_checkpoint("hfi-alloc");
+ 	}
+ 	if (hfion != 0 && hfi_smmu != 0) {
+-		pg_sync_checkpoint("before-smmu-bypass");
+-		if (!pg_hfi_smmu_bypass()) {
+-			printf("POLARIS PWR: HFI SMMU bypass unavailable; "
+-			    "CM3 held in reset\n");
+-			return 0;
++		if (hfi_smmu == 3) {
++			pg_sync_checkpoint("before-smmu-s1");
++			if (!pg_hfi_smmu_stage1()) {
++				printf("POLARIS PWR: HFI SMMU stage-1 "
++				    "unavailable; CM3 held in reset\n");
++				return 0;
++			}
++			pg_sync_checkpoint("smmu-s1");
++		} else {
++			pg_sync_checkpoint("before-smmu-bypass");
++			if (!pg_hfi_smmu_bypass()) {
++				printf("POLARIS PWR: HFI SMMU bypass "
++				    "unavailable; CM3 held in reset\n");
++				return 0;
++			}
++			pg_sync_checkpoint("smmu-bypass");
+ 		}
+-		pg_sync_checkpoint("smmu-bypass");
+ 	}
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT, 0, 3);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_BOOT_CONFIG, 0x02u, 3);
