@@ -145,7 +145,7 @@ def overlap(base, size, other, other_size):
     return base < other + other_size and other < base + size
 
 
-def check_layout(kernel, tree, cmdline, files, hfi=None):
+def check_layout(kernel, tree, cmdline, files, hfi=None, extra_entries=()):
     raw = tree.read_bytes()
     root, end = adt.parse(raw)
     if end != len(raw):
@@ -170,6 +170,16 @@ def check_layout(kernel, tree, cmdline, files, hfi=None):
             if overlap(hfi_pa, hfi_size, addr, length):
                 raise ValueError(f'GPU-HFI reservation overlaps {label}')
         entries = (('GPU-HFI', hfi_pa, hfi_size),)
+    for name, e_phys, e_size in extra_entries:
+        if not name or name == 'GPU-HFI' or e_size <= 0 or \
+                e_phys & (PAGE - 1) or e_phys + e_size > 1 << 32:
+            raise ValueError(f'{name} reservation is not a usable low-DRAM range')
+        if overlap(base, size, e_phys, e_size):
+            raise ValueError(f'{name} reservation overlaps XNU managed RAM')
+        for label, addr, length in PLATFORM_RESERVED:
+            if overlap(e_phys, e_size, addr, length):
+                raise ValueError(f'{name} reservation overlaps {label}')
+        entries += ((name, e_phys, e_size),)
     image, _ = mkpayload.build(kernel, tree, cmdline,
                                 blobs=[(name, str(files[name][0])) for name, _ in BLOBS],
                                 memory_map_entries=entries)
@@ -201,6 +211,13 @@ def check_layout(kernel, tree, cmdline, files, hfi=None):
             raise ValueError('packed GPU-HFI entry differs from the requested range')
         if any(overlap(addr, length, a, s) for a, s in intervals):
             raise ValueError('GPU-HFI overlaps a firmware allocation')
+    for name, e_phys, e_size in extra_entries:
+        value = memory_map.prop(name)
+        if value is None or len(value) != 16:
+            raise ValueError(f'missing ADT entry: {name}')
+        addr, length = struct.unpack('<2Q', value)
+        if (addr, length) != (e_phys, e_size):
+            raise ValueError(f'packed {name} entry differs from the requested range')
     return len(image), MAX_PAYLOAD_SIZE - len(image)
 
 
