@@ -1,0 +1,338 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 1d1c69d..7fa9e1f 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -479,6 +479,8 @@ static volatile uint32_t *pg_gmu_regs;
+ static volatile uint32_t *pg_gmu_fw_regs;
+ static volatile uint32_t *pg_smmu_regs;
+ static volatile uint32_t *pg_pdc_regs;
++/* 0129: context bank selected by pg_hfi_smmu_stage1(), for diagnostics. */
++static int pg_smmu_s1_cbndx = -1;
+ static uint32_t pg_cx_saved;
+ static int pg_cx_owned;
+ 
+@@ -651,7 +653,7 @@ pg_pdc_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0128a checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0129 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1563,6 +1565,190 @@ pg_hfi_dump_queues(const char *why)
+ 	}
+ }
+ 
++/*
++ * 0129: the 0128a run proved that the CM3 reaches its 0xBABEFACE entry but
++ * never sets HFI_CTRL_STATUS bit 0. The firmware debug-log area and the DBG
++ * queue are the only places that can explain why from the firmware side, so
++ * dump both before any fault state is cleared or the CM3 is touched again.
++ */
++static void
++pg_hfi_log_dump(const char *why)
++{
++	volatile uint32_t *log;
++	unsigned int i, pos, start, n;
++	unsigned int dwords = 512u;
++	char buf[81];
++
++	if (!pg_hfi.ready || pg_hfi.va == 0) {
++		printf("POLARIS PWR: HFI log dump %s: no table\n", why);
++		return;
++	}
++	pg_hfi_flush();
++	log = (volatile uint32_t *)(pg_hfi.va + PG_HFI_TABLE_SIZE);
++	printf("POLARIS PWR: HFI log dump %s pa=0x%llx dwords=%u\n", why,
++	    (unsigned long long)(pg_hfi.pa + PG_HFI_TABLE_SIZE), dwords);
++	for (i = 0; i < dwords; i += 8u) {
++		printf("POLARIS PWR: HFI log[%03x] %08x %08x %08x %08x "
++		    "%08x %08x %08x %08x\n", i,
++		    log[i + 0u], log[i + 1u], log[i + 2u], log[i + 3u],
++		    log[i + 4u], log[i + 5u], log[i + 6u], log[i + 7u]);
++	}
++	printf("POLARIS PWR: HFI log ascii %s\n", why);
++	pos = 0;
++	while (pos < PG_HFI_DBG_SIZE) {
++		n = 0;
++		while (pos < PG_HFI_DBG_SIZE &&
++		    (((volatile uint8_t *)log)[pos] < 0x20u ||
++		    ((volatile uint8_t *)log)[pos] > 0x7eu)) {
++			pos++;
++		}
++		start = pos;
++		while (pos < PG_HFI_DBG_SIZE &&
++		    ((volatile uint8_t *)log)[pos] >= 0x20u &&
++		    ((volatile uint8_t *)log)[pos] <= 0x7eu) {
++			if (n + 1u < sizeof(buf)) {
++				buf[n++] =
++				    (char)((volatile uint8_t *)log)[pos];
++			}
++			pos++;
++		}
++		if (n >= 4u && pos - start >= 4u) {
++			buf[n] = '\0';
++			printf("POLARIS PWR: HFI log ascii %s off=0x%04x "
++			    "\"%s\"\n", why, start, buf);
++		}
++	}
++}
++
++static void
++pg_hfi_debug_queue_dump(const char *why)
++{
++	volatile uint32_t *table = (volatile uint32_t *)pg_hfi.va;
++	volatile uint32_t *q;
++	volatile uint8_t *b;
++	unsigned int i, pos, start, n;
++	unsigned int dwords = 256u;
++	uint32_t off = PG_HFI_Q0_OFFSET + PG_HFI_DBG_Q * PG_HFI_Q_STRIDE;
++	char buf[81];
++
++	if (!pg_hfi.ready || pg_hfi.va == 0 || table == 0) {
++		printf("POLARIS PWR: HFI dbgq dump %s: no table\n", why);
++		return;
++	}
++	pg_hfi_flush();
++	q = (volatile uint32_t *)(pg_hfi.va + off);
++	printf("POLARIS PWR: HFI dbgq dump %s off=0x%x pa=0x%llx "
++	    "rd=%u wr=%u dwords=%u\n", why, off,
++	    (unsigned long long)(pg_hfi.pa + off),
++	    table[PG_HFI_HDR_DWORDS + 2u * PG_HFI_QHDR_DWORDS + 10u],
++	    table[PG_HFI_HDR_DWORDS + 2u * PG_HFI_QHDR_DWORDS + 11u],
++	    dwords);
++	for (i = 0; i < dwords; i += 8u) {
++		printf("POLARIS PWR: HFI dbgq[%03x] %08x %08x %08x %08x "
++		    "%08x %08x %08x %08x\n", i,
++		    q[i + 0u], q[i + 1u], q[i + 2u], q[i + 3u],
++		    q[i + 4u], q[i + 5u], q[i + 6u], q[i + 7u]);
++	}
++	printf("POLARIS PWR: HFI dbgq ascii %s\n", why);
++	b = (volatile uint8_t *)q;
++	pos = 0;
++	while (pos < 1024u) {
++		n = 0;
++		while (pos < 1024u &&
++		    (b[pos] < 0x20u || b[pos] > 0x7eu)) {
++			pos++;
++		}
++		start = pos;
++		while (pos < 1024u && b[pos] >= 0x20u && b[pos] <= 0x7eu) {
++			if (n + 1u < sizeof(buf)) {
++				buf[n++] = (char)b[pos];
++			}
++			pos++;
++		}
++		if (n >= 4u && pos - start >= 4u) {
++			buf[n] = '\0';
++			printf("POLARIS PWR: HFI dbgq ascii %s off=0x%04x "
++			    "\"%s\"\n", why, start, buf);
++		}
++	}
++}
++
++/*
++ * 0129: a single register snapshot taken before any fault-clearing write.
++ * Reading SMMU IDR3 (0x02c) wedges this SMMU, so only the registers already
++ * exercised by stage-1 setup are touched, and only if their maps exist.
++ */
++static void
++pg_gmu_hfi_snapshot(const char *tag)
++{
++	uint32_t pdc_en = 0xffffffffu;
++	uint32_t cb = 0;
++
++	printf("POLARIS PWR: HFI snapshot %s\n", tag);
++	if (pg_gmu_regs == NULL) {
++		printf("POLARIS PWR: HFI snapshot %s: no GMU map\n", tag);
++		return;
++	}
++	printf("POLARIS PWR: HFI snap ctrl status=0x%08x init=0x%08x "
++	    "ver=0x%08x qtbl_addr=0x%08x qtbl_info=0x%08x sfr=0x%08x\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_STATUS),
++	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_INIT),
++	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_VERSION_INFO),
++	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_QTBL_ADDR),
++	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_QTBL_INFO),
++	    pg_rd32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR));
++	printf("POLARIS PWR: HFI snap intr info=0x%08x mask=0x%08x "
++	    "ao=0x%08x ao_mask=0x%08x fence=0x%08x\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO),
++	    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_MASK),
++	    pg_rd32(pg_gmu_regs, PG_GMU_AO_HOST_INTR_STATUS),
++	    pg_rd32(pg_gmu_regs, PG_GMU_AO_HOST_INTR_MASK),
++	    pg_rd32(pg_gmu_regs, PG_GMU_AHB_FENCE_STATUS));
++	printf("POLARIS PWR: HFI snap cm3 init=0x%08x busy=0x%08x "
++	    "cfg=0x%08x general7=0x%08x pwrmsg=0x%08x pwrresp=0x%08x\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_INIT_RESULT),
++	    pg_rd32(pg_gmu_regs, PG_GMU_CM3_FW_BUSY),
++	    pg_rd32(pg_gmu_regs, PG_GMU_CM3_CFG),
++	    pg_rd32(pg_gmu_regs, PG_GMU_GENERAL_7),
++	    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG),
++	    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_CP_RESP));
++	if (pg_pdc_regs != NULL) {
++		pdc_en = pg_rd32(pg_pdc_regs, PG_PDC_GPU_ENABLE_PDC);
++	}
++	printf("POLARIS PWR: HFI snap rscc ack=0x%08x seq_busy=0x%08x "
++	    "pdc_en=0x%08x\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_CONTROL_ACK),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_SEQ_BUSY_DRV0), pdc_en);
++	if (pg_smmu_regs != NULL) {
++		printf("POLARIS PWR: HFI snap smmu sCR0=0x%08x sACR=0x%08x "
++		    "GFSR=0x%08x S2CR3=0x%08x S2CR4=0x%08x SMR3=0x%08x "
++		    "SMR4=0x%08x\n",
++		    pg_rd32(pg_smmu_regs, 0x000u),
++		    pg_rd32(pg_smmu_regs, PG_SMMU_sACR),
++		    pg_rd32(pg_smmu_regs, PG_SMMU_GFSR),
++		    pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(3)),
++		    pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(4)),
++		    pg_rd32(pg_smmu_regs, PG_SMMU_SMR(3)),
++		    pg_rd32(pg_smmu_regs, PG_SMMU_SMR(4)));
++		if (pg_smmu_s1_cbndx >= 0) {
++			cb = (uint32_t)pg_smmu_s1_cbndx;
++			printf("POLARIS PWR: HFI snap CB%u SCTLR=0x%08x "
++			    "TTBR0=0x%08x TTBCR=0x%08x FSR=0x%08x "
++			    "FAR=0x%08x\n", cb,
++			    pg_rd32(pg_smmu_regs,
++			    PG_SMMU_CB(cb, PG_SMMU_CB_SCTLR)),
++			    pg_rd32(pg_smmu_regs,
++			    PG_SMMU_CB(cb, PG_SMMU_CB_TTBR0_LO)),
++			    pg_rd32(pg_smmu_regs,
++			    PG_SMMU_CB(cb, PG_SMMU_CB_TTBCR)),
++			    pg_rd32(pg_smmu_regs,
++			    PG_SMMU_CB(cb, PG_SMMU_CB_FSR)),
++			    pg_rd32(pg_smmu_regs,
++			    PG_SMMU_CB(cb, PG_SMMU_CB_FAR_LO)));
++		}
++	}
++}
++
+ static bool
+ pg_hfi_alloc(void)
+ {
+@@ -1866,6 +2052,7 @@ pg_hfi_smmu_stage1(void)
+ 		pg_sync_checkpoint("s1-cb-none");
+ 		return false;
+ 	}
++	pg_smmu_s1_cbndx = (int)cbndx;
+ 	printf("POLARIS PWR: SMMU S1 selected CB%u\n", cbndx);
+ 
+ 	/* Disable, clear fault state, then program the bank exactly as vendor. */
+@@ -2248,6 +2435,17 @@ pg_hfi_ctrl_init(void)
+ 		    status, init_rd,
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO),
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_MASK));
++		/*
++		 * 0129: capture the SMMU fault state and the firmware-facing
++		 * buffers before pg_gmu_cm3_fault_probe() clears the CM3
++		 * fault bit. If CB FSR/FAR only turn non-zero here, the
++		 * failure is a firmware MMIO fault, not a host write order.
++		 */
++		printf("POLARIS PWR: HFI CTRL_INIT timeout snapshot %s\n",
++		    "ctrl-timeout");
++		pg_gmu_hfi_snapshot("ctrl-timeout");
++		pg_hfi_log_dump("ctrl-timeout");
++		pg_hfi_debug_queue_dump("ctrl-timeout");
+ 		pg_sync_checkpoint("ctrl-timeout");
+ 		return false;
+ 	}
+@@ -2267,6 +2465,9 @@ pg_hfi_ctrl_init(void)
+ 	pg_wr32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_MASK, mask & ~1u, 3);
+ 	pg_sync_checkpoint("ctrl-after-mask");
+ 	pg_hfi_dump_queues("post-ctrl");
++	pg_gmu_hfi_snapshot("post-ctrl");
++	pg_hfi_log_dump("post-ctrl");
++	pg_hfi_debug_queue_dump("post-ctrl");
+ 	printf("POLARIS PWR: HFI ctrl initialized status=0x%08x mask=0x%08x "
+ 	    "version=0x%08x qtbl_addr=0x%08x qtbl_info=0x%08x sfr=0x%08x\n",
+ 	    status, mask & ~1u, version, qtbl_addr, qtbl_info, sfr);
+@@ -2289,7 +2490,8 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0128a-smmu-s1 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0129-hfi-diag polarishfi=%d\n",
++	    hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -2359,6 +2561,9 @@ polaris_gpu_hfi_start(void)
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_MASK),
+ 		    table[PG_HFI_MSG_READ_INDEX],
+ 		    table[PG_HFI_MSG_WRITE_INDEX]);
++		pg_gmu_hfi_snapshot("ack-timeout");
++		pg_hfi_log_dump("ack-timeout");
++		pg_hfi_debug_queue_dump("ack-timeout");
+ 		pg_hfi_dump_queues("ack-timeout");
+ 		return 0;
+ 	}
+@@ -2380,6 +2585,8 @@ polaris_gpu_hfi_start(void)
+ 	if (size < 3u || size > PG_HFI_ACK_WORDS) {
+ 		printf("POLARIS PWR: HFI ACK invalid hdr=0x%08x size=%u rd=%u "
+ 		    "wr=%u\n", hdr, size, rd, wr);
++		pg_hfi_log_dump("bad-size");
++		pg_hfi_debug_queue_dump("bad-size");
+ 		pg_hfi_dump_queues("bad-size");
+ 		return 0;
+ 	}
+@@ -2404,6 +2611,8 @@ polaris_gpu_hfi_start(void)
+ 		for (i = 0; i < size; i++) {
+ 			printf("POLARIS PWR: HFI ACK[%u]=0x%08x\n", i, ack[i]);
+ 		}
++		pg_hfi_log_dump("bad-hdr");
++		pg_hfi_debug_queue_dump("bad-hdr");
+ 		pg_hfi_dump_queues("bad-hdr");
+ 		return 0;
+ 	}
+@@ -2453,6 +2662,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	uint32_t last = 0;
+ 	unsigned int i;
+ 	int optin = 0, gpuon = 0, hfion = 0, hfi_smmu = 0;
++	int hfi_align = 0;
+ 	int rpmh_on = 0, rpmh_ok = 0;
+ 	int ctrl_ok = 0;
+ 	int gfx_ok = 0, sptprac_ok = 0;
+@@ -2478,6 +2688,11 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (hfion != 1) {
+ 		hfion = 0;
+ 	}
++	(void)PE_parse_boot_argn("polarishfialign", &hfi_align,
++	    sizeof(hfi_align));
++	if (hfi_align != 1) {
++		hfi_align = 0;
++	}
+ 	(void)PE_parse_boot_argn("polarishfismmu", &hfi_smmu, sizeof(hfi_smmu));
+ 	if (hfi_smmu != 1 && hfi_smmu != 3) {
+ 		hfi_smmu = 0;
+@@ -2507,8 +2722,9 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0128a build polarispwr=%d rpmh=%d\n", pwrlevel,
++	printf("POLARIS PWR: 0129 build polarispwr=%d rpmh=%d\n", pwrlevel,
+ 	    rpmh_on);
++	printf("POLARIS PWR: HFI align %d\n", hfi_align);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
+ 		return 0;
+@@ -2598,13 +2814,18 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	pg_wr32(pg_gmu_regs, PG_GMU_AHB_FENCE_RANGE_0,
+ 	    (1u << 31) | (0xau << 18) | 0xa0u, 3);
+ 	pg_sync_checkpoint("before-sfr");
+-	if (hfion != 0) {
++	if (hfion != 0 && hfi_align == 0) {
+ 		pg_wr32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR, PG_A630_CHIPID, 3);
+ 	}
+ 	pg_sync_checkpoint("after-sfr");
+ 	pg_sync_checkpoint("before-cm3-cfg");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_CM3_CFG, 0x4052u, 3);
+ 	pg_sync_checkpoint("after-cm3-cfg");
++	if (hfion != 0 && hfi_align != 0) {
++		pg_sync_checkpoint("before-sfr-align");
++		pg_wr32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR, PG_A630_CHIPID, 3);
++		pg_sync_checkpoint("after-sfr-align");
++	}
+ 	if (hfion != 0 && pwrlevel >= 6) {
+ 		pg_sync_checkpoint("before-pwr-col-cp-msg");
+ 		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG,

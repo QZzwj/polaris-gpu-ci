@@ -1,0 +1,447 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 765aa2a..58a5c9f 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -403,8 +403,24 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_CB_CONTEXTIDR       0x034u
+ #define PG_SMMU_CB_S1_MAIR0         0x038u
+ #define PG_SMMU_CB_S1_MAIR1         0x03cu
++#define PG_SMMU_CB_PAR_LO           0x050u
++#define PG_SMMU_CB_PAR_HI           0x054u
+ #define PG_SMMU_CB_FAR_LO           0x060u
+ #define PG_SMMU_CB_FAR_HI           0x064u
++#define PG_SMMU_CB_FSYNR0           0x068u
++#define PG_SMMU_CB_S1_TLBIALL       0x618u
++#define PG_SMMU_CB_TLBSYNC          0x7f0u
++#define PG_SMMU_CB_TLBSTATUS        0x7f4u
++#define PG_SMMU_CB_ATS1PR           0x800u
++#define PG_SMMU_CB_ATSR             0x8f0u
++#define PG_SMMU_CBFRSYNRA(n)        (PG_SMMU_GR1 + 0x400u + ((n) * 4u))
++
++#define PG_SMMU_CB_PAR_F            (1u << 0)
++#define PG_SMMU_CB_PAR_PA_MASK      0x000000fffffff000ull
++#define PG_SMMU_CB_ATSR_ACTIVE      (1u << 0)
++#define PG_SMMU_CB_TLBSTATUS_SACTIVE (1u << 0)
++#define PG_SMMU_CB_FSYNR0_WNR       (1u << 4)
++#define PG_SMMU_CBFRSYNRA_SID_MASK  0xffffu
+ 
+ #define PG_SMMU_CBAR_S1_TRANS_S2_BYPASS (1u << 16)
+ #define PG_SMMU_CBAR_S1_BPSHCFG_NSH (3u << 8)
+@@ -482,6 +498,10 @@ extern void sweet_log_sync(void);
+ 
+ /* Bounded poll budget: 200 iterations of a 1 us delay. */
+ #define PG_POLL_US 200u
++/* SMMU TLB sync can take longer; vendor uses a 500 ms bound. */
++#define PG_SMMU_TLB_POLL_US 500000u
++/* ATS1PR should complete in tens of microseconds; allow 1 ms. */
++#define PG_SMMU_ATS_POLL_US 1000u
+ /* RCG root/update budget: 500 iterations of a 1 us delay, as clk-rcg2 uses. */
+ #define PG_RCG_POLL_US 500u
+ /* PLL lock budget: the vendor driver uses 100 us; keep a wider margin. */
+@@ -497,6 +517,10 @@ static volatile uint32_t *pg_smmu_regs;
+ static volatile uint32_t *pg_pdc_regs;
+ /* 0129: context bank selected by pg_hfi_smmu_stage1(), for diagnostics. */
+ static int pg_smmu_s1_cbndx = -1;
++/* 0132: host mapping of the stage-1 table, for descriptor readback. */
++static volatile uint32_t *pg_smmu_s1_pt;
++/* 0132: a timed-out ATS1PR is not retried; it may need QCOM halt/resume. */
++static bool pg_smmu_ats_timed_out;
+ /* 0131: host mapping of the sentinel page behind the GMU heap window. */
+ static volatile uint32_t *pg_heap_scratch;
+ static uint32_t pg_cx_saved;
+@@ -579,6 +603,26 @@ pg_wr32(volatile uint32_t *base, uint32_t off, uint32_t value, unsigned page)
+ #endif
+ }
+ 
++/*
++ * 0132: ATS1PR is a single 64-bit register on SMMUv2 and must be written
++ * with one store.  PAR and the prefetch-address registers are read as two
++ * 32-bit halves because this mapping is a volatile u32 view.
++ */
++static inline uint64_t
++pg_rd64(volatile uint32_t *base, uint32_t off)
++{
++	uint64_t lo = pg_rd32(base, off);
++	uint64_t hi = pg_rd32(base, off + 4u);
++
++	return lo | (hi << 32);
++}
++
++static inline void
++pg_wr64(volatile uint32_t *base, uint32_t off, uint64_t value)
++{
++	*(volatile uint64_t *)((volatile char *)base + off) = value;
++}
++
+ static bool
+ pg_cx_map(void)
+ {
+@@ -684,7 +728,7 @@ pg_pdc_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0131 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0132 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -705,6 +749,57 @@ pg_smmu_map(void)
+ 	return true;
+ }
+ 
++/*
++ * 0132: SMMUv2 TLBIALLNSNH/sTLBGSYNC are command registers; the command
++ * is a zero write, not a one write.  Poll sTLBGSTATUS.GSACTIVE with a
++ * bounded budget and report a timeout instead of spinning forever.
++ */
++static bool
++pg_smmu_tlb_invalidate_global(const char *tag)
++{
++	uint32_t status = 0;
++	unsigned int i;
++
++	pg_wr32(pg_smmu_regs, PG_SMMU_TLBIALLNSNH, 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_STLBGSYNC, 0, 3);
++	for (i = 0; i < PG_SMMU_TLB_POLL_US / 1000u; i++) {
++		status = pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS);
++		if ((status & 1u) == 0) {
++			break;
++		}
++		DELAY(1000);
++	}
++	printf("POLARIS PWR: SMMU TLB global %s status=0x%08x %s\n",
++	    tag, status, (status & 1u) != 0 ? "timeout" : "ok");
++	return (status & 1u) == 0;
++}
++
++/*
++ * 0132: invalidate only the selected context bank, then wait for
++ * TLBSTATUS.SACTIVE to clear.  This is the vendor non-errata path.
++ */
++static bool
++pg_smmu_tlb_invalidate_cb(unsigned int cb, const char *tag)
++{
++	uint32_t status = 0;
++	unsigned int i;
++
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cb, PG_SMMU_CB_S1_TLBIALL), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cb, PG_SMMU_CB_TLBSYNC), 0, 3);
++	for (i = 0; i < PG_SMMU_TLB_POLL_US / 1000u; i++) {
++		status = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(cb, PG_SMMU_CB_TLBSTATUS));
++		if ((status & PG_SMMU_CB_TLBSTATUS_SACTIVE) == 0) {
++			break;
++		}
++		DELAY(1000);
++	}
++	printf("POLARIS PWR: SMMU TLB CB%u %s status=0x%08x %s\n",
++	    cb, tag, status,
++	    (status & PG_SMMU_CB_TLBSTATUS_SACTIVE) != 0 ? "timeout" : "ok");
++	return (status & PG_SMMU_CB_TLBSTATUS_SACTIVE) == 0;
++}
++
+ int
+ polaris_gpu_rails_enter(void)
+ {
+@@ -1873,7 +1968,6 @@ pg_hfi_smmu_bypass(void)
+ {
+ 	uint32_t scr0, acr, acr_after, smr3, smr4, s2cr3, s2cr4;
+ 	uint32_t idr0, idr1, idr2, idr7;
+-	unsigned int i;
+ 
+ 	if (!pg_smmu_map()) {
+ 		return false;
+@@ -1956,13 +2050,7 @@ pg_hfi_smmu_bypass(void)
+ 	printf("POLARIS PWR: SMMU SMR3 readback=0x%08x SMR4 readback=0x%08x\n",
+ 	    smr3, smr4);
+ 	pg_sync_checkpoint("smmu-s2cr-smr-written");
+-	pg_wr32(pg_smmu_regs, PG_SMMU_TLBIALLNSNH, 1, 3);
+-	for (i = 0; i < 100u; i++) {
+-		if ((pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS) & 1u) == 0) {
+-			break;
+-		}
+-		DELAY(10);
+-	}
++	(void)pg_smmu_tlb_invalidate_global("bypass");
+ 	printf("POLARIS PWR: SMMU bypass after SMR3=0x%08x SMR4=0x%08x "
+ 	    "S2CR3=0x%08x S2CR4=0x%08x tlb=0x%08x\n",
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_SMR(3)),
+@@ -1978,37 +2066,197 @@ pg_hfi_smmu_bypass(void)
+ }
+ 
+ /*
+- * 0131: sample the SMMU fault state at each pre-HFI checkpoint.  The
+- * 0130 ring only proved that CB4 FSR was zero at s1-done; it did not
+- * show when the 0x06f8fbc4 fault appeared.  Reading GFSR/GFAR and each
+- * context bank is safe here: these are the same registers already read
+- * by stage-1 setup (IDR3 is deliberately never touched).
++ * 0132: sample the full CB4 fault/context state before any ATS call or
++ * FSR-clear write.  FSYNR0.WNR distinguishes a firmware write from a
++ * read; CBFRSYNRA names the stream that caused the fault.  IDR3 remains
++ * deliberately untouched because reading it wedges this SMMU.
+  */
+ static void
+ pg_smmu_fault_probe(const char *tag)
+ {
+ 	unsigned int i;
+-	uint32_t fsr, far, sctlr;
++	uint64_t far, par, ttbr0;
++	uint32_t fsr, far_lo, far_hi, sctlr, fsynr0, frsynra, atsr;
++	uint32_t ttbcr, ttbcr2, contextidr, mair0, mair1, cba2r, sid;
+ 
+ 	if (pg_smmu_regs == NULL) {
+ 		printf("POLARIS PWR: SMMU fault probe %s no map\n", tag);
+ 		return;
+ 	}
+-	printf("POLARIS PWR: SMMU fault probe %s GFSR=0x%08x GFAR=0x%08x\n",
+-	    tag, pg_rd32(pg_smmu_regs, PG_SMMU_GFSR),
+-	    pg_rd32(pg_smmu_regs, PG_SMMU_GFAR));
++	printf("POLARIS PWR: SMMU fault probe %s GFSR=0x%08x GFAR=0x%08x "
++	    "GFSYNR0=0x%08x GFSYNR1=0x%08x\n", tag,
++	    pg_rd32(pg_smmu_regs, PG_SMMU_GFSR),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_GFAR),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_GFSYNR0),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_GFSYNR1));
+ 	for (i = 0; i <= PG_SMMU_MAX_LEVEL; i++) {
+ 		fsr = pg_rd32(pg_smmu_regs, PG_SMMU_CB(i, PG_SMMU_CB_FSR));
+-		far = pg_rd32(pg_smmu_regs,
++		far_lo = pg_rd32(pg_smmu_regs,
+ 		    PG_SMMU_CB(i, PG_SMMU_CB_FAR_LO));
++		far_hi = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_FAR_HI));
++		far = (uint64_t)far_lo | ((uint64_t)far_hi << 32);
+ 		sctlr = pg_rd32(pg_smmu_regs,
+ 		    PG_SMMU_CB(i, PG_SMMU_CB_SCTLR));
+-		if (fsr != 0 || far != 0 || (int)i == pg_smmu_s1_cbndx) {
++		if (fsr == 0 && far == 0 && (int)i != pg_smmu_s1_cbndx) {
++			continue;
++		}
++
++		fsynr0 = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_FSYNR0));
++		frsynra = pg_rd32(pg_smmu_regs, PG_SMMU_CBFRSYNRA(i));
++		sid = frsynra & PG_SMMU_CBFRSYNRA_SID_MASK;
++		par = pg_rd64(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_PAR_LO));
++		atsr = pg_rd32(pg_smmu_regs, PG_SMMU_CB(i, PG_SMMU_CB_ATSR));
++		ttbr0 = pg_rd64(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_TTBR0_LO));
++		ttbcr = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_TTBCR));
++		ttbcr2 = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_TTBCR2));
++		contextidr = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_CONTEXTIDR));
++		mair0 = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_S1_MAIR0));
++		mair1 = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(i, PG_SMMU_CB_S1_MAIR1));
++		cba2r = pg_rd32(pg_smmu_regs, PG_SMMU_CBA2R(i));
++		printf("POLARIS PWR: SMMU fault probe %s CB%u SCTLR=0x%08x "
++		    "FSR=0x%08x FAR=0x%llx FSYNR0=0x%08x wnr=%u sid=0x%04x "
++		    "PAR=0x%llx PAR_F=%u ATSR=0x%08x\n", tag, i, sctlr, fsr,
++		    far, fsynr0, (fsynr0 & PG_SMMU_CB_FSYNR0_WNR) ? 1u : 0u,
++		    sid, par, (par & PG_SMMU_CB_PAR_F) ? 1u : 0u, atsr);
++		printf("POLARIS PWR: SMMU fault probe %s CB%u ctx "
++		    "TTBR0=0x%llx TTBCR=0x%08x TTBCR2=0x%08x "
++		    "CONTEXTIDR=0x%08x MAIR0=0x%08x MAIR1=0x%08x "
++		    "CBA2R=0x%08x\n", tag, i, ttbr0, ttbcr, ttbcr2,
++		    contextidr, mair0, mair1, cba2r);
++		if ((int)i == pg_smmu_s1_cbndx && pg_smmu_s1_pt != NULL) {
+ 			printf("POLARIS PWR: SMMU fault probe %s CB%u "
+-			    "SCTLR=0x%08x FSR=0x%08x FAR=0x%08x\n", tag, i,
+-			    sctlr, fsr, far);
++			    "pt[0x6e]=0x%08x pt[0x6f]=0x%08x "
++			    "pt[0x70]=0x%08x\n", tag, i,
++			    pg_smmu_s1_pt[0x6eu], pg_smmu_s1_pt[0x6fu],
++			    pg_smmu_s1_pt[0x70u]);
++		}
++	}
++}
++
++/*
++ * 0132: ask the SMMU itself to walk the stage-1 table for one page.  The
++ * result is independent of the CM3 traffic path, so it separates a bad
++ * mapping from a stream/attribute problem.  Snapshot the fault registers
++ * first, then clear only the stale FSR value, as the vendor does.  A
++ * timeout is explicitly inconclusive: QCOM's ATS path also halts the
++ * micro-MMU, which this bring-up does not implement yet.
++ */
++static bool
++pg_smmu_ats1pr_probe(unsigned int cb, uint32_t va, const char *tag)
++{
++	uint64_t expected = 0, par, par_before;
++	uint32_t desc = 0, fsr_before, fsr_after, fsynr0, frsynra;
++	uint32_t far_lo, far_hi, atsr, idr0, idx, page, sid;
++	uint64_t far_before, far_after;
++	unsigned int i;
++	bool timed_out = false;
++
++	if (pg_smmu_regs == NULL || pg_smmu_s1_pt == NULL ||
++	    cb > PG_SMMU_MAX_LEVEL) {
++		printf("POLARIS PWR: SMMU ATS1PR %s CB%u unavailable\n",
++		    tag, cb);
++		return false;
++	}
++	if (pg_smmu_ats_timed_out) {
++		printf("POLARIS PWR: SMMU ATS1PR %s CB%u skipped after "
++		    "earlier timeout\n", tag, cb);
++		return false;
++	}
++
++	page = va & ~0xfffu;
++	idx = page >> 20;
++	desc = pg_smmu_s1_pt[idx];
++	if ((desc & 3u) == 2u) {
++		expected = (uint64_t)(desc & 0xfff00000u) |
++		    (page & 0xfffffu);
++	}
++	fsr_before = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FSR));
++	far_lo = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FAR_LO));
++	far_hi = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FAR_HI));
++	far_before = (uint64_t)far_lo | ((uint64_t)far_hi << 32);
++	fsynr0 = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FSYNR0));
++	frsynra = pg_rd32(pg_smmu_regs, PG_SMMU_CBFRSYNRA(cb));
++	par_before = pg_rd64(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_PAR_LO));
++	atsr = pg_rd32(pg_smmu_regs, PG_SMMU_CB(cb, PG_SMMU_CB_ATSR));
++	idr0 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR0);
++	sid = frsynra & PG_SMMU_CBFRSYNRA_SID_MASK;
++	printf("POLARIS PWR: SMMU ATS1PR %s CB%u pre va=0x%08x "
++	    "page=0x%08x desc=0x%08x expected=0x%llx atosns=%u "
++	    "FSR=0x%08x FAR=0x%llx FSYNR0=0x%08x wnr=%u sid=0x%04x "
++	    "PAR=0x%llx ATSR=0x%08x\n", tag, cb, va, page, desc, expected,
++	    (idr0 >> 26) & 1u, fsr_before, far_before, fsynr0,
++	    (fsynr0 & PG_SMMU_CB_FSYNR0_WNR) ? 1u : 0u, sid, par_before,
++	    atsr);
++
++	/* Clear the stale fault value so ATS can report a fresh fault. */
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cb, PG_SMMU_CB_FSR),
++	    fsr_before, 3);
++	__sync_synchronize();
++	pg_wr64(pg_smmu_regs, PG_SMMU_CB(cb, PG_SMMU_CB_ATS1PR), page);
++	__sync_synchronize();
++	for (i = 0; i < PG_SMMU_ATS_POLL_US; i++) {
++		atsr = pg_rd32(pg_smmu_regs,
++		    PG_SMMU_CB(cb, PG_SMMU_CB_ATSR));
++		if ((atsr & PG_SMMU_CB_ATSR_ACTIVE) == 0) {
++			break;
+ 		}
++		DELAY(1);
++	}
++	if ((atsr & PG_SMMU_CB_ATSR_ACTIVE) != 0) {
++		timed_out = true;
++		pg_smmu_ats_timed_out = true;
++	}
++
++	par = pg_rd64(pg_smmu_regs, PG_SMMU_CB(cb, PG_SMMU_CB_PAR_LO));
++	fsr_after = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FSR));
++	far_lo = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FAR_LO));
++	far_hi = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FAR_HI));
++	far_after = (uint64_t)far_lo | ((uint64_t)far_hi << 32);
++	fsynr0 = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cb, PG_SMMU_CB_FSYNR0));
++	frsynra = pg_rd32(pg_smmu_regs, PG_SMMU_CBFRSYNRA(cb));
++	sid = frsynra & PG_SMMU_CBFRSYNRA_SID_MASK;
++	printf("POLARIS PWR: SMMU ATS1PR %s CB%u post va=0x%08x "
++	    "PAR=0x%llx pa=0x%llx ATSR=0x%08x FSR=0x%08x FAR=0x%llx "
++	    "FSYNR0=0x%08x wnr=%u sid=0x%04x par_unchanged=%u\n",
++	    tag, cb, va, par, par & PG_SMMU_CB_PAR_PA_MASK, atsr,
++	    fsr_after, far_after, fsynr0,
++	    (fsynr0 & PG_SMMU_CB_FSYNR0_WNR) ? 1u : 0u, sid,
++	    par == par_before ? 1u : 0u);
++	if (timed_out) {
++		printf("POLARIS PWR: SMMU ATS1PR %s CB%u TIMEOUT "
++		    "va=0x%08x atsr=0x%08x; inconclusive (ATS may require "
++		    "QCOM halt/resume)\n", tag, cb, va, atsr);
++		return false;
++	}
++	if ((par & PG_SMMU_CB_PAR_F) != 0) {
++		printf("POLARIS PWR: SMMU ATS1PR %s CB%u FAULT va=0x%08x "
++		    "PAR=0x%llx expected=0x%llx\n", tag, cb, va, par,
++		    expected);
++		return true;
+ 	}
++	printf("POLARIS PWR: SMMU ATS1PR %s CB%u ok va=0x%08x "
++	    "pa=0x%llx expected=0x%llx match=%s\n", tag, cb, va,
++	    par & PG_SMMU_CB_PAR_PA_MASK, expected,
++	    (par & PG_SMMU_CB_PAR_PA_MASK) == expected ? "yes" : "no");
++	return true;
+ }
+ 
+ /*
+@@ -2071,6 +2319,7 @@ pg_hfi_smmu_stage1(void)
+ 	    pt_pa, (uint64_t)va);
+ 
+ 	pt = (volatile uint32_t *)va;
++	pg_smmu_s1_pt = pt;
+ 	for (i = 0; i < PG_SMMU_S1_PT_SIZE / 4u; i++) {
+ 		pt[i] = 0;
+ 	}
+@@ -2221,13 +2470,8 @@ pg_hfi_smmu_stage1(void)
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_SMR(4), PG_SMMU_SMR_VALID | 4u, 3);
+ 	__sync_synchronize();
+ 	pg_sync_checkpoint("s1-smr-written");
+-	pg_wr32(pg_smmu_regs, PG_SMMU_TLBIALLNSNH, 1, 3);
+-	for (i = 0; i < 100u; i++) {
+-		if ((pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS) & 1u) == 0) {
+-			break;
+-		}
+-		DELAY(10);
+-	}
++	(void)pg_smmu_tlb_invalidate_global("s1");
++	(void)pg_smmu_tlb_invalidate_cb(cbndx, "s1");
+ 	printf("POLARIS PWR: SMMU S1 done SMR3=0x%08x SMR4=0x%08x "
+ 	    "S2CR3=0x%08x S2CR4=0x%08x tlb=0x%08x CBFSR=0x%08x "
+ 	    "CBFAR=0x%08x\n",
+@@ -2240,6 +2484,9 @@ pg_hfi_smmu_stage1(void)
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FAR_LO)));
+ 	pg_sync_checkpoint("s1-done");
+ 	pg_smmu_fault_probe("s1-done");
++	if (pg_smmu_ats1pr_probe(cbndx, 0x0c420000u, "s1-alias")) {
++		(void)pg_smmu_ats1pr_probe(cbndx, 0x06f8f000u, "s1-heap");
++	}
+ 	return true;
+ }
+ 
+@@ -2669,7 +2916,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0131-heap-map polarishfi=%d\n",
++	printf("POLARIS PWR: HFI start build 0132-ats-fault-probe polarishfi=%d\n",
+ 	    hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+@@ -2901,7 +3148,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0131 build polarispwr=%d rpmh=%d\n", pwrlevel,
++	printf("POLARIS PWR: 0132 build polarispwr=%d rpmh=%d\n", pwrlevel,
+ 	    rpmh_on);
+ 	printf("POLARIS PWR: HFI align %d\n", hfi_align);
+ 	pg_sync_checkpoint("entry");
+@@ -3083,6 +3330,15 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		ctrl_ok = pg_hfi_ctrl_init();
+ 		pg_sync_checkpoint("after-ctrl-init");
+ 		pg_smmu_fault_probe("after-ctrl-init");
++		if (hfi_smmu == 3 && !ctrl_ok && pg_smmu_s1_cbndx >= 0) {
++			if (pg_smmu_ats1pr_probe(
++			    (unsigned int)pg_smmu_s1_cbndx, 0x0c420000u,
++			    "ctrl-alias")) {
++				(void)pg_smmu_ats1pr_probe(
++				    (unsigned int)pg_smmu_s1_cbndx,
++				    0x06f8fbc4u, "ctrl-heap");
++			}
++		}
+ 		pg_gmu_cm3_fault_probe("after-ctrl-init");
+ 	}
+ 	hfi_status = pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_STATUS);
