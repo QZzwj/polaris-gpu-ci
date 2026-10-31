@@ -1,0 +1,202 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index 498baa6..22283f3 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -281,7 +281,7 @@ polaris_gpu_init(void)
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: build 0126-gxgdsc\n");
++	printf("POLARIS GPU: build 0127-smmu-acr\n");
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index a742d75..b34732d 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -359,6 +359,7 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_SMR(n)          (0x800u + ((n) * 4u))
+ #define PG_SMMU_S2CR(n)         (0xc00u + ((n) * 4u))
+ #define PG_SMMU_CB_FSR          0x058u
++#define PG_SMMU_sACR            0x010u
+ 
+ #define PG_SMMU_IDR0_NUMSMRG_SHIFT  0
+ #define PG_SMMU_IDR0_NUMSMRG_MASK   0xffu
+@@ -373,7 +374,12 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S2CR_TYPE_MASK      0x3u
+ #define PG_SMMU_S2CR_CBNDX_MASK     0xffu
+ #define PG_SMMU_S2CR_TYPE_BYPASS    (1u << PG_SMMU_S2CR_TYPE_SHIFT)
++#define PG_SMMU_S2CR_SHCFG_NSH      (3u << 8)
++#define PG_SMMU_S2CR_BYPASS_NSH     (PG_SMMU_S2CR_TYPE_BYPASS | \
++                                     PG_SMMU_S2CR_SHCFG_NSH | 0xffu)
+ #define PG_SMMU_SMR_VALID           (1u << 31)
++#define PG_SMMU_sCR0_CLIENTPD       (1u << 0)
++#define PG_SMMU_ACR_CACHE_LOCK      (1u << 26)
+ 
+ /*
+  * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
+@@ -597,7 +603,7 @@ pg_pdc_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0126 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0127 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1600,29 +1606,91 @@ pg_hfi_alloc(void)
+ static bool
+ pg_hfi_smmu_bypass(void)
+ {
+-	uint32_t scr0, smr3, smr4, s2cr3, s2cr4;
++	uint32_t scr0, acr, acr_after, smr3, smr4, s2cr3, s2cr4;
++	uint32_t idr0, idr1, idr2, idr7;
+ 	unsigned int i;
+ 
+ 	if (!pg_smmu_map()) {
+ 		return false;
+ 	}
+ 	scr0 = pg_rd32(pg_smmu_regs, 0x000u);
++	acr = pg_rd32(pg_smmu_regs, PG_SMMU_sACR);
+ 	smr3 = pg_rd32(pg_smmu_regs, PG_SMMU_SMR(3));
+ 	smr4 = pg_rd32(pg_smmu_regs, PG_SMMU_SMR(4));
+ 	s2cr3 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(3));
+ 	s2cr4 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(4));
+-	printf("POLARIS PWR: SMMU bypass before sCR0=0x%08x SMR3=0x%08x "
+-	    "SMR4=0x%08x S2CR3=0x%08x S2CR4=0x%08x\n",
+-	    scr0, smr3, smr4, s2cr3, s2cr4);
+-
+-	/* Program the bypass type before making either SMR entry valid. */
+-	pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(3),
+-	    PG_SMMU_S2CR_TYPE_BYPASS | 0xffu, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(4),
+-	    PG_SMMU_S2CR_TYPE_BYPASS | 0xffu, 3);
++	idr0 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR0);
++	idr1 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR1);
++	idr2 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR2);
++	idr7 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR7);
++	printf("POLARIS PWR: SMMU bypass before sCR0=0x%08x sACR=0x%08x "
++	    "SMR3=0x%08x SMR4=0x%08x S2CR3=0x%08x S2CR4=0x%08x\n",
++	    scr0, acr, smr3, smr4, s2cr3, s2cr4);
++	printf("POLARIS PWR: SMMU ids IDR0=0x%08x IDR1=0x%08x IDR2=0x%08x "
++	    "IDR7=0x%08x\n", idr0, idr1, idr2, idr7);
++
++	/*
++	 * MMU-500r2+ can leave ACR.CACHE_LOCK set. The vendor driver clears
++	 * this before touching translation state. If the bit is hard-wired by
++	 * the secure monitor, the readback below will still have bit 26 set
++	 * and the S2CR store is not trusted.
++	 */
++	pg_sync_checkpoint("smmu-before-acr");
++	acr_after = acr & ~PG_SMMU_ACR_CACHE_LOCK;
++	pg_wr32(pg_smmu_regs, PG_SMMU_sACR, acr_after, 3);
++	acr_after = pg_rd32(pg_smmu_regs, PG_SMMU_sACR);
++	printf("POLARIS PWR: SMMU sACR 0x%08x->0x%08x cache_lock=%u\n",
++	    acr, acr_after, (acr_after & PG_SMMU_ACR_CACHE_LOCK) ? 1u : 0u);
++	pg_sync_checkpoint("smmu-acr-cleared");
++
++	/*
++	 * Program the bypass type before making either SMR entry valid. The
++	 * S2CR value follows arm_smmu_write_s2cr(): TYPE=BYPASS, SHCFG=NSH,
++	 * CBNDX=0xff. Read each store back immediately because a write that is
++	 * silently dropped used to be indistinguishable from a later reset.
++	 */
++	pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(3), PG_SMMU_S2CR_BYPASS_NSH, 3);
++	s2cr3 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(3));
++	printf("POLARIS PWR: SMMU S2CR3 write=0x%08x readback=0x%08x\n",
++	    PG_SMMU_S2CR_BYPASS_NSH, s2cr3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(4), PG_SMMU_S2CR_BYPASS_NSH, 3);
++	s2cr4 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(4));
++	printf("POLARIS PWR: SMMU S2CR4 write=0x%08x readback=0x%08x\n",
++	    PG_SMMU_S2CR_BYPASS_NSH, s2cr4);
++
++	/*
++	 * If CLIENTPD gates the update path on this integration, disable the
++	 * clients, repeat the update, then restore the original sCR0 value.
++	 * Only do this when the first store did not take effect.
++	 */
++	if (((s2cr3 >> PG_SMMU_S2CR_TYPE_SHIFT) &
++	    PG_SMMU_S2CR_TYPE_MASK) != 1u ||
++	    ((s2cr4 >> PG_SMMU_S2CR_TYPE_SHIFT) &
++	    PG_SMMU_S2CR_TYPE_MASK) != 1u) {
++		pg_wr32(pg_smmu_regs, 0x000u,
++		    scr0 | PG_SMMU_sCR0_CLIENTPD, 3);
++		pg_sync_checkpoint("smmu-clientpd-on");
++		pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(3),
++		    PG_SMMU_S2CR_BYPASS_NSH, 3);
++		pg_wr32(pg_smmu_regs, PG_SMMU_S2CR(4),
++		    PG_SMMU_S2CR_BYPASS_NSH, 3);
++		s2cr3 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(3));
++		s2cr4 = pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(4));
++		pg_wr32(pg_smmu_regs, 0x000u, scr0, 3);
++		pg_sync_checkpoint("smmu-clientpd-off");
++		printf("POLARIS PWR: SMMU S2CR retry with CLIENTPD "
++		    "S2CR3=0x%08x S2CR4=0x%08x sCR0=0x%08x\n",
++		    s2cr3, s2cr4, pg_rd32(pg_smmu_regs, 0x000u));
++	}
++
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_SMR(3), PG_SMMU_SMR_VALID | 5u, 3);
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_SMR(4), PG_SMMU_SMR_VALID | 4u, 3);
+ 	__sync_synchronize();
++	smr3 = pg_rd32(pg_smmu_regs, PG_SMMU_SMR(3));
++	smr4 = pg_rd32(pg_smmu_regs, PG_SMMU_SMR(4));
++	printf("POLARIS PWR: SMMU SMR3 readback=0x%08x SMR4 readback=0x%08x\n",
++	    smr3, smr4);
++	pg_sync_checkpoint("smmu-s2cr-smr-written");
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_TLBIALLNSNH, 1, 3);
+ 	for (i = 0; i < 100u; i++) {
+ 		if ((pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS) & 1u) == 0) {
+@@ -1637,6 +1705,10 @@ pg_hfi_smmu_bypass(void)
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(3)),
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_S2CR(4)),
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS));
++	printf("POLARIS PWR: SMMU bypass final sCR0=0x%08x sACR=0x%08x "
++	    "GFSR=0x%08x\n", pg_rd32(pg_smmu_regs, 0x000u),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_sACR),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_GFSR));
+ 	return true;
+ }
+ 
+@@ -1906,6 +1978,7 @@ pg_hfi_ctrl_init(void)
+ {
+ 	uint32_t mask = 0, status = 0;
+ 	uint32_t init_rd = 0;
++	uint32_t intr_info = 0;
+ 	uint32_t version = 0, qtbl_addr = 0, qtbl_info = 0, sfr = 0;
+ 	unsigned int i;
+ 
+@@ -1918,10 +1991,13 @@ pg_hfi_ctrl_init(void)
+ 	 */
+ 	pg_sync_checkpoint("ctrl-before-init-write");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_HFI_CTRL_INIT, 1, 3);
++	pg_sync_checkpoint("ctrl-after-init-store");
+ 	init_rd = pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_INIT);
++	pg_sync_checkpoint("ctrl-after-init-read");
++	intr_info = pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO);
++	pg_sync_checkpoint("ctrl-after-intr-info");
+ 	printf("POLARIS PWR: HFI CTRL_INIT write=1 readback=0x%08x "
+-	    "intr_info=0x%08x\n", init_rd,
+-	    pg_rd32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_INFO));
++	    "intr_info=0x%08x\n", init_rd, intr_info);
+ 	pg_sync_checkpoint("ctrl-after-init-write");
+ 	pg_sync_checkpoint("ctrl-before-poll");
+ 	status = pg_rd32(pg_gmu_regs, PG_GMU_HFI_CTRL_STATUS);
+@@ -1978,7 +2054,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0126-gxgdsc polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0127-smmu-acr polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -2196,7 +2272,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0126 build polarispwr=%d rpmh=%d\n", pwrlevel,
++	printf("POLARIS PWR: 0127 build polarispwr=%d rpmh=%d\n", pwrlevel,
+ 	    rpmh_on);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
