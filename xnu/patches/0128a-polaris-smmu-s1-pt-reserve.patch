@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index b7a73dd..1d1c69d 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -422,6 +422,12 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S1_SECTION_SIZE     0x00100000u
+ #define PG_SMMU_S1_SECTIONS         4u
+ #define PG_SMMU_S1_DESC_FLAGS       0x00010c06u
++/*
++ * 0128a: the L1 table lives in the ADT-reserved GPU-S1PT range. The address
++ * must match package_0128a.py's memory_map_entries; it is deliberately not
++ * obtained from kmem_alloc_contig(), which returned KERN_INVALID_ARGUMENT.
++ */
++#define PG_SMMU_S1_PT_PA            0x8c428000ull
+ 
+ /*
+  * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
+@@ -645,7 +651,7 @@ pg_pdc_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0128 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0128a checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1771,13 +1777,11 @@ pg_hfi_smmu_stage1(void)
+ 		PG_SMMU_MAX_LEVEL, PG_SMMU_MAX_LEVEL - 1u, 2u, 1u, 0u
+ 	};
+ 	vm_offset_t va = 0;
+-	ppnum_t pn, max_pnum;
+ 	uint64_t pt_pa, win_pa;
+ 	volatile uint32_t *pt;
+ 	uint32_t i, idx, first, cbndx = 0, s2cr3, s2cr4, val;
+ 	uint32_t cbar, sctlr, fsr;
+ 	bool have_cb = false;
+-	kern_return_t kr;
+ 
+ 	if (!pg_smmu_map() || !pg_hfi.ready) {
+ 		printf("POLARIS PWR: SMMU S1 missing SMMU map or HFI table\n");
+@@ -1791,31 +1795,28 @@ pg_hfi_smmu_stage1(void)
+ 
+ 	/*
+ 	 * TTBR0 must point at a 16 KiB-aligned L1 table whose descriptors are
+-	 * indexed by VA[31:20]. The allocation is contiguous, zero-filled and
+-	 * physically aligned to its own size.
++	 * indexed by VA[31:20]. 0128's kmem_alloc_contig() attempt returned
++	 * kr=3, so 0128a uses the ADT-reserved GPU-S1PT range instead. The
++	 * page is outside XNU-managed RAM and is mapped uncached with
++	 * ml_io_map(); the handoff reservation is permanent for this boot.
+ 	 */
+-	pg_sync_checkpoint("s1-pt-alloc");
+-	max_pnum = (ppnum_t)((0x100000000ull >> PAGE_SHIFT) - 1ull);
+-	kr = kmem_alloc_contig(kernel_map, &va, PG_SMMU_S1_PT_SIZE, 0x3fffull,
+-	    max_pnum, (ppnum_t)((PG_SMMU_S1_PT_SIZE >> PAGE_SHIFT) - 1u),
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
+-	if (kr != KERN_SUCCESS || va == 0) {
+-		printf("POLARIS PWR: SMMU S1 page table allocation failed "
+-		    "kr=%d\n", kr);
+-		return false;
+-	}
+-	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+-	if (pn == 0) {
+-		printf("POLARIS PWR: SMMU S1 page table has no physical page\n");
++	pg_sync_checkpoint("s1-pt-map");
++	va = ml_io_map((vm_offset_t)PG_SMMU_S1_PT_PA, PG_SMMU_S1_PT_SIZE);
++	if (va == 0) {
++		printf("POLARIS PWR: SMMU S1 pt map failed pa=0x%llx\n",
++		    PG_SMMU_S1_PT_PA);
+ 		return false;
+ 	}
+-	pt_pa = ptoa_64(pn);
++	pt_pa = PG_SMMU_S1_PT_PA;
+ 	if ((pt_pa & (PG_SMMU_S1_PT_SIZE - 1u)) != 0 ||
+ 	    pt_pa + PG_SMMU_S1_PT_SIZE > 0x100000000ull) {
+ 		printf("POLARIS PWR: SMMU S1 page table pa=0x%llx is not "
+ 		    "16K-aligned below 4 GiB\n", pt_pa);
+ 		return false;
+ 	}
++	pg_sync_checkpoint("s1-pt-mapped");
++	printf("POLARIS PWR: SMMU S1 pt reserved pa=0x%llx va=0x%llx\n",
++	    pt_pa, (uint64_t)va);
+ 
+ 	pt = (volatile uint32_t *)va;
+ 	for (i = 0; i < PG_SMMU_S1_PT_SIZE / 4u; i++) {
+@@ -1832,7 +1833,6 @@ pg_hfi_smmu_stage1(void)
+ 		    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) & 0xfff00000u) |
+ 		    PG_SMMU_S1_DESC_FLAGS;
+ 	}
+-	flush_dcache64((addr64_t)pt_pa, PG_SMMU_S1_PT_SIZE, 1);
+ 	__sync_synchronize();
+ 	pg_sync_checkpoint("s1-pt-filled");
+ 	printf("POLARIS PWR: SMMU S1 pt pa=0x%llx win=0x%08x first=%u "
+@@ -2289,7 +2289,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0128-smmu-s1 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0128a-smmu-s1 polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -2507,7 +2507,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0128 build polarispwr=%d rpmh=%d\n", pwrlevel,
++	printf("POLARIS PWR: 0128a build polarispwr=%d rpmh=%d\n", pwrlevel,
+ 	    rpmh_on);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
