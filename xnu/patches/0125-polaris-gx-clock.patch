@@ -1,0 +1,256 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index b9589c5..ef49290 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -281,7 +281,7 @@ polaris_gpu_init(void)
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: build 0124-hfi8\n");
++	printf("POLARIS GPU: build 0125-gxclk\n");
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 75416e6..cde6996 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -74,6 +74,22 @@ extern void sweet_log_sync(void);
+ #define PG_GMU_CLK_CMD   (0x1120u - PG_GPUCC_PAGE_OFFSET)
+ #define PG_GMU_CLK_CFG   (0x1124u - PG_GPUCC_PAGE_OFFSET)
+ 
++/*
++ * 0125: GX core clock (vendor gpu_cc_gx_gfx3d_clk).
++ *   gfx3d_clk_src cmd_rcgr = 0x101c (cmd 0x101c, cfg 0x1020, m/n/d 0x1024..)
++ *   gfx3d_clk branch halt_reg = enable_reg = 0x1054, enable_mask = BIT(0)
++ *   gx_gdscr = 0x100c, gx_clamp_io = 0x1508
++ * Offsets are relative to the mapped GPUCC page at +0x1000.
++ */
++#define PG_GX_GDSCR        (0x100cu - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_CLAMP_IO     (0x1508u - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_GFX3D_CMD    (0x101cu - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_GFX3D_CFG    (0x1020u - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_GFX3D_M      (0x1024u - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_GFX3D_N      (0x1028u - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_GFX3D_D      (0x102cu - PG_GPUCC_PAGE_OFFSET)
++#define PG_GX_GFX3D_CBCR   (0x1054u - PG_GPUCC_PAGE_OFFSET)
++
+ #if (PG_GPUCC_MAP + PG_GPUCC_MAP_SZ) > (PG_GPUCC_BASE + PG_GPUCC_WINDOW)
+ #error "the GPUCC power mapping would leave the documented window"
+ #endif
+@@ -574,7 +590,7 @@ pg_pdc_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0124 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0125 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -842,6 +858,135 @@ pg_clocks_rollback(uint32_t cbcr, uint32_t cmd, uint32_t cfg)
+ 	    "(cbcr=0x%08x cmd=0x%08x cfg=0x%08x)\n", rc, rm, rf);
+ }
+ 
++/*
++ * 0125: enable the GX core clock before CM3 release. 0124 showed the GMU
++ * CM3 alive but the gfx rail ack stuck at 0 and SPTPRAC status 0x94, whose
++ * bit 7 is GX_CLK_OFF (bit 6, GX_GDSC_POWER_OFF, is already clear). The
++ * vendor order in kgsl gmu_start() is GDSC, all GPUCC clocks including
++ * gpu_cc_gx_gfx3d_clk, then CM3 release.
++ *
++ * Try the branch bit alone first; the bootloader may have left the RCG
++ * parented. If the branch stays halted, program the RCG from GPLL0_OUT_MAIN
++ * (parent 5, divider 1), which is always available, and retry the branch.
++ * GX GDSC/clamp are left alone because the rail already reads powered.
++ */
++static int
++pg_gx_clk_on(void)
++{
++	uint32_t cbcr, cmd, cfg, value;
++	uint32_t cbcr_saved, cmd_saved, cfg_saved;
++	unsigned int i;
++
++	cbcr = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CBCR);
++	cmd = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD);
++	cfg = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CFG);
++	printf("POLARIS PWR: GX clk enter cbcr=0x%08x cmd=0x%08x cfg=0x%08x "
++	    "gdscr=0x%08x clamp=0x%08x m=%u n=%u d=%u\n",
++	    cbcr, cmd, cfg,
++	    pg_rd32(pg_cx_regs, PG_GX_GDSCR),
++	    pg_rd32(pg_cx_regs, PG_GX_CLAMP_IO),
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_M),
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_N),
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_D));
++	if ((cbcr & PG_CBCR_CLK_OFF) == 0) {
++		printf("POLARIS PWR: GX clk already on; CBCR=0x%08x\n", cbcr);
++		return 1;
++	}
++
++	cbcr_saved = cbcr;
++	cmd_saved = cmd;
++	cfg_saved = cfg;
++
++	/* Minimal step: branch enable only. */
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CBCR, cbcr | PG_CBCR_ENABLE, 3);
++	for (i = 0; i < PG_POLL_US; i++) {
++		cbcr = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CBCR);
++		if ((cbcr & PG_CBCR_CLK_OFF) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i < PG_POLL_US) {
++		printf("POLARIS PWR: GX clk branch on (minimal); CBCR=0x%08x\n",
++		    cbcr);
++		return 1;
++	}
++	printf("POLARIS PWR: GX clk branch halted after %u polls; "
++	    "programming RCG (cmd=0x%08x cfg=0x%08x)\n", i,
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD),
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_CFG));
++
++	/* Root request; wait for ROOT_OFF to drop. */
++	cmd = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CMD, cmd | PG_RCG_CMD_ROOT_EN, 3);
++	for (i = 0; i < PG_RCG_POLL_US; i++) {
++		if ((pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD) &
++		    PG_RCG_CMD_ROOT_OFF) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_RCG_POLL_US) {
++		goto fail;
++	}
++
++	/* Integer divider mode: M/N/D = 0. */
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_M, 0, 3);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_N, 0, 3);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_D, 0, 3);
++
++	/* Parent 5 = GPLL0_OUT_MAIN, source divider 1. */
++	value = (5u << 8);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CFG, value, 3);
++	if (pg_rd32(pg_cx_regs, PG_GX_GFX3D_CFG) != value) {
++		goto fail;
++	}
++
++	/* Commit and wait for UPDATE to self-clear. */
++	cmd = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CMD,
++	    cmd | PG_RCG_CMD_ROOT_EN | PG_RCG_CMD_UPDATE, 3);
++	for (i = 0; i < PG_RCG_POLL_US; i++) {
++		cmd = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD);
++		if ((cmd & (PG_RCG_CMD_UPDATE | PG_RCG_CMD_DIRTY_CFG)) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_RCG_POLL_US) {
++		goto fail;
++	}
++
++	/* Retry the branch with a valid parent. */
++	cbcr = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CBCR);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CBCR, cbcr | PG_CBCR_ENABLE, 3);
++	for (i = 0; i < PG_POLL_US; i++) {
++		cbcr = pg_rd32(pg_cx_regs, PG_GX_GFX3D_CBCR);
++		if ((cbcr & PG_CBCR_CLK_OFF) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	if (i == PG_POLL_US) {
++		goto fail;
++	}
++	printf("POLARIS PWR: GX clk on; CBCR=0x%08x cmd=0x%08x cfg=0x%08x\n",
++	    cbcr, pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD),
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_CFG));
++	return 1;
++
++fail:
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CBCR, cbcr_saved, 3);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CFG, cfg_saved, 3);
++	pg_wr32(pg_cx_regs, PG_GX_GFX3D_CMD, cmd_saved | PG_RCG_CMD_UPDATE, 3);
++	printf("POLARIS PWR: GX clk enable failed; restored "
++	    "(cbcr=0x%08x cmd=0x%08x cfg=0x%08x)\n",
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_CBCR),
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_CMD),
++	    pg_rd32(pg_cx_regs, PG_GX_GFX3D_CFG));
++	return 0;
++}
++
+ int
+ polaris_gpu_clocks_enter(void)
+ {
+@@ -952,11 +1097,22 @@ polaris_gpu_clocks_enter(void)
+ 		return 0;
+ 	}
+ 
+-	pg_clk_owned = 1;
+ 	printf("POLARIS PWR: gmu clock source root on; cfg=0x%08x\n",
+ 	    pg_rd32(pg_cx_regs, PG_GMU_CLK_CFG));
+ 	printf("POLARIS PWR: gmu branch enabled; CBCR=0x%08x\n",
+ 	    pg_rd32(pg_cx_regs, PG_CX_GMU_CBCR));
++
++	/*
++	 * 0125: the GMU branch is up; now give the GX domain its core clock
++	 * before CM3 release (kgsl gmu_start order). A failure here rolls the
++	 * GMU clock back rather than leaving a half-configured domain.
++	 */
++	if (!pg_gx_clk_on()) {
++		pg_clocks_rollback(pg_cbcr_saved, pg_cmd_saved, pg_cfg_saved);
++		pg_pll1_exit();
++		return 0;
++	}
++	pg_clk_owned = 1;
+ 	return 1;
+ }
+ 
+@@ -1605,8 +1761,12 @@ static bool
+ pg_gmu_gfx_rail_on(void)
+ {
+ 	uint32_t info = 0;
++	uint32_t misc;
+ 	unsigned int i;
+ 
++	misc = pg_rd32(pg_gmu_regs, PG_GMU_REG(0x24542u));
++	printf("POLARIS PWR: GX_DOMAIN_MISC=0x%08x clamp_io=%u before OOB\n",
++	    misc, misc & 1u);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_BOOT_SLUMBER_OPTION, 0, 3);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_GX_VOTE_IDX, PG_GMU_GX_VOTE_DEFAULT, 3);
+ 	pg_wr32(pg_gmu_regs, PG_GMU_MX_VOTE_IDX, PG_GMU_MX_VOTE_DEFAULT, 3);
+@@ -1619,12 +1779,13 @@ pg_gmu_gfx_rail_on(void)
+ 		DELAY(1000);
+ 	}
+ 	pg_wr32(pg_gmu_regs, PG_GMU_GMU2HOST_INTR_CLR, 1u << 30, 3);
++	misc = pg_rd32(pg_gmu_regs, PG_GMU_REG(0x24542u));
+ 	printf("POLARIS PWR: GMU gfx rail OOB option=%u gx=%u mx=%u "
+-	    "ack=%u info=0x%08x\n",
++	    "ack=%u info=0x%08x misc=0x%08x clamp_io=%u\n",
+ 	    pg_rd32(pg_gmu_regs, PG_GMU_BOOT_SLUMBER_OPTION),
+ 	    pg_rd32(pg_gmu_regs, PG_GMU_GX_VOTE_IDX),
+ 	    pg_rd32(pg_gmu_regs, PG_GMU_MX_VOTE_IDX),
+-	    (info & (1u << 30)) != 0, info);
++	    (info & (1u << 30)) != 0, info, misc, misc & 1u);
+ 	return (info & (1u << 30)) != 0;
+ }
+ 
+@@ -1743,7 +1904,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0124-hfi8 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0125-gxclk polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -1961,7 +2122,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0124 build polarispwr=%d rpmh=%d\n", pwrlevel,
++	printf("POLARIS PWR: 0125 build polarispwr=%d rpmh=%d\n", pwrlevel,
+ 	    rpmh_on);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
