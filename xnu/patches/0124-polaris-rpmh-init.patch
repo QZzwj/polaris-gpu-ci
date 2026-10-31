@@ -1,0 +1,304 @@
+diff --git a/bsd/dev/polaris_gpu.c b/bsd/dev/polaris_gpu.c
+index ae11fe1..b9589c5 100644
+--- a/bsd/dev/polaris_gpu.c
++++ b/bsd/dev/polaris_gpu.c
+@@ -281,7 +281,7 @@ polaris_gpu_init(void)
+ 	if (optin != 1 || polaris_gpu.state != POLARIS_GPU_OFF) {
+ 		return;
+ 	}
+-	printf("POLARIS GPU: build 0123-hfi7\n");
++	printf("POLARIS GPU: build 0124-hfi8\n");
+ 	polaris_gpu.state = POLARIS_GPU_STARTING;
+ 	if (!polaris_gpu_enter(&polaris_gpu, POLARIS_GPU_BOARD)) {
+ 		goto fail;
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index a0805a5..75416e6 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -154,11 +154,52 @@ extern void sweet_log_sync(void);
+ #define PG_GMU_GENERAL_7           PG_GMU_REG(0x1f9ccu)
+ #define PG_GMU_AO_HOST_INTR_STATUS PG_GMU_REG(0x23b05u)
+ #define PG_GMU_AO_HOST_INTR_MASK   PG_GMU_REG(0x23b06u)
++#define PG_GMU_RSCC_CONTROL_REQ    PG_GMU_REG(0x23b07u)
+ #define PG_GMU_RSCC_CONTROL_ACK    PG_GMU_REG(0x23b08u)
+ #define PG_GMU_GPU_CX_BUSY_STATUS  PG_GMU_REG(0x23b0cu)
+ #define PG_GMU_AHB_FENCE_RANGE_0   PG_GMU_REG(0x23b11u)
+ #define PG_GMU_AHB_FENCE_STATUS    PG_GMU_REG(0x23b13u)
+ 
++/*
++ * 0124: RSCC/PDC registers used by mainline a6xx_gmu_rpmh_init(). The RSCC
++ * block lives at GMU window +0x23000; the PDC block is the second reg range
++ * of the SDM845 gmu node, <0x0b200000 0x300000>.
++ */
++#define PG_GMU_RSCC_RSC_STATUS0_DRV0     PG_GMU_REG(0x23404u)
++#define PG_GMU_RSCC_PDC_SEQ_START_ADDR   PG_GMU_REG(0x23408u)
++#define PG_GMU_RSCC_PDC_MATCH_VALUE_LO   PG_GMU_REG(0x23409u)
++#define PG_GMU_RSCC_PDC_MATCH_VALUE_HI   PG_GMU_REG(0x2340au)
++#define PG_GMU_RSCC_PDC_SLAVE_ID_DRV0    PG_GMU_REG(0x2340bu)
++#define PG_GMU_RSCC_HIDDEN_TCS_CMD0_ADDR PG_GMU_REG(0x2340du)
++#define PG_GMU_RSCC_HIDDEN_TCS_CMD0_DATA PG_GMU_REG(0x2340eu)
++#define PG_GMU_RSCC_HIDDEN_TCS_CMD1_ADDR PG_GMU_REG(0x2340fu)
++#define PG_GMU_RSCC_HIDDEN_TCS_CMD1_DATA PG_GMU_REG(0x23410u)
++#define PG_GMU_RSCC_HIDDEN_TCS_CMD2_ADDR PG_GMU_REG(0x23411u)
++#define PG_GMU_RSCC_HIDDEN_TCS_CMD2_DATA PG_GMU_REG(0x23412u)
++#define PG_GMU_RSCC_OVERRIDE_START_ADDR  PG_GMU_REG(0x23500u)
++#define PG_GMU_RSCC_SEQ_BUSY_DRV0        PG_GMU_REG(0x23501u)
++#define PG_GMU_RSCC_SEQ_MEM_0_DRV0       PG_GMU_REG(0x23580u)
++
++#define PG_PDC_BASE             0x0b200000ull
++#define PG_PDC_WINDOW           0x300000u
++#define PG_PDC_REG(n)           ((uint32_t)((n) * 4u))
++#define PG_PDC_GPU_TCS1_CMD_ENABLE_BANK     PG_PDC_REG(0x21572u)
++#define PG_PDC_GPU_TCS1_CMD_WAIT_FOR_CMPL_BANK PG_PDC_REG(0x21573u)
++#define PG_PDC_GPU_TCS1_CONTROL            PG_PDC_REG(0x21574u)
++#define PG_PDC_GPU_TCS1_CMD0_MSGID         PG_PDC_REG(0x21575u)
++#define PG_PDC_GPU_TCS1_CMD0_ADDR          PG_PDC_REG(0x21576u)
++#define PG_PDC_GPU_TCS1_CMD0_DATA          PG_PDC_REG(0x21577u)
++#define PG_PDC_GPU_TCS3_CMD_ENABLE_BANK     PG_PDC_REG(0x215d6u)
++#define PG_PDC_GPU_TCS3_CMD_WAIT_FOR_CMPL_BANK PG_PDC_REG(0x215d7u)
++#define PG_PDC_GPU_TCS3_CONTROL            PG_PDC_REG(0x215d8u)
++#define PG_PDC_GPU_TCS3_CMD0_MSGID         PG_PDC_REG(0x215d9u)
++#define PG_PDC_GPU_TCS3_CMD0_ADDR          PG_PDC_REG(0x215dau)
++#define PG_PDC_GPU_TCS3_CMD0_DATA          PG_PDC_REG(0x215dbu)
++#define PG_PDC_GPU_SEQ_MEM_0               PG_PDC_REG(0x0a0000u)
++#define PG_PDC_GPU_SEQ_START_ADDR          PG_PDC_REG(0x21148u)
++#define PG_PDC_GPU_ENABLE_PDC              PG_PDC_REG(0x21140u)
++#define PG_PDC_GPU_A630_ADDRESS_OFFSET     0x30080u
++
+ /*
+  * Mainline a6xx_gmu_power_config()/a6xx_gmu_gfx_rail_on()/
+  * a6xx_sptprac_enable() registers. All of these are programmed before
+@@ -363,6 +404,7 @@ static volatile uint32_t *pg_gcc_gfx_regs;
+ static volatile uint32_t *pg_gmu_regs;
+ static volatile uint32_t *pg_gmu_fw_regs;
+ static volatile uint32_t *pg_smmu_regs;
++static volatile uint32_t *pg_pdc_regs;
+ static uint32_t pg_cx_saved;
+ static int pg_cx_owned;
+ 
+@@ -505,8 +547,26 @@ pg_gmu_map(void)
+ 	return true;
+ }
+ 
++static bool
++pg_pdc_map(void)
++{
++	vm_offset_t virt;
++
++	if (pg_pdc_regs != NULL) {
++		return true;
++	}
++	virt = ml_io_map(PG_PDC_BASE, PG_PDC_WINDOW);
++	if (virt == 0) {
++		printf("POLARIS PWR: cannot map GPU PDC CSRs; "
++		    "RPMh init skipped\n");
++		return false;
++	}
++	pg_pdc_regs = (volatile uint32_t *)virt;
++	return true;
++}
++
+ /*
+- * 0123 bisection aid: make the console line and the persistent ring durable
++ * 0124 bisection aid: make the console line and the persistent ring durable
+  * before the next GMU/SMMU register access. A wedged interconnect leaves no
+  * chance for the once-a-second log thread to flush, so every checkpoint is
+  * synchronously written to the sweetlog area.
+@@ -514,7 +574,7 @@ pg_gmu_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0123 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0124 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1393,6 +1453,117 @@ pg_gmu_power_config(int level)
+ 	}
+ }
+ 
++/*
++ * 0124: mainline a6xx_gmu_rpmh_init(). The GMU firmware votes through the
++ * RSC/PDC sequencer as soon as it starts; without this programming the first
++ * RPMh transaction faults the CM3. The sequence is copied from
++ * a6xx_gmu_rpmh_init() for a630 (pdc_address_offset 0x30080).
++ */
++static bool
++pg_gmu_rpmh_init(void)
++{
++	static const uint32_t rscc_seq[5] = {
++		0xa7a506a0u, 0xa1e6a6e7u, 0xa2e081e1u, 0xe9a982e2u,
++		0x0020e8a8u
++	};
++	static const uint32_t pdc_seq[5] = {
++		0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u,
++		0x002081fcu
++	};
++	uint32_t status0_before, seq_busy_before, ack_before;
++	uint32_t pdc_en_before;
++	unsigned int i;
++
++	if (!pg_pdc_map()) {
++		return false;
++	}
++	status0_before = pg_rd32(pg_gmu_regs, PG_GMU_RSCC_RSC_STATUS0_DRV0);
++	seq_busy_before = pg_rd32(pg_gmu_regs, PG_GMU_RSCC_SEQ_BUSY_DRV0);
++	ack_before = pg_rd32(pg_gmu_regs, PG_GMU_RSCC_CONTROL_ACK);
++	pdc_en_before = pg_rd32(pg_pdc_regs, PG_PDC_GPU_ENABLE_PDC);
++	printf("POLARIS PWR: RPMh init before status0=0x%08x seq_busy=0x%08x "
++	    "ack=0x%08x pdc_en=0x%08x\n", status0_before, seq_busy_before,
++	    ack_before, pdc_en_before);
++
++	/* Disable SDE clock gating and set up the RSC/PDC handshake. */
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_RSC_STATUS0_DRV0, 1u << 24, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_PDC_SLAVE_ID_DRV0, 1, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_HIDDEN_TCS_CMD0_DATA, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_HIDDEN_TCS_CMD0_ADDR, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_HIDDEN_TCS_CMD1_DATA, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_HIDDEN_TCS_CMD1_ADDR, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_HIDDEN_TCS_CMD2_DATA, 0x80000000u, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_HIDDEN_TCS_CMD2_ADDR, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_OVERRIDE_START_ADDR, 0, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_PDC_SEQ_START_ADDR, 0x4520u, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_PDC_MATCH_VALUE_LO, 0x4510u, 3);
++	pg_wr32(pg_gmu_regs, PG_GMU_RSCC_PDC_MATCH_VALUE_HI, 0x4514u, 3);
++
++	for (i = 0; i < 5u; i++) {
++		pg_wr32(pg_gmu_regs, PG_GMU_RSCC_SEQ_MEM_0_DRV0 + i * 4u,
++		    rscc_seq[i], 3);
++	}
++	pg_sync_checkpoint("rpmh-rscc-done");
++
++	/* Load the PDC sequencer uCode and its TCS commands. */
++	for (i = 0; i < 5u; i++) {
++		pg_wr32(pg_pdc_regs, PG_PDC_GPU_SEQ_MEM_0 + i * 4u,
++		    pdc_seq[i], 3);
++	}
++	pg_sync_checkpoint("rpmh-pdc-seq");
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD_ENABLE_BANK, 7, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD_WAIT_FOR_CMPL_BANK, 0, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CONTROL, 0, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_MSGID, 0x10108u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_ADDR, 0x30010u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_DATA, 1, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_MSGID + 16u, 0x10108u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_ADDR + 16u, 0x30000u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_DATA + 16u, 0, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_MSGID + 32u, 0x10108u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_ADDR + 32u,
++	    PG_PDC_GPU_A630_ADDRESS_OFFSET, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS1_CMD0_DATA + 32u, 0, 3);
++	pg_sync_checkpoint("rpmh-tcs1");
++
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD_ENABLE_BANK, 7, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD_WAIT_FOR_CMPL_BANK, 0, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CONTROL, 0, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_MSGID, 0x10108u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_ADDR, 0x30010u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_DATA, 2, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_MSGID + 16u, 0x10108u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_ADDR + 16u, 0x30000u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_DATA + 16u, 3, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_MSGID + 32u, 0x10108u, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_ADDR + 32u,
++	    PG_PDC_GPU_A630_ADDRESS_OFFSET, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_TCS3_CMD0_DATA + 32u, 3, 3);
++	pg_sync_checkpoint("rpmh-tcs3");
++
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_SEQ_START_ADDR, 0, 3);
++	pg_wr32(pg_pdc_regs, PG_PDC_GPU_ENABLE_PDC, 0x80000001u, 3);
++	__sync_synchronize();
++	pg_sync_checkpoint("rpmh-enabled");
++
++	printf("POLARIS PWR: RPMh init done status0=0x%08x slave=0x%08x "
++	    "seq_start=0x%08x match=0x%08x/0x%08x seq_mem0=0x%08x "
++	    "seq_busy=0x%08x ack=0x%08x pdc_en=0x%08x tcs1=0x%08x "
++	    "tcs3=0x%08x\n",
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_RSC_STATUS0_DRV0),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_PDC_SLAVE_ID_DRV0),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_PDC_SEQ_START_ADDR),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_PDC_MATCH_VALUE_LO),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_PDC_MATCH_VALUE_HI),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_SEQ_MEM_0_DRV0),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_SEQ_BUSY_DRV0),
++	    pg_rd32(pg_gmu_regs, PG_GMU_RSCC_CONTROL_ACK),
++	    pg_rd32(pg_pdc_regs, PG_PDC_GPU_ENABLE_PDC),
++	    pg_rd32(pg_pdc_regs, PG_PDC_GPU_TCS1_CONTROL),
++	    pg_rd32(pg_pdc_regs, PG_PDC_GPU_TCS3_CONTROL));
++	return true;
++}
++
+ /*
+  * 0123: report and clear a CM3 firmware fault without masking the next step.
+  * BIT(23) of GMU2HOST_INTR_INFO is HFI_IRQ_CM3_FAULT_MASK in the vendor HFI
+@@ -1572,7 +1743,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0123-hfi7 polarishfi=%d\n", hfion);
++	printf("POLARIS PWR: HFI start build 0124-hfi8 polarishfi=%d\n", hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+ 		return 0;
+@@ -1736,6 +1907,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	uint32_t last = 0;
+ 	unsigned int i;
+ 	int optin = 0, gpuon = 0, hfion = 0, hfi_smmu = 0;
++	int rpmh_on = 0, rpmh_ok = 0;
+ 	int ctrl_ok = 0;
+ 	int gfx_ok = 0, sptprac_ok = 0;
+ 	int pwrlevel = 0;
+@@ -1764,6 +1936,10 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (hfi_smmu != 1) {
+ 		hfi_smmu = 0;
+ 	}
++	(void)PE_parse_boot_argn("polarisrpmh", &rpmh_on, sizeof(rpmh_on));
++	if (rpmh_on != 1) {
++		rpmh_on = 0;
++	}
+ 	if (hfion != 0) {
+ 		pg_hfi_reserved_pa = hfi_pa;
+ 		pg_hfi_reserved_size = hfi_size;
+@@ -1785,12 +1961,18 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0123 build polarispwr=%d\n", pwrlevel);
++	printf("POLARIS PWR: 0124 build polarispwr=%d rpmh=%d\n", pwrlevel,
++	    rpmh_on);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
+ 		return 0;
+ 	}
+ 	pg_sync_checkpoint("gmu-mapped");
++	if (rpmh_on != 0) {
++		pg_sync_checkpoint("before-rpmh-init");
++		rpmh_ok = pg_gmu_rpmh_init();
++		pg_sync_checkpoint("after-rpmh-init");
++	}
+ 	if (pg_gmu_fw_regs == NULL) {
+ 		virt = ml_io_map((vm_offset_t)pa, PG_GMU_FW_SIZE);
+ 		if (virt == 0) {
+@@ -1946,12 +2128,12 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		    init_result, busy, cfg, general7, hfi_status,
+ 		    ctrl_ok ? "initialized" : "not initialized");
+ 		printf("POLARIS PWR: HFI table pa=0x%llx va=0x%llx ctrl=0x%08x "
+-		    "qtbl_info=0x%08x sfr=0x%08x gfx=%d sptprac=%d\n",
++		    "qtbl_info=0x%08x sfr=0x%08x gfx=%d sptprac=%d rpmh=%d\n",
+ 		    pg_hfi.pa,
+ 		    (uint64_t)pg_hfi.va, hfi_status,
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_HFI_QTBL_INFO),
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_HFI_SFR_ADDR),
+-		    gfx_ok, sptprac_ok);
++		    gfx_ok, sptprac_ok, rpmh_ok);
+ 	} else {
+ 		printf("POLARIS PWR: GMU boot complete init=0x%08x fw_busy=0x%08x "
+ 		    "cfg=0x%08x general7=0x%08x hfi_status=0x%08x; "
+@@ -2176,6 +2358,7 @@ pg_pwr_test_reset(void)
+ 	pg_gmu_regs = NULL;
+ 	pg_gmu_fw_regs = NULL;
+ 	pg_smmu_regs = NULL;
++	pg_pdc_regs = NULL;
+ 	pg_bus_owned = 0;
+ 	pg_bus_axi_saved = 0;
+ 	pg_bus_memnoc_saved = 0;
