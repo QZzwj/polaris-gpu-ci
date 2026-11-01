@@ -1,0 +1,132 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 3bded65..7100e02 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -507,18 +507,19 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S1_PT_PA            0x8c428000ull
+ 
+ /*
+- * 0135 diagnostic window.  The CM3 faults at VA 0x106f8fbc4 while HFI
++ * 0137 diagnostic window.  The CM3 faults at VA 0x106f8fbc4 while HFI
+  * CTRL_INIT is running, i.e. physical 0x86f8fbc4 after the GMU's bit-31
+- * truncation.  One 2 MiB AArch64 block maps 0x06e00000-0x06ffffff (and
+- * equivalently 0x106e00000-0x106ffffff) onto the free low-DRAM window at
+- * 0x86e00000-0x86ffffff.  A host-visible page at the fault offset is
+- * filled with a sentinel before the CM3 is released.
++ * truncation.  The firmware heap starts at 0x06f8f000 and extends to the
++ * end of its 2 MiB slot.  0137 maps every remaining 4 KiB page of that
++ * slot to the AP-writable pool at 0x8c48f000-0x8c4fffff.
+  */
+ #define PG_GMU_HEAP_VA_BASE         0x06e00000u
+ #define PG_GMU_HEAP_SECTIONS        1u
+ #define PG_GMU_HEAP_WINDOW_PA       0x8c480000u
+ #define PG_GMU_HEAP_SCRATCH_PA      0x8c48f000ull
+-#define PG_GMU_HEAP_SCRATCH_SIZE    0x1000u
++#define PG_GMU_HEAP_L3_FIRST        0x18fu
++#define PG_GMU_HEAP_L3_LAST         0x1ffu
++#define PG_GMU_HEAP_SCRATCH_SIZE    0x71000u
+ #define PG_GMU_HEAP_SCRATCH_FILL    0xdeadbeefu
+ 
+ /*
+@@ -2586,7 +2587,7 @@ pg_hfi_smmu_stage1(void)
+ 		return false;
+ 	}
+ 	desc_flags = PG_SMMU_S1_A64_DESC_FLAGS;
+-	printf("POLARIS PWR: SMMU S1 0136 long desc flags=0x%llx ns=1 "
++	printf("POLARIS PWR: SMMU S1 0137 long desc flags=0x%llx ns=1 "
+ 	    "asid=5\n", desc_flags);
+ 
+ 	/*
+@@ -2638,12 +2639,12 @@ pg_hfi_smmu_stage1(void)
+ 	    PG_SMMU_S1_L2_4_OFF);
+ 
+ 	/*
+-	 * 0136: the GMU reaches the firmware heap through a bit-31-truncated
++	 * 0137: the GMU reaches the firmware heap through a bit-31-truncated
+ 	 * address: VA 0x106f8fbc4 is issued as 0x06f8fbc4.  0135 mapped that
+ 	 * 2 MiB slot to 0x86e00000, which lies inside the FDT
+ 	 * removed_region@86200000 and hangs the AP on first write.  Point
+-	 * both aliases at one shared L3 table and map only the heap page,
+-	 * VA offset 0x18f000, to the AP-writable 0x8c48f000.
++	 * both aliases at one shared L3 table and map VA 0x18f000 through
++	 * the end of the slot to AP-writable pages starting at 0x8c48f000.
+ 	 */
+ 	l3_pa = pt_pa + PG_SMMU_S1_L3_OFF;
+ 	l3 = (volatile uint64_t *)((volatile char *)pt + PG_SMMU_S1_L3_OFF);
+@@ -2651,8 +2652,11 @@ pg_hfi_smmu_stage1(void)
+ 	l2_0[heap_idx] = l3_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
+ 	high_idx = (uint32_t)((0x106e00000ull >> 21) & 0x1ffu);
+ 	l2_4[high_idx] = l3_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
+-	l3[0x18fu] = (uint64_t)PG_GMU_HEAP_SCRATCH_PA |
+-	    PG_SMMU_S1_A64_PAGE_FLAGS;
++	for (i = PG_GMU_HEAP_L3_FIRST; i <= PG_GMU_HEAP_L3_LAST; i++) {
++		l3[i] = (uint64_t)(PG_GMU_HEAP_SCRATCH_PA +
++		    ((uint64_t)(i - PG_GMU_HEAP_L3_FIRST) << 12)) |
++		    PG_SMMU_S1_A64_PAGE_FLAGS;
++	}
+ 
+ 	/*
+ 	 * Map the 2 MiB block that contains the HFI queue table.  The GMU
+@@ -2668,11 +2672,13 @@ pg_hfi_smmu_stage1(void)
+ 	l2_0[hfi_idx] = hfi_block_pa | desc_flags;
+ 	__sync_synchronize();
+ 	pg_sync_checkpoint("s1-pt-filled");
+-	printf("POLARIS PWR: SMMU S1 0136 pt pa=0x%llx L1[0]=0x%llx "
++	printf("POLARIS PWR: SMMU S1 0137 pt pa=0x%llx L1[0]=0x%llx "
+ 	    "L1[4]=0x%llx L2_0[37]=0x%llx L2_0[62]=0x%llx "
+-	    "L2_4[37]=0x%llx L3[18f]=0x%llx\n", pt_pa, pt[0], pt[4],
+-	    l2_0[0x37u], l2_0[0x62u], l2_4[0x37u], l3[0x18fu]);
+-	printf("POLARIS PWR: SMMU S1 0136 heap va=0x%08x pa=0x%llx "
++	    "L2_4[37]=0x%llx L3[18f]=0x%llx L3[190]=0x%llx "
++	    "L3[1ff]=0x%llx\n", pt_pa, pt[0], pt[4],
++	    l2_0[0x37u], l2_0[0x62u], l2_4[0x37u], l3[0x18fu],
++	    l3[0x190u], l3[0x1ffu]);
++	printf("POLARIS PWR: SMMU S1 0137 heap va=0x%08x pa=0x%llx "
+ 	    "idx=0x%x desc=0x%llx hfi va=0x%llx pa=0x%llx idx=0x%x\n",
+ 	    PG_GMU_HEAP_VA_BASE, (uint64_t)PG_GMU_HEAP_SCRATCH_PA, heap_idx,
+ 	    l3[0x18fu], hfi_block_va, hfi_block_pa, hfi_idx);
+@@ -2759,7 +2765,7 @@ pg_hfi_smmu_stage1(void)
+ 	ttbcr2 = pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR2));
+ 	mair0 = pg_rd32(pg_smmu_regs,
+ 	    PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR0));
+-	printf("POLARIS PWR: SMMU S1 0136 pre-enable CB%u CBA2R=0x%08x "
++	printf("POLARIS PWR: SMMU S1 0137 pre-enable CB%u CBA2R=0x%08x "
+ 	    "TTBR0=0x%llx TTBCR=0x%08x TTBCR2=0x%08x MAIR0=0x%08x\n",
+ 	    cbndx, cba2r, ttbr0, ttbcr, ttbcr2, mair0);
+ 	if (cba2r != PG_SMMU_S1_CBA2R_RW64 ||
+@@ -2767,7 +2773,7 @@ pg_hfi_smmu_stage1(void)
+ 	    ttbcr != PG_SMMU_S1_TTBCR_VAL ||
+ 	    ttbcr2 != PG_SMMU_S1_TTBCR2_VAL ||
+ 	    mair0 != PG_SMMU_S1_MAIR0_VAL) {
+-		printf("POLARIS PWR: SMMU S1 0136 register verify failed; "
++		printf("POLARIS PWR: SMMU S1 0137 register verify failed; "
+ 		    "CB%u left disabled, CM3 must stay reset\n", cbndx);
+ 		pg_sync_checkpoint("s1-0135-verify-failed");
+ 		return false;
+@@ -2780,7 +2786,7 @@ pg_hfi_smmu_stage1(void)
+ 	if (pg_polaris0133(2)) {
+ 		pg_smmu_micro_mmu_resume("s1");
+ 	}
+-	printf("POLARIS PWR: SMMU S1 0136 CB%u programmed CBAR=0x%08x "
++	printf("POLARIS PWR: SMMU S1 0137 CB%u programmed CBAR=0x%08x "
+ 	    "SCTLR=0x%08x TTBR0=0x%llx TTBCR=0x%08x TTBCR2=0x%08x "
+ 	    "CBA2R=0x%08x FSR=0x%08x\n", cbndx,
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CBAR(cbndx)),
+@@ -3329,7 +3335,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0136-smmu-a64-page-heap "
++	printf("POLARIS PWR: HFI start build 0137-smmu-a64-heap-pages "
+ 	    "polarishfi=%d polaris0133=0x%x\n", hfion,
+ 	    pg_polaris0133_mask);
+ 	if (hfion != 1) {
+@@ -3568,7 +3574,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		mode0133 = 0;
+ 	}
+ 	pg_polaris0133_mask = (uint32_t)mode0133;
+-	printf("POLARIS PWR: 0136 build polarispwr=%d rpmh=%d modes=0x%x "
++	printf("POLARIS PWR: 0137 build polarispwr=%d rpmh=%d modes=0x%x "
+ 	    "ns=%u actlr=%u micro=%u resume=%u diag=%u hfibase=%u "
+ 	    "alias=%u old=%u\n",
+ 	    pwrlevel, rpmh_on, pg_polaris0133_mask,
