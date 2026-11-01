@@ -1,0 +1,372 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 2937166..c9d7ef9 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -353,6 +353,7 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_GFSR            0x048u
+ #define PG_SMMU_GFSYNR0         0x050u
+ #define PG_SMMU_GFSYNR1         0x054u
++#define PG_SMMU_TLBIALLH        0x06cu
+ #define PG_SMMU_TLBIALLNSNH     0x068u
+ #define PG_SMMU_STLBGSYNC       0x070u
+ #define PG_SMMU_STLBGSTATUS     0x074u
+@@ -378,6 +379,7 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S2CR_BYPASS_NSH     (PG_SMMU_S2CR_TYPE_BYPASS | \
+                                      PG_SMMU_S2CR_SHCFG_NSH | 0xffu)
+ #define PG_SMMU_SMR_VALID           (1u << 31)
++#define PG_SMMU_sCR0                0x000u
+ #define PG_SMMU_sCR0_CLIENTPD       (1u << 0)
+ #define PG_SMMU_ACR_CACHE_LOCK      (1u << 26)
+ 
+@@ -438,6 +440,8 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S1_SECTION_SIZE     0x00100000u
+ #define PG_SMMU_S1_SECTIONS         4u
+ #define PG_SMMU_S1_DESC_FLAGS       0x00010c06u
++#define PG_SMMU_S1_DESC_DEV         0x00010c06u
++#define PG_SMMU_S1_DESC_NC          0x00001c02u
+ /*
+  * 0133: bit 19 of an AArch32 short-descriptor section is NS.  The GMU data
+  * path is a non-secure master while the SMMU register writes are owned by
+@@ -481,6 +485,8 @@ extern void sweet_log_sync(void);
+ #define PG_0133_CB_RESUME_RETRY     (1u << 3)
+ #define PG_0133_DIAG                (1u << 4)
+ #define PG_0133_HFI_BASE            (1u << 5)
++#define PG_0133_FULL_ALIAS          (1u << 6)
++#define PG_0133_OLD_DESC            (1u << 7)
+ /*
+  * 0128a: the L1 table lives in the ADT-reserved GPU-S1PT range. The address
+  * must match package_0128a.py's memory_map_entries; it is deliberately not
+@@ -2293,6 +2299,71 @@ pg_smmu_micro_mmu_resume(const char *tag)
+ 	    PG_SMMU_IMPL_DEF1 + PG_SMMU_MICRO_MMU_CTRL));
+ }
+ 
++/*
++ * 0134: vendor arm_smmu_device_reset() order.  0133 left CB4 enabled
++ * (SCTLR.M=1) and then halted the micro-MMU, which deadlocked the NoC.
++ * Disable every context bank, clear its FSR, invalidate both TLBs and
++ * program sCR0 before any bank is touched again.
++ */
++static void
++pg_smmu_reset_all(const char *tag)
++{
++	uint32_t acr, scr0, gfsr, status;
++	unsigned int i;
++
++	if (pg_smmu_regs == NULL) {
++		return;
++	}
++	acr = pg_rd32(pg_smmu_regs, PG_SMMU_sACR);
++	if ((acr & PG_SMMU_ACR_CACHE_LOCK) != 0) {
++		pg_wr32(pg_smmu_regs, PG_SMMU_sACR,
++		    acr & ~PG_SMMU_ACR_CACHE_LOCK, 3);
++	}
++	for (i = 0; i <= PG_SMMU_MAX_LEVEL; i++) {
++		pg_wr32(pg_smmu_regs, PG_SMMU_CB(i, PG_SMMU_CB_SCTLR), 0, 3);
++		pg_wr32(pg_smmu_regs, PG_SMMU_CB(i, PG_SMMU_CB_FSR),
++		    0xffffffffu, 3);
++	}
++	__sync_synchronize();
++	gfsr = pg_rd32(pg_smmu_regs, PG_SMMU_GFSR);
++	pg_wr32(pg_smmu_regs, PG_SMMU_GFSR, gfsr, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_TLBIALLH, 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_TLBIALLNSNH, 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_STLBGSYNC, 0, 3);
++	status = 0;
++	for (i = 0; i < PG_SMMU_TLB_POLL_US / 1000u; i++) {
++		status = pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS);
++		if ((status & 1u) == 0) {
++			break;
++		}
++		DELAY(1);
++	}
++	scr0 = pg_rd32(pg_smmu_regs, PG_SMMU_sCR0);
++	/* GFRE|GFIE|GCFGFRE|GCFGFIE */
++	scr0 |= (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5);
++	/* VMIDPNE|PTM */
++	scr0 |= (1u << 11) | (1u << 12);
++	/* CLIENTPD|USFCFG|FB off, BSU=0 */
++	scr0 &= ~((1u << 0) | (1u << 10) | (1u << 13));
++	scr0 &= ~(3u << 14);
++	/* SHCFG=NSH */
++	scr0 &= ~(3u << 22);
++	scr0 |= (3u << 22);
++	pg_wr32(pg_smmu_regs, PG_SMMU_sCR0, scr0, 3);
++	__sync_synchronize();
++	printf("POLARIS PWR: SMMU 0134 reset %s sACR=0x%08x sCR0=0x%08x "
++	    "GFSR=0x%08x tlb=0x%08x\n", tag,
++	    pg_rd32(pg_smmu_regs, PG_SMMU_sACR),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_sCR0),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_GFSR), status);
++	for (i = 0; i <= PG_SMMU_MAX_LEVEL; i++) {
++		printf("POLARIS PWR: SMMU 0134 reset %s CB%u SCTLR=0x%08x "
++		    "FSR=0x%08x\n", tag, i,
++		    pg_rd32(pg_smmu_regs, PG_SMMU_CB(i, PG_SMMU_CB_SCTLR)),
++		    pg_rd32(pg_smmu_regs, PG_SMMU_CB(i, PG_SMMU_CB_FSR)));
++	}
++}
++
+ /*
+  * 0133 bit 4: the firmware fault address 0x06f8fbc4 is not a literal in
+  * a630_gmu.bin, so it is probably loaded from DTCM.  Dump the first 1 KiB
+@@ -2466,7 +2537,7 @@ pg_hfi_smmu_stage1(void)
+ 	vm_offset_t va = 0;
+ 	uint64_t pt_pa, win_pa;
+ 	volatile uint32_t *pt;
+-	uint32_t i, idx, first, alias_first, heap_first, cbndx = 0;
++	uint32_t i, idx, first, alias_first, heap_first, cbndx = 0, alias_base;
+ 	uint32_t s2cr3, s2cr4, val;
+ 	uint32_t desc_flags;
+ 	uint32_t cbar, sctlr, fsr;
+@@ -2481,10 +2552,21 @@ pg_hfi_smmu_stage1(void)
+ 		    pg_hfi.pa);
+ 		return false;
+ 	}
+-	desc_flags = PG_SMMU_S1_DESC_FLAGS |
++	desc_flags = (pg_polaris0133(7) ? PG_SMMU_S1_DESC_DEV :
++	    PG_SMMU_S1_DESC_NC) |
+ 	    (pg_polaris0133(0) ? PG_SMMU_S1_DESC_NS : 0);
+-	printf("POLARIS PWR: SMMU S1 0133 desc_flags=0x%08x ns=%u\n",
+-	    desc_flags, (desc_flags & PG_SMMU_S1_DESC_NS) ? 1u : 0u);
++	printf("POLARIS PWR: SMMU S1 0134 desc_flags=0x%08x ns=%u old=%u\n",
++	    desc_flags, (desc_flags & PG_SMMU_S1_DESC_NS) ? 1u : 0u,
++	    pg_polaris0133(7) ? 1u : 0u);
++
++	/*
++	 * 0134: undo 0133's fatal ordering.  Every context bank must be
++	 * disabled and the micro-MMU left alone until the whole SMMU has
++	 * been reset, exactly as arm_smmu_device_reset() does.
++	 */
++	pg_sync_checkpoint("s1-0134-reset-before");
++	pg_smmu_reset_all("s1");
++	pg_sync_checkpoint("s1-0134-reset-after");
+ 
+ 	/*
+ 	 * TTBR0 must point at a 16 KiB-aligned L1 table whose descriptors are
+@@ -2518,24 +2600,26 @@ pg_hfi_smmu_stage1(void)
+ 	}
+ 	first = (uint32_t)(pg_hfi.pa >> 20);
+ 	win_pa = (uint64_t)first << 20;
+-	for (i = 0; i < PG_SMMU_S1_SECTIONS; i++) {
+-		idx = first + i;
+-		if (idx >= PG_SMMU_S1_PT_SIZE / 4u) {
+-			break;
+-		}
+-		pt[idx] = ((uint32_t)(win_pa +
+-		    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) & 0xfff00000u) |
+-		    desc_flags;
+-	}
++	alias_first = (uint32_t)((pg_hfi.pa & 0x7fffffffull) >> 20);
++	heap_first = PG_GMU_HEAP_VA_BASE >> 20;
+ 	/*
+-	 * 0130: map the GMU-visible <2 GiB alias onto the same physical
+-	 * 4 MiB window.  The firmware truncates bit 31, so without this
+-	 * section it faults at 0x0c420008 before CTRL_INIT can run.
++	 * 0134 bit 6: diagnostic all-4 GiB alias.  Every truth table entry
++	 * points at the same low-DRAM 1 MiB; the VA's 1 MiB offset is
++	 * preserved, so 0x0c42xxxx, 0x06f8xxxx and 0x6002xxxx all land in
++	 * the window without a separate cutout for each one.
+ 	 */
+-	alias_first = (uint32_t)((pg_hfi.pa & 0x7fffffffull) >> 20);
+-	if (alias_first != first) {
++	if (pg_polaris0133(6)) {
++		alias_base = PG_GMU_HEAP_WINDOW_PA & 0xfff00000u;
++		for (i = 0; i < PG_SMMU_S1_PT_SIZE / 4u; i++) {
++			pt[i] = alias_base | desc_flags;
++		}
++		printf("POLARIS PWR: SMMU 0134 full alias entries=%u "
++		    "base=0x%08x desc=0x%08x va0c4=0x%08x va06f=0x%08x "
++		    "va600=0x%08x\n", PG_SMMU_S1_PT_SIZE / 4u, alias_base,
++		    pt[0], pt[0x0c4], pt[0x06f], pt[0x600]);
++	} else {
+ 		for (i = 0; i < PG_SMMU_S1_SECTIONS; i++) {
+-			idx = alias_first + i;
++			idx = first + i;
+ 			if (idx >= PG_SMMU_S1_PT_SIZE / 4u) {
+ 				break;
+ 			}
+@@ -2543,36 +2627,54 @@ pg_hfi_smmu_stage1(void)
+ 			    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) &
+ 			    0xfff00000u) | desc_flags;
+ 		}
+-	}
+-	/*
+-	 * 0131: diagnostic mapping for the firmware heap window.  Every
+-	 * one of the 16 sections aliases the same free low-DRAM MiB at
+-	 * 0x8c400000; only the page at +0x8f000 is filled with a sentinel.
+-	 * If the firmware writes VA 0x06f8fbc4 the SMMU must no longer
+-	 * report a translation fault, and the host can see the write.
+-	 */
+-	heap_first = PG_GMU_HEAP_VA_BASE >> 20;
+-	if (heap_first + PG_GMU_HEAP_SECTIONS <=
+-	    PG_SMMU_S1_PT_SIZE / 4u) {
+-		for (i = 0; i < PG_GMU_HEAP_SECTIONS; i++) {
+-			pt[heap_first + i] =
+-			    (PG_GMU_HEAP_WINDOW_PA & 0xfff00000u) |
+-			    desc_flags;
++		/*
++		 * 0130: map the GMU-visible <2 GiB alias onto the same
++		 * physical 4 MiB window.  The firmware truncates bit 31,
++		 * so without this section it faults at 0x0c420008 before
++		 * CTRL_INIT can run.
++		 */
++		if (alias_first != first) {
++			for (i = 0; i < PG_SMMU_S1_SECTIONS; i++) {
++				idx = alias_first + i;
++				if (idx >= PG_SMMU_S1_PT_SIZE / 4u) {
++					break;
++				}
++				pt[idx] = ((uint32_t)(win_pa +
++				    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) &
++				    0xfff00000u) | desc_flags;
++			}
+ 		}
+-	}
+-	/*
+-	 * 0133 bit 5: alternative GMU-visible base.  A single 1 MiB section
+-	 * maps the whole low-DRAM window that holds the HFI table; the table
+-	 * address handed to the firmware adds the 0x20000 in-window offset.
+-	 */
+-	if (pg_polaris0133(5)) {
+-		idx = PG_0133_HFI_VA_BASE >> 20;
+-		if (idx < PG_SMMU_S1_PT_SIZE / 4u) {
+-			pt[idx] = (PG_0133_HFI_PA_BASE & 0xfff00000u) |
+-			    desc_flags;
+-			printf("POLARIS PWR: SMMU S1 0133 hfi base "
+-			    "va=0x%08x first=%u desc=0x%08x\n",
+-			    PG_0133_HFI_VA_BASE, idx, pt[idx]);
++		/*
++		 * 0131: diagnostic mapping for the firmware heap window.
++		 * Every one of the 16 sections aliases the same free
++		 * low-DRAM MiB at 0x8c400000; only the page at +0x8f000
++		 * is filled with a sentinel.  If the firmware writes VA
++		 * 0x06f8fbc4 the SMMU must no longer report a translation
++		 * fault, and the host can see the write.
++		 */
++		if (heap_first + PG_GMU_HEAP_SECTIONS <=
++		    PG_SMMU_S1_PT_SIZE / 4u) {
++			for (i = 0; i < PG_GMU_HEAP_SECTIONS; i++) {
++				pt[heap_first + i] =
++				    (PG_GMU_HEAP_WINDOW_PA & 0xfff00000u) |
++				    desc_flags;
++			}
++		}
++		/*
++		 * 0133 bit 5: alternative GMU-visible base.  A single 1 MiB
++		 * section maps the whole low-DRAM window that holds the HFI
++		 * table; the table address handed to the firmware adds the
++		 * 0x20000 in-window offset.
++		 */
++		if (pg_polaris0133(5)) {
++			idx = PG_0133_HFI_VA_BASE >> 20;
++			if (idx < PG_SMMU_S1_PT_SIZE / 4u) {
++				pt[idx] = (PG_0133_HFI_PA_BASE & 0xfff00000u) |
++				    desc_flags;
++				printf("POLARIS PWR: SMMU S1 0133 hfi base "
++				    "va=0x%08x first=%u desc=0x%08x\n",
++				    PG_0133_HFI_VA_BASE, idx, pt[idx]);
++			}
+ 		}
+ 	}
+ 	__sync_synchronize();
+@@ -2591,7 +2693,7 @@ pg_hfi_smmu_stage1(void)
+ 	    PG_GMU_HEAP_WINDOW_PA, heap_first, pt[heap_first]);
+ 
+ 	/* Dump every candidate bank before choosing one. */
+-	pg_sync_checkpoint("s1-cb-probe");
++	pg_sync_checkpoint("s1-0134-cb-probe");
+ 	for (i = 0; i <= PG_SMMU_MAX_LEVEL; i++) {
+ 		cbar = pg_rd32(pg_smmu_regs, PG_SMMU_CBAR(i));
+ 		sctlr = pg_rd32(pg_smmu_regs,
+@@ -2619,16 +2721,24 @@ pg_hfi_smmu_stage1(void)
+ 	}
+ 	pg_smmu_s1_cbndx = (int)cbndx;
+ 	printf("POLARIS PWR: SMMU S1 selected CB%u\n", cbndx);
++	pg_sync_checkpoint("s1-0134-cb-selected");
+ 
+ 	if (pg_polaris0133(1)) {
+-		pg_wr32(pg_smmu_regs,
+-		    PG_SMMU_CB(cbndx, PG_SMMU_CB_ACTLR),
+-		    PG_SMMU_ACTLR_QCOM_NSH, 3);
+-		printf("POLARIS PWR: SMMU S1 0133 CB%u ACTLR=0x%08x\n",
+-		    cbndx, pg_rd32(pg_smmu_regs,
++		/*
++		 * Vendor qsmmuv2_device_reset() writes ACTLR on every bank;
++		 * 0133 wrote only the selected one and left CB4 running.
++		 */
++		for (i = 0; i <= PG_SMMU_MAX_LEVEL; i++) {
++			pg_wr32(pg_smmu_regs,
++			    PG_SMMU_CB(i, PG_SMMU_CB_ACTLR),
++			    PG_SMMU_ACTLR_QCOM_NSH, 3);
++		}
++		printf("POLARIS PWR: SMMU S1 0134 ACTLR all CB=0x%08x\n",
++		    pg_rd32(pg_smmu_regs,
+ 		    PG_SMMU_CB(cbndx, PG_SMMU_CB_ACTLR)));
+ 	}
+ 	if (pg_polaris0133(2)) {
++		/* Only safe now: every CB above has SCTLR.M=0. */
+ 		(void)pg_smmu_micro_mmu_halt("s1");
+ 	}
+ 	/* Disable, clear fault state, then program the bank exactly as vendor. */
+@@ -2647,9 +2757,10 @@ pg_hfi_smmu_stage1(void)
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_CONTEXTIDR), 0, 3);
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR0), 0, 3);
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR1), 0, 3);
+-	pg_sync_checkpoint("s1-cb-programmed");
++	pg_sync_checkpoint("s1-0134-cb-programmed");
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR),
+ 	    PG_SMMU_SCTLR_S1, 3);
++	pg_sync_checkpoint("s1-0134-sctlr-on");
+ 	if (pg_polaris0133(2)) {
+ 		pg_smmu_micro_mmu_resume("s1");
+ 	}
+@@ -2686,12 +2797,12 @@ pg_hfi_smmu_stage1(void)
+ 		pg_sync_checkpoint("s1-s2cr-forced");
+ 		return false;
+ 	}
+-	pg_sync_checkpoint("s1-s2cr-written");
++	pg_sync_checkpoint("s1-0134-s2cr");
+ 
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_SMR(3), PG_SMMU_SMR_VALID | 5u, 3);
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_SMR(4), PG_SMMU_SMR_VALID | 4u, 3);
+ 	__sync_synchronize();
+-	pg_sync_checkpoint("s1-smr-written");
++	pg_sync_checkpoint("s1-0134-smr");
+ 	(void)pg_smmu_tlb_invalidate_global("s1");
+ 	(void)pg_smmu_tlb_invalidate_cb(cbndx, "s1");
+ 	printf("POLARIS PWR: SMMU S1 done SMR3=0x%08x SMR4=0x%08x "
+@@ -2704,7 +2815,7 @@ pg_hfi_smmu_stage1(void)
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_STLBGSTATUS),
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FSR)),
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FAR_LO)));
+-	pg_sync_checkpoint("s1-done");
++	pg_sync_checkpoint("s1-0134-tlb");
+ 	pg_smmu_fault_probe("s1-done");
+ 	if (pg_polaris0133(4)) {
+ 		pg_smmu_all_cb_dump("s1-done");
+@@ -3194,7 +3305,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0133-ns-actlr-micro-diag "
++	printf("POLARIS PWR: HFI start build 0134-smmu-reset-order "
+ 	    "polarishfi=%d polaris0133=0x%x\n", hfion,
+ 	    pg_polaris0133_mask);
+ 	if (hfion != 1) {
+@@ -3433,12 +3544,14 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		mode0133 = 0;
+ 	}
+ 	pg_polaris0133_mask = (uint32_t)mode0133;
+-	printf("POLARIS PWR: 0133 build polarispwr=%d rpmh=%d modes=0x%x "
+-	    "ns=%u actlr=%u micro=%u resume=%u diag=%u hfibase=%u\n",
++	printf("POLARIS PWR: 0134 build polarispwr=%d rpmh=%d modes=0x%x "
++	    "ns=%u actlr=%u micro=%u resume=%u diag=%u hfibase=%u "
++	    "alias=%u old=%u\n",
+ 	    pwrlevel, rpmh_on, pg_polaris0133_mask,
+ 	    pg_polaris0133(0) ? 1u : 0u, pg_polaris0133(1) ? 1u : 0u,
+ 	    pg_polaris0133(2) ? 1u : 0u, pg_polaris0133(3) ? 1u : 0u,
+-	    pg_polaris0133(4) ? 1u : 0u, pg_polaris0133(5) ? 1u : 0u);
++	    pg_polaris0133(4) ? 1u : 0u, pg_polaris0133(5) ? 1u : 0u,
++	    pg_polaris0133(6) ? 1u : 0u, pg_polaris0133(7) ? 1u : 0u);
+ 	printf("POLARIS PWR: HFI align %d\n", hfi_align);
+ 	pg_sync_checkpoint("entry");
+ 	if (!pg_gmu_map()) {
