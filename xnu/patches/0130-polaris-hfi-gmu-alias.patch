@@ -1,0 +1,148 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 7fa9e1f..7838a3f 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -527,6 +527,19 @@ static struct pg_hfi_state pg_hfi;
+ static uint32_t pg_hfi_reserved_pa;
+ static uint32_t pg_hfi_reserved_size;
+ 
++/*
++ * 0130: the GMU only addresses a 2 GiB window (mainline creates gmu->vm
++ * over 0x0..0x80000000).  The HFI reservation is at 0x8c420000, so the
++ * firmware masks bit 31 and walks 0x0c420000; 0129 caught that as
++ * CB4 FSR=0x2 FAR=0x0c420008.  Every address handed to the GMU must use
++ * this alias, and stage 1 maps it to the same physical sections.
++ */
++static inline uint32_t
++pg_hfi_gmu_addr(uint32_t offset)
++{
++	return (uint32_t)((pg_hfi.pa + offset) & 0x7fffffffull);
++}
++
+ #ifdef PG_PWR_TEST
+ extern void pg_pwr_test_after_write(unsigned, uint32_t, uint32_t);
+ void pg_pwr_test_reset(void);
+@@ -653,7 +666,7 @@ pg_pdc_map(void)
+ static void
+ pg_sync_checkpoint(const char *tag)
+ {
+-	printf("POLARIS PWR: 0129 checkpoint %s\n", tag);
++	printf("POLARIS PWR: 0130 checkpoint %s\n", tag);
+ 	sweet_log_sync();
+ }
+ 
+@@ -1524,7 +1537,7 @@ pg_hfi_fill_table(void)
+ 		uint32_t offset = PG_HFI_Q0_OFFSET + i * PG_HFI_Q_STRIDE;
+ 
+ 		table[base + 0] = PG_HFI_Q_STATUS_ACTIVE;
+-		table[base + 1] = (uint32_t)(pg_hfi.pa + offset);
++		table[base + 1] = pg_hfi_gmu_addr(offset);
+ 		table[base + 2] = types[i];
+ 		table[base + 3] = PG_HFI_Q_DWORDS;
+ 		table[base + 4] = 0;
+@@ -1965,7 +1978,7 @@ pg_hfi_smmu_stage1(void)
+ 	vm_offset_t va = 0;
+ 	uint64_t pt_pa, win_pa;
+ 	volatile uint32_t *pt;
+-	uint32_t i, idx, first, cbndx = 0, s2cr3, s2cr4, val;
++	uint32_t i, idx, first, alias_first, cbndx = 0, s2cr3, s2cr4, val;
+ 	uint32_t cbar, sctlr, fsr;
+ 	bool have_cb = false;
+ 
+@@ -2019,11 +2032,33 @@ pg_hfi_smmu_stage1(void)
+ 		    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) & 0xfff00000u) |
+ 		    PG_SMMU_S1_DESC_FLAGS;
+ 	}
++	/*
++	 * 0130: map the GMU-visible <2 GiB alias onto the same physical
++	 * 4 MiB window.  The firmware truncates bit 31, so without this
++	 * section it faults at 0x0c420008 before CTRL_INIT can run.
++	 */
++	alias_first = (uint32_t)((pg_hfi.pa & 0x7fffffffull) >> 20);
++	if (alias_first != first) {
++		for (i = 0; i < PG_SMMU_S1_SECTIONS; i++) {
++			idx = alias_first + i;
++			if (idx >= PG_SMMU_S1_PT_SIZE / 4u) {
++				break;
++			}
++			pt[idx] = ((uint32_t)(win_pa +
++			    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) &
++			    0xfff00000u) | PG_SMMU_S1_DESC_FLAGS;
++		}
++	}
+ 	__sync_synchronize();
+ 	pg_sync_checkpoint("s1-pt-filled");
+ 	printf("POLARIS PWR: SMMU S1 pt pa=0x%llx win=0x%08x first=%u "
+ 	    "desc[%u]=0x%08x desc[%u]=0x%08x\n", pt_pa, (uint32_t)win_pa,
+ 	    first, first, pt[first], first + 1u, pt[first + 1u]);
++	if (alias_first != first) {
++		printf("POLARIS PWR: SMMU S1 alias va=0x%08x first=%u "
++		    "desc[%u]=0x%08x\n", alias_first << 20, alias_first,
++		    alias_first, pt[alias_first]);
++	}
+ 
+ 	/* Dump every candidate bank before choosing one. */
+ 	pg_sync_checkpoint("s1-cb-probe");
+@@ -2490,7 +2525,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0129-hfi-diag polarishfi=%d\n",
++	printf("POLARIS PWR: HFI start build 0130-gmu-alias polarishfi=%d\n",
+ 	    hfion);
+ 	if (hfion != 1) {
+ 		printf("POLARIS PWR: HFI not opted in; no access\n");
+@@ -2530,7 +2565,7 @@ polaris_gpu_hfi_start(void)
+ 	    ((cmd_wr + 1u) % PG_HFI_Q_DWORDS)] = 0;
+ 	table[PG_HFI_CMD_DATA_DWORD +
+ 	    ((cmd_wr + 2u) % PG_HFI_Q_DWORDS)] =
+-	    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE);
++	    pg_hfi_gmu_addr(PG_HFI_TABLE_SIZE);
+ 	table[PG_HFI_CMD_DATA_DWORD +
+ 	    ((cmd_wr + 3u) % PG_HFI_Q_DWORDS)] = PG_HFI_DBG_SIZE;
+ 	table[PG_HFI_CMD_DATA_DWORD +
+@@ -2545,7 +2580,7 @@ polaris_gpu_hfi_start(void)
+ 	pg_wr32(pg_gmu_regs, PG_GMU_HOST2GMU_INTR_SET, 1, 3);
+ 	pg_sync_checkpoint("hfi-intr-set");
+ 	printf("POLARIS PWR: HFI INIT sent cmd=0x%08x dbg=0x%08x wr=%u->%u\n",
+-	    PG_HFI_INIT_HDR, (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE),
++	    PG_HFI_INIT_HDR, pg_hfi_gmu_addr(PG_HFI_TABLE_SIZE),
+ 	    cmd_wr, cmd_wr_new);
+ 
+ 	for (i = 0; i < PG_HFI_ACK_TIMEOUT_US / 1000u; i++) {
+@@ -2722,7 +2757,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (pwrlevel > 6) {
+ 		pwrlevel = 6;
+ 	}
+-	printf("POLARIS PWR: 0129 build polarispwr=%d rpmh=%d\n", pwrlevel,
++	printf("POLARIS PWR: 0130 build polarispwr=%d rpmh=%d\n", pwrlevel,
+ 	    rpmh_on);
+ 	printf("POLARIS PWR: HFI align %d\n", hfi_align);
+ 	pg_sync_checkpoint("entry");
+@@ -2807,8 +2842,10 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	pg_sync_checkpoint("before-qtbl");
+ 	if (hfion != 0) {
+ 		pg_wr32(pg_gmu_regs, PG_GMU_HFI_QTBL_ADDR,
+-		    (uint32_t)pg_hfi.pa, 3);
++		    pg_hfi_gmu_addr(0), 3);
+ 		pg_wr32(pg_gmu_regs, PG_GMU_HFI_QTBL_INFO, 1, 3);
++		printf("POLARIS PWR: HFI GMU alias pa=0x%llx gmu=0x%08x\n",
++		    pg_hfi.pa, pg_hfi_gmu_addr(0));
+ 	}
+ 	pg_sync_checkpoint("after-qtbl");
+ 	pg_wr32(pg_gmu_regs, PG_GMU_AHB_FENCE_RANGE_0,
+@@ -2829,12 +2866,12 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 	if (hfion != 0 && pwrlevel >= 6) {
+ 		pg_sync_checkpoint("before-pwr-col-cp-msg");
+ 		pg_wr32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG,
+-		    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE) |
++		    pg_hfi_gmu_addr(PG_HFI_TABLE_SIZE) |
+ 		    (PG_HFI_DBG_SIZE / 4096u - 1u), 3);
+ 		pg_sync_checkpoint("after-pwr-col-cp-msg");
+ 		printf("POLARIS PWR: GMU PWR_COL_CP_MSG=0x%08x (dbg=0x%08x)\n",
+ 		    pg_rd32(pg_gmu_regs, PG_GMU_PWR_COL_CP_MSG),
+-		    (uint32_t)(pg_hfi.pa + PG_HFI_TABLE_SIZE));
++		    pg_hfi_gmu_addr(PG_HFI_TABLE_SIZE));
+ 	}
+ 	pg_gmu_power_config(pwrlevel);
+ 

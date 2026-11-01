@@ -1,0 +1,254 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index 7100e02..915630d 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -507,20 +507,26 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S1_PT_PA            0x8c428000ull
+ 
+ /*
+- * 0137 diagnostic window.  The CM3 faults at VA 0x106f8fbc4 while HFI
+- * CTRL_INIT is running, i.e. physical 0x86f8fbc4 after the GMU's bit-31
+- * truncation.  The firmware heap starts at 0x06f8f000 and extends to the
+- * end of its 2 MiB slot.  0137 maps every remaining 4 KiB page of that
+- * slot to the AP-writable pool at 0x8c48f000-0x8c4fffff.
++ * 0138 diagnostic window.  0137 proved that the GMU follows a firmware heap
++ * pointer at VA 0x06f8f000 and keeps walking past the end of that 2 MiB
++ * slot.  The old mapping only filled L3 entries 0x180-0x1ff, so the next
++ * access at 0x07000004 hit an empty L3[0].  Map all nine 2 MiB slots
++ * 0x37-0x3f to one fully populated L3 table.  The 0xd0 pages of the
++ * AP-writable pool at 0x8c430000 are reused modulo the table size; the
++ * anchor mapping preserves 0x06f8f000 -> pool+0xf000 so the known fault
++ * offset remains readable at pool+0xfbc4.
+  */
+ #define PG_GMU_HEAP_VA_BASE         0x06e00000u
+-#define PG_GMU_HEAP_SECTIONS        1u
+-#define PG_GMU_HEAP_WINDOW_PA       0x8c480000u
+-#define PG_GMU_HEAP_SCRATCH_PA      0x8c48f000ull
+-#define PG_GMU_HEAP_L3_FIRST        0x18fu
+-#define PG_GMU_HEAP_L3_LAST         0x1ffu
+-#define PG_GMU_HEAP_SCRATCH_SIZE    0x71000u
+-#define PG_GMU_HEAP_SCRATCH_FILL    0xdeadbeefu
++#define PG_GMU_HEAP_SLOT_FIRST      0x37u
++#define PG_GMU_HEAP_SLOT_LAST       0x3fu
++#define PG_GMU_HEAP_POOL_PA         0x8c430000ull
++#define PG_GMU_HEAP_POOL_SIZE       0x000d0000u
++#define PG_GMU_HEAP_L3_ANCHOR       0x180u
++#define PG_GMU_HEAP_KNOWN_OFF       0x0f000u
++#define PG_GMU_HEAP_FAULT_OFF       0x0fbc4u
++#define PG_GMU_HEAP_SCRATCH_PA      PG_GMU_HEAP_POOL_PA
++#define PG_GMU_HEAP_SCRATCH_SIZE    PG_GMU_HEAP_POOL_SIZE
++#define PG_GMU_HEAP_SCRATCH_FILL    0x00000000u
+ 
+ /*
+  * Fabia PLL register offsets, from clk-alpha-pll.c (CAF msm-4.9 and
+@@ -2570,7 +2576,8 @@ pg_hfi_smmu_stage1(void)
+ 	uint64_t pt_pa, hfi_block_pa, hfi_block_va;
+ 	volatile uint64_t *pt, *l2_0, *l2_4, *l3;
+ 	uint64_t l2_0_pa, l2_4_pa, l3_pa;
+-	uint32_t i, hfi_idx, heap_idx, high_idx, cbndx = 0;
++	uint32_t i, hfi_idx, heap_idx, slot, pool_pages;
++	uint32_t l3_slot, cbndx = 0;
+ 	uint32_t s2cr3, s2cr4, val;
+ 	uint64_t desc_flags;
+ 	uint32_t cbar, sctlr, fsr, cba2r, ttbcr, ttbcr2, mair0;
+@@ -2587,7 +2594,7 @@ pg_hfi_smmu_stage1(void)
+ 		return false;
+ 	}
+ 	desc_flags = PG_SMMU_S1_A64_DESC_FLAGS;
+-	printf("POLARIS PWR: SMMU S1 0137 long desc flags=0x%llx ns=1 "
++	printf("POLARIS PWR: SMMU S1 0138 long desc flags=0x%llx ns=1 "
+ 	    "asid=5\n", desc_flags);
+ 
+ 	/*
+@@ -2639,23 +2646,28 @@ pg_hfi_smmu_stage1(void)
+ 	    PG_SMMU_S1_L2_4_OFF);
+ 
+ 	/*
+-	 * 0137: the GMU reaches the firmware heap through a bit-31-truncated
+-	 * address: VA 0x106f8fbc4 is issued as 0x06f8fbc4.  0135 mapped that
+-	 * 2 MiB slot to 0x86e00000, which lies inside the FDT
+-	 * removed_region@86200000 and hangs the AP on first write.  Point
+-	 * both aliases at one shared L3 table and map VA 0x18f000 through
+-	 * the end of the slot to AP-writable pages starting at 0x8c48f000.
++	 * 0138: the GMU reaches the firmware heap through a bit-31-truncated
++	 * address: VA 0x106f8fbc4 is issued as 0x06f8fbc4.  Map every 2 MiB
++	 * slot from 0x06e00000 through 0x07ffffff to one fully populated L3
++	 * table, using the AP-writable pool modulo its 0xd0 pages.  This is a
++	 * diagnostic alias, not a permanent firmware heap: it prevents a
++	 * translation fault from hiding the next HFI failure and preserves the
++	 * known 0x06f8f000 -> pool+0xf000 anchor for the fault dump.
+ 	 */
+ 	l3_pa = pt_pa + PG_SMMU_S1_L3_OFF;
+ 	l3 = (volatile uint64_t *)((volatile char *)pt + PG_SMMU_S1_L3_OFF);
+ 	heap_idx = (uint32_t)((PG_GMU_HEAP_VA_BASE >> 21) & 0x1ffu);
+-	l2_0[heap_idx] = l3_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
+-	high_idx = (uint32_t)((0x106e00000ull >> 21) & 0x1ffu);
+-	l2_4[high_idx] = l3_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
+-	for (i = PG_GMU_HEAP_L3_FIRST; i <= PG_GMU_HEAP_L3_LAST; i++) {
+-		l3[i] = (uint64_t)(PG_GMU_HEAP_SCRATCH_PA +
+-		    ((uint64_t)(i - PG_GMU_HEAP_L3_FIRST) << 12)) |
+-		    PG_SMMU_S1_A64_PAGE_FLAGS;
++	for (slot = PG_GMU_HEAP_SLOT_FIRST; slot <= PG_GMU_HEAP_SLOT_LAST;
++	    slot++) {
++		l2_0[slot] = l3_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
++		l2_4[slot] = l3_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
++	}
++	pool_pages = PG_GMU_HEAP_POOL_SIZE / 4096u;
++	for (i = 0; i < 0x200u; i++) {
++		l3_slot = (i >= PG_GMU_HEAP_L3_ANCHOR) ?
++		    (i - PG_GMU_HEAP_L3_ANCHOR) : (i % pool_pages);
++		l3[i] = (uint64_t)(PG_GMU_HEAP_POOL_PA +
++		    ((uint64_t)l3_slot << 12)) | PG_SMMU_S1_A64_PAGE_FLAGS;
+ 	}
+ 
+ 	/*
+@@ -2672,15 +2684,16 @@ pg_hfi_smmu_stage1(void)
+ 	l2_0[hfi_idx] = hfi_block_pa | desc_flags;
+ 	__sync_synchronize();
+ 	pg_sync_checkpoint("s1-pt-filled");
+-	printf("POLARIS PWR: SMMU S1 0137 pt pa=0x%llx L1[0]=0x%llx "
++	printf("POLARIS PWR: SMMU S1 0138 pt pa=0x%llx L1[0]=0x%llx "
+ 	    "L1[4]=0x%llx L2_0[37]=0x%llx L2_0[62]=0x%llx "
+-	    "L2_4[37]=0x%llx L3[18f]=0x%llx L3[190]=0x%llx "
+-	    "L3[1ff]=0x%llx\n", pt_pa, pt[0], pt[4],
+-	    l2_0[0x37u], l2_0[0x62u], l2_4[0x37u], l3[0x18fu],
++	    "L2_0[3f]=0x%llx L2_4[37]=0x%llx L3[0]=0x%llx "
++	    "L3[18f]=0x%llx L3[190]=0x%llx L3[1ff]=0x%llx\n",
++	    pt_pa, pt[0], pt[4], l2_0[0x37u], l2_0[0x62u],
++	    l2_0[0x3fu], l2_4[0x37u], l3[0x0u], l3[0x18fu],
+ 	    l3[0x190u], l3[0x1ffu]);
+-	printf("POLARIS PWR: SMMU S1 0137 heap va=0x%08x pa=0x%llx "
++	printf("POLARIS PWR: SMMU S1 0138 heap va=0x%08x pa=0x%llx "
+ 	    "idx=0x%x desc=0x%llx hfi va=0x%llx pa=0x%llx idx=0x%x\n",
+-	    PG_GMU_HEAP_VA_BASE, (uint64_t)PG_GMU_HEAP_SCRATCH_PA, heap_idx,
++	    PG_GMU_HEAP_VA_BASE, (uint64_t)PG_GMU_HEAP_POOL_PA, heap_idx,
+ 	    l3[0x18fu], hfi_block_va, hfi_block_pa, hfi_idx);
+ 
+ 	/* Dump every candidate bank before choosing one. */
+@@ -2765,7 +2778,7 @@ pg_hfi_smmu_stage1(void)
+ 	ttbcr2 = pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR2));
+ 	mair0 = pg_rd32(pg_smmu_regs,
+ 	    PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR0));
+-	printf("POLARIS PWR: SMMU S1 0137 pre-enable CB%u CBA2R=0x%08x "
++	printf("POLARIS PWR: SMMU S1 0138 pre-enable CB%u CBA2R=0x%08x "
+ 	    "TTBR0=0x%llx TTBCR=0x%08x TTBCR2=0x%08x MAIR0=0x%08x\n",
+ 	    cbndx, cba2r, ttbr0, ttbcr, ttbcr2, mair0);
+ 	if (cba2r != PG_SMMU_S1_CBA2R_RW64 ||
+@@ -2773,7 +2786,7 @@ pg_hfi_smmu_stage1(void)
+ 	    ttbcr != PG_SMMU_S1_TTBCR_VAL ||
+ 	    ttbcr2 != PG_SMMU_S1_TTBCR2_VAL ||
+ 	    mair0 != PG_SMMU_S1_MAIR0_VAL) {
+-		printf("POLARIS PWR: SMMU S1 0137 register verify failed; "
++		printf("POLARIS PWR: SMMU S1 0138 register verify failed; "
+ 		    "CB%u left disabled, CM3 must stay reset\n", cbndx);
+ 		pg_sync_checkpoint("s1-0135-verify-failed");
+ 		return false;
+@@ -2786,7 +2799,7 @@ pg_hfi_smmu_stage1(void)
+ 	if (pg_polaris0133(2)) {
+ 		pg_smmu_micro_mmu_resume("s1");
+ 	}
+-	printf("POLARIS PWR: SMMU S1 0137 CB%u programmed CBAR=0x%08x "
++	printf("POLARIS PWR: SMMU S1 0138 CB%u programmed CBAR=0x%08x "
+ 	    "SCTLR=0x%08x TTBR0=0x%llx TTBCR=0x%08x TTBCR2=0x%08x "
+ 	    "CBA2R=0x%08x FSR=0x%08x\n", cbndx,
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CBAR(cbndx)),
+@@ -2853,10 +2866,11 @@ pg_hfi_smmu_stage1(void)
+ }
+ 
+ /*
+- * 0131: map and fill the host side of the diagnostic GMU heap page.
+- * This page is the physical target of VA 0x06f8f000-0x06f8ffff in the
+- * stage-1 table built above.  A firmware write at 0x06f8fbc4 therefore
+- * appears at offset 0xbc4 of this mapping.
++ * 0138: map and zero the whole diagnostic GMU heap pool.  The stage-1
++ * alias preserves VA 0x06f8f000 at pool+0xf000, so a firmware write at
++ * 0x06f8fbc4 appears at pool+0xfbc4.  Zero is important: 0137 filled the
++ * page with 0xdeadbeef and the CM3 treated that as heap metadata while
++ * running CTRL_INIT.
+  */
+ static bool
+ pg_heap_scratch_prepare(void)
+@@ -2897,31 +2911,50 @@ pg_heap_scratch_prepare(void)
+ static void
+ pg_heap_scratch_dump(const char *tag)
+ {
+-	uint32_t i, changed = 0;
++	uint32_t i, page, index, changed = 0, dirty_pages = 0, shown = 0;
+ 	uint32_t sentinel;
++	bool dirty;
+ 
+ 	if (pg_heap_scratch == NULL) {
+ 		printf("POLARIS PWR: HFI snap heap %s no map\n", tag);
+ 		return;
+ 	}
+ 	__sync_synchronize();
+-	for (i = 0; i < PG_GMU_HEAP_SCRATCH_SIZE / 4u; i++) {
+-		if (pg_heap_scratch[i] != PG_GMU_HEAP_SCRATCH_FILL) {
+-			changed++;
++	for (page = 0; page < PG_GMU_HEAP_SCRATCH_SIZE / 4096u; page++) {
++		dirty = false;
++		for (i = 0; i < 4096u / 4u; i++) {
++			index = page * (4096u / 4u) + i;
++			if (pg_heap_scratch[index] != PG_GMU_HEAP_SCRATCH_FILL) {
++				changed++;
++				if (!dirty) {
++					dirty = true;
++					dirty_pages++;
++				}
++				if (shown < 16u) {
++					printf("POLARIS PWR: HFI snap heap nz[%05x]"
++					    "=%08x\n", index * 4u,
++					    pg_heap_scratch[index]);
++					shown++;
++				}
++			}
+ 		}
+ 	}
+-	sentinel = pg_heap_scratch[0xbc4u / 4u];
++	sentinel = pg_heap_scratch[PG_GMU_HEAP_FAULT_OFF / 4u];
+ 	printf("POLARIS PWR: HFI snap heap %s pa=0x%llx changed=%u/%u "
+-	    "far_off=0xbc4 value=0x%08x\n", tag, PG_GMU_HEAP_SCRATCH_PA,
+-	    changed, PG_GMU_HEAP_SCRATCH_SIZE / 4u, sentinel);
+-	for (i = 0; i < 16u; i += 8u) {
+-		printf("POLARIS PWR: HFI snap heap[%03x] %08x %08x %08x "
+-		    "%08x %08x %08x %08x %08x\n", i,
+-		    pg_heap_scratch[i + 0u], pg_heap_scratch[i + 1u],
+-		    pg_heap_scratch[i + 2u], pg_heap_scratch[i + 3u],
+-		    pg_heap_scratch[i + 4u], pg_heap_scratch[i + 5u],
+-		    pg_heap_scratch[i + 6u], pg_heap_scratch[i + 7u]);
+-	}
++	    "dirty_pages=%u far_off=0x%x heap_va=0x06f8fbc4 value=0x%08x\n",
++	    tag, PG_GMU_HEAP_SCRATCH_PA, changed,
++	    PG_GMU_HEAP_SCRATCH_SIZE / 4u, dirty_pages,
++	    PG_GMU_HEAP_FAULT_OFF, sentinel);
++	printf("POLARIS PWR: HFI snap heap known[%04x] %08x %08x %08x "
++	    "%08x %08x %08x %08x %08x\n", PG_GMU_HEAP_KNOWN_OFF,
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 0u],
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 1u],
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 2u],
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 3u],
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 4u],
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 5u],
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 6u],
++	    pg_heap_scratch[PG_GMU_HEAP_KNOWN_OFF / 4u + 7u]);
+ }
+ 
+ /*
+@@ -3335,7 +3368,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0137-smmu-a64-heap-pages "
++	printf("POLARIS PWR: HFI start build 0138-smmu-zero-heap-alias "
+ 	    "polarishfi=%d polaris0133=0x%x\n", hfion,
+ 	    pg_polaris0133_mask);
+ 	if (hfion != 1) {
+@@ -3574,7 +3607,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		mode0133 = 0;
+ 	}
+ 	pg_polaris0133_mask = (uint32_t)mode0133;
+-	printf("POLARIS PWR: 0137 build polarispwr=%d rpmh=%d modes=0x%x "
++	printf("POLARIS PWR: 0138 build polarispwr=%d rpmh=%d modes=0x%x "
+ 	    "ns=%u actlr=%u micro=%u resume=%u diag=%u hfibase=%u "
+ 	    "alias=%u old=%u\n",
+ 	    pwrlevel, rpmh_on, pg_polaris0133_mask,
