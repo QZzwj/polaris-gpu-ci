@@ -1,0 +1,500 @@
+diff --git a/bsd/dev/polaris_gpu_pwron.c b/bsd/dev/polaris_gpu_pwron.c
+index c9d7ef9..3f39e0f 100644
+--- a/bsd/dev/polaris_gpu_pwron.c
++++ b/bsd/dev/polaris_gpu_pwron.c
+@@ -435,22 +435,32 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S2CR_S1_TRANS(cb)   (PG_SMMU_S2CR_SHCFG_NSH | \
+                                      ((cb) & PG_SMMU_S2CR_CBNDX_MASK))
+ 
+-/* One 4 KiB granule AArch32 short-descriptor L1 table covers 4 GiB. */
+-#define PG_SMMU_S1_PT_SIZE          0x4000u
+-#define PG_SMMU_S1_SECTION_SIZE     0x00100000u
+-#define PG_SMMU_S1_SECTIONS         4u
+-#define PG_SMMU_S1_DESC_FLAGS       0x00010c06u
+-#define PG_SMMU_S1_DESC_DEV         0x00010c06u
+-#define PG_SMMU_S1_DESC_NC          0x00001c02u
+ /*
+- * 0133: bit 19 of an AArch32 short-descriptor section is NS.  The GMU data
+- * path is a non-secure master while the SMMU register writes are owned by
+- * the secure monitor.  A secure (NS=0) leaf makes the real CM3 walk fault
+- * with FSR.TF while ATS1PR, which does not carry the stream security state,
+- * succeeds.  Keep the old value available through polaris0133 bit 0 so one
+- * kernel can test both.
++ * 0135: 39-bit AArch64 stage-1 long-descriptor tables in the same 16 KiB
++ * GPU-S1PT reservation:
++ *   0x8c428000  L1 (512 x 8 bytes)
++ *   0x8c429000  L2 for VA[38:30] = 0
++ *   0x8c42a000  L2 for VA[38:30] = 4
++ *   0x8c42b000  spare
++ * A 2 MiB block maps the GMU low alias 0x06e00000-0x06ffffff and the
++ * firmware's bit-31-truncated alias 0x106e00000-0x106ffffff; both resolve
++ * to PA 0x86e00000-0x86ffffff.  MAIR0 attr 0 is normal NC, used by 0xe21.
+  */
+-#define PG_SMMU_S1_DESC_NS          (1u << 19)
++#define PG_SMMU_S1_PT_SIZE          0x4000u
++#define PG_SMMU_S1_L1_OFF           0x0000u
++#define PG_SMMU_S1_L2_0_OFF         0x1000u
++#define PG_SMMU_S1_L2_4_OFF         0x2000u
++#define PG_SMMU_S1_BLOCK_SIZE       0x00200000u
++#define PG_SMMU_S1_A64_DESC_FLAGS   0x0000000000000e21ull
++#define PG_SMMU_S1_A64_TABLE_FLAGS  0x0000000000000003ull
++/* TTBR0[63:48] carries ASID 5 (cbndx + 1). */
++#define PG_SMMU_S1_TTBR0_VAL        0x000500008c428000ull
++#define PG_SMMU_S1_TTBR1_VAL        0x0000000000000000ull
++#define PG_SMMU_S1_TTBCR_VAL        0x00802019u
++#define PG_SMMU_S1_TTBCR2_VAL       0x00038001u
++#define PG_SMMU_S1_MAIR0_VAL        0xf404ff44u
++#define PG_SMMU_S1_MAIR1_VAL        0x00000000u
++#define PG_SMMU_S1_CBA2R_RW64       0x00000001u
+ 
+ #define PG_SMMU_CB_ACTLR            0x004u
+ #define PG_SMMU_CB_RESUME           0x008u
+@@ -495,18 +505,17 @@ extern void sweet_log_sync(void);
+ #define PG_SMMU_S1_PT_PA            0x8c428000ull
+ 
+ /*
+- * 0131 diagnostic window.  The CM3 faults at VA 0x06f8fbc4 while HFI
+- * CTRL_INIT is running.  That address is inside the GMU's 2 GiB view of
+- * physical 0x86f8fbc4 (the same bit-31 truncation that produced the
+- * 0x0c420008 fault in 0129).  Map the whole 0x06f00000-0x06ffffff
+- * window onto the free low-DRAM MiB at 0x8c400000 so a firmware write
+- * cannot escape into another subsystem.  A host-visible page inside
+- * that MiB is filled with a sentinel before the CM3 is released.
++ * 0135 diagnostic window.  The CM3 faults at VA 0x106f8fbc4 while HFI
++ * CTRL_INIT is running, i.e. physical 0x86f8fbc4 after the GMU's bit-31
++ * truncation.  One 2 MiB AArch64 block maps 0x06e00000-0x06ffffff (and
++ * equivalently 0x106e00000-0x106ffffff) onto the free low-DRAM window at
++ * 0x86e00000-0x86ffffff.  A host-visible page at the fault offset is
++ * filled with a sentinel before the CM3 is released.
+  */
+-#define PG_GMU_HEAP_VA_BASE         0x06f00000u
+-#define PG_GMU_HEAP_SECTIONS        16u
+-#define PG_GMU_HEAP_WINDOW_PA       0x8c400000u
+-#define PG_GMU_HEAP_SCRATCH_PA      0x8c48f000ull
++#define PG_GMU_HEAP_VA_BASE         0x06e00000u
++#define PG_GMU_HEAP_SECTIONS        1u
++#define PG_GMU_HEAP_WINDOW_PA       0x86e00000u
++#define PG_GMU_HEAP_SCRATCH_PA      0x86f8f000ull
+ #define PG_GMU_HEAP_SCRATCH_SIZE    0x1000u
+ #define PG_GMU_HEAP_SCRATCH_FILL    0xdeadbeefu
+ 
+@@ -566,8 +575,8 @@ static volatile uint32_t *pg_smmu_regs;
+ static volatile uint32_t *pg_pdc_regs;
+ /* 0129: context bank selected by pg_hfi_smmu_stage1(), for diagnostics. */
+ static int pg_smmu_s1_cbndx = -1;
+-/* 0132: host mapping of the stage-1 table, for descriptor readback. */
+-static volatile uint32_t *pg_smmu_s1_pt;
++/* 0135: host mapping of the AArch64 stage-1 tables, for descriptor readback. */
++static volatile uint64_t *pg_smmu_s1_pt;
+ /* 0132: a timed-out ATS1PR is not retried; it may need QCOM halt/resume. */
+ static bool pg_smmu_ats_timed_out;
+ /* 0133: independent experiment bits selected by polaris0133=<mask>. */
+@@ -2193,11 +2202,17 @@ pg_smmu_fault_probe(const char *tag)
+ 		    "CBA2R=0x%08x\n", tag, i, ttbr0, ttbcr, ttbcr2,
+ 		    contextidr, mair0, mair1, cba2r);
+ 		if ((int)i == pg_smmu_s1_cbndx && pg_smmu_s1_pt != NULL) {
++			volatile uint64_t *l1 = pg_smmu_s1_pt;
++			volatile uint64_t *l2_0 = (volatile uint64_t *)
++			    ((volatile char *)l1 + PG_SMMU_S1_L2_0_OFF);
++			volatile uint64_t *l2_4 = (volatile uint64_t *)
++			    ((volatile char *)l1 + PG_SMMU_S1_L2_4_OFF);
++
+ 			printf("POLARIS PWR: SMMU fault probe %s CB%u "
+-			    "pt[0x6e]=0x%08x pt[0x6f]=0x%08x "
+-			    "pt[0x70]=0x%08x\n", tag, i,
+-			    pg_smmu_s1_pt[0x6eu], pg_smmu_s1_pt[0x6fu],
+-			    pg_smmu_s1_pt[0x70u]);
++			    "L1[0]=0x%llx L1[4]=0x%llx "
++			    "L2_0[37]=0x%llx L2_0[62]=0x%llx "
++			    "L2_4[37]=0x%llx\n", tag, i, l1[0], l1[4],
++			    l2_0[0x37u], l2_0[0x62u], l2_4[0x37u]);
+ 		}
+ 	}
+ }
+@@ -2410,11 +2425,13 @@ pg_gmu_dtcm_dump(const char *tag)
+  * micro-MMU, which this bring-up does not implement yet.
+  */
+ static bool
+-pg_smmu_ats1pr_probe(unsigned int cb, uint32_t va, const char *tag)
++pg_smmu_ats1pr_probe(unsigned int cb, uint64_t va, const char *tag)
+ {
+-	uint64_t expected = 0, par, par_before;
+-	uint32_t desc = 0, fsr_before, fsr_after, fsynr0, frsynra;
+-	uint32_t far_lo, far_hi, atsr, idr0, idx, page, sid;
++	volatile uint64_t *l1, *l2;
++	uint64_t expected = 0, par, par_before, page, desc = 0;
++	uint64_t l1_desc, l1_pa, l2_off;
++	uint32_t fsr_before, fsr_after, fsynr0, frsynra;
++	uint32_t far_lo, far_hi, atsr, idr0, l1_idx, l2_idx, sid;
+ 	uint64_t far_before, far_after;
+ 	unsigned int i;
+ 	bool timed_out = false;
+@@ -2431,12 +2448,24 @@ pg_smmu_ats1pr_probe(unsigned int cb, uint32_t va, const char *tag)
+ 		return false;
+ 	}
+ 
+-	page = va & ~0xfffu;
+-	idx = page >> 20;
+-	desc = pg_smmu_s1_pt[idx];
+-	if ((desc & 3u) == 2u) {
+-		expected = (uint64_t)(desc & 0xfff00000u) |
+-		    (page & 0xfffffu);
++	page = va & ~(uint64_t)0xfffull;
++	l1_idx = (uint32_t)((va >> 30) & 0x1ffull);
++	l1 = pg_smmu_s1_pt;
++	l1_desc = l1[l1_idx];
++	if ((l1_desc & 3ull) == 3ull) {
++		l1_pa = l1_desc & 0x0000fffffffff000ull;
++		l2_off = l1_pa - PG_SMMU_S1_PT_PA;
++		if (l2_off + 0x1000ull <= PG_SMMU_S1_PT_SIZE) {
++			l2 = (volatile uint64_t *)((volatile char *)l1 +
++			    l2_off);
++			l2_idx = (uint32_t)((va >> 21) & 0x1ffull);
++			desc = l2[l2_idx];
++			if ((desc & 3ull) == 1ull) {
++				expected = (desc &
++				    0x0000ffffffe00000ull) |
++				    (va & 0x1fffffull);
++			}
++		}
+ 	}
+ 	fsr_before = pg_rd32(pg_smmu_regs,
+ 	    PG_SMMU_CB(cb, PG_SMMU_CB_FSR));
+@@ -2453,8 +2482,8 @@ pg_smmu_ats1pr_probe(unsigned int cb, uint32_t va, const char *tag)
+ 	atsr = pg_rd32(pg_smmu_regs, PG_SMMU_CB(cb, PG_SMMU_CB_ATSR));
+ 	idr0 = pg_rd32(pg_smmu_regs, PG_SMMU_IDR0);
+ 	sid = frsynra & PG_SMMU_CBFRSYNRA_SID_MASK;
+-	printf("POLARIS PWR: SMMU ATS1PR %s CB%u pre va=0x%08x "
+-	    "page=0x%08x desc=0x%08x expected=0x%llx atosns=%u "
++	printf("POLARIS PWR: SMMU ATS1PR %s CB%u pre va=0x%llx "
++	    "page=0x%llx desc=0x%llx expected=0x%llx atosns=%u "
+ 	    "FSR=0x%08x FAR=0x%llx FSYNR0=0x%08x wnr=%u sid=0x%04x "
+ 	    "PAR=0x%llx ATSR=0x%08x\n", tag, cb, va, page, desc, expected,
+ 	    (idr0 >> 26) & 1u, fsr_before, far_before, fsynr0,
+@@ -2492,7 +2521,7 @@ pg_smmu_ats1pr_probe(unsigned int cb, uint32_t va, const char *tag)
+ 	    PG_SMMU_CB(cb, PG_SMMU_CB_FSYNR0));
+ 	frsynra = pg_rd32(pg_smmu_regs, PG_SMMU_CBFRSYNRA(cb));
+ 	sid = frsynra & PG_SMMU_CBFRSYNRA_SID_MASK;
+-	printf("POLARIS PWR: SMMU ATS1PR %s CB%u post va=0x%08x "
++	printf("POLARIS PWR: SMMU ATS1PR %s CB%u post va=0x%llx "
+ 	    "PAR=0x%llx pa=0x%llx ATSR=0x%08x FSR=0x%08x FAR=0x%llx "
+ 	    "FSYNR0=0x%08x wnr=%u sid=0x%04x par_unchanged=%u\n",
+ 	    tag, cb, va, par, par & PG_SMMU_CB_PAR_PA_MASK, atsr,
+@@ -2501,17 +2530,17 @@ pg_smmu_ats1pr_probe(unsigned int cb, uint32_t va, const char *tag)
+ 	    par == par_before ? 1u : 0u);
+ 	if (timed_out) {
+ 		printf("POLARIS PWR: SMMU ATS1PR %s CB%u TIMEOUT "
+-		    "va=0x%08x atsr=0x%08x; inconclusive (ATS may require "
++		    "va=0x%llx atsr=0x%08x; inconclusive (ATS may require "
+ 		    "QCOM halt/resume)\n", tag, cb, va, atsr);
+ 		return false;
+ 	}
+ 	if ((par & PG_SMMU_CB_PAR_F) != 0) {
+-		printf("POLARIS PWR: SMMU ATS1PR %s CB%u FAULT va=0x%08x "
++		printf("POLARIS PWR: SMMU ATS1PR %s CB%u FAULT va=0x%llx "
+ 		    "PAR=0x%llx expected=0x%llx\n", tag, cb, va, par,
+ 		    expected);
+ 		return true;
+ 	}
+-	printf("POLARIS PWR: SMMU ATS1PR %s CB%u ok va=0x%08x "
++	printf("POLARIS PWR: SMMU ATS1PR %s CB%u ok va=0x%llx "
+ 	    "pa=0x%llx expected=0x%llx match=%s\n", tag, cb, va,
+ 	    par & PG_SMMU_CB_PAR_PA_MASK, expected,
+ 	    (par & PG_SMMU_CB_PAR_PA_MASK) == expected ? "yes" : "no");
+@@ -2535,12 +2564,14 @@ pg_hfi_smmu_stage1(void)
+ 		PG_SMMU_MAX_LEVEL, PG_SMMU_MAX_LEVEL - 1u, 2u, 1u, 0u
+ 	};
+ 	vm_offset_t va = 0;
+-	uint64_t pt_pa, win_pa;
+-	volatile uint32_t *pt;
+-	uint32_t i, idx, first, alias_first, heap_first, cbndx = 0, alias_base;
++	uint64_t pt_pa, win_pa, hfi_block_pa, hfi_block_va;
++	volatile uint64_t *pt, *l2_0, *l2_4;
++	uint64_t l2_0_pa, l2_4_pa;
++	uint32_t i, hfi_idx, heap_idx, high_idx, cbndx = 0;
+ 	uint32_t s2cr3, s2cr4, val;
+-	uint32_t desc_flags;
+-	uint32_t cbar, sctlr, fsr;
++	uint64_t desc_flags;
++	uint32_t cbar, sctlr, fsr, cba2r, ttbcr, ttbcr2, mair0;
++	uint64_t ttbr0;
+ 	bool have_cb = false;
+ 
+ 	if (!pg_smmu_map() || !pg_hfi.ready) {
+@@ -2552,12 +2583,9 @@ pg_hfi_smmu_stage1(void)
+ 		    pg_hfi.pa);
+ 		return false;
+ 	}
+-	desc_flags = (pg_polaris0133(7) ? PG_SMMU_S1_DESC_DEV :
+-	    PG_SMMU_S1_DESC_NC) |
+-	    (pg_polaris0133(0) ? PG_SMMU_S1_DESC_NS : 0);
+-	printf("POLARIS PWR: SMMU S1 0134 desc_flags=0x%08x ns=%u old=%u\n",
+-	    desc_flags, (desc_flags & PG_SMMU_S1_DESC_NS) ? 1u : 0u,
+-	    pg_polaris0133(7) ? 1u : 0u);
++	desc_flags = PG_SMMU_S1_A64_DESC_FLAGS;
++	printf("POLARIS PWR: SMMU S1 0135 long desc flags=0x%llx ns=1 "
++	    "asid=5\n", desc_flags);
+ 
+ 	/*
+ 	 * 0134: undo 0133's fatal ordering.  Every context bank must be
+@@ -2593,104 +2621,54 @@ pg_hfi_smmu_stage1(void)
+ 	printf("POLARIS PWR: SMMU S1 pt reserved pa=0x%llx va=0x%llx\n",
+ 	    pt_pa, (uint64_t)va);
+ 
+-	pt = (volatile uint32_t *)va;
++	pt = (volatile uint64_t *)va;
+ 	pg_smmu_s1_pt = pt;
+-	for (i = 0; i < PG_SMMU_S1_PT_SIZE / 4u; i++) {
++	for (i = 0; i < PG_SMMU_S1_PT_SIZE / 8u; i++) {
+ 		pt[i] = 0;
+ 	}
+-	first = (uint32_t)(pg_hfi.pa >> 20);
+-	win_pa = (uint64_t)first << 20;
+-	alias_first = (uint32_t)((pg_hfi.pa & 0x7fffffffull) >> 20);
+-	heap_first = PG_GMU_HEAP_VA_BASE >> 20;
++	l2_0_pa = pt_pa + PG_SMMU_S1_L2_0_OFF;
++	l2_4_pa = pt_pa + PG_SMMU_S1_L2_4_OFF;
++	pt[0] = l2_0_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
++	pt[4] = l2_4_pa | PG_SMMU_S1_A64_TABLE_FLAGS;
++	l2_0 = (volatile uint64_t *)((volatile char *)pt +
++	    PG_SMMU_S1_L2_0_OFF);
++	l2_4 = (volatile uint64_t *)((volatile char *)pt +
++	    PG_SMMU_S1_L2_4_OFF);
++
+ 	/*
+-	 * 0134 bit 6: diagnostic all-4 GiB alias.  Every truth table entry
+-	 * points at the same low-DRAM 1 MiB; the VA's 1 MiB offset is
+-	 * preserved, so 0x0c42xxxx, 0x06f8xxxx and 0x6002xxxx all land in
+-	 * the window without a separate cutout for each one.
++	 * The GMU reaches the firmware heap through a bit-31-truncated
++	 * address: VA 0x106f8fbc4 is issued as 0x06f8fbc4.  Map both
++	 * 2 MiB aliases to the same free low-DRAM window so a firmware
++	 * write can never escape into another subsystem.
+ 	 */
+-	if (pg_polaris0133(6)) {
+-		alias_base = PG_GMU_HEAP_WINDOW_PA & 0xfff00000u;
+-		for (i = 0; i < PG_SMMU_S1_PT_SIZE / 4u; i++) {
+-			pt[i] = alias_base | desc_flags;
+-		}
+-		printf("POLARIS PWR: SMMU 0134 full alias entries=%u "
+-		    "base=0x%08x desc=0x%08x va0c4=0x%08x va06f=0x%08x "
+-		    "va600=0x%08x\n", PG_SMMU_S1_PT_SIZE / 4u, alias_base,
+-		    pt[0], pt[0x0c4], pt[0x06f], pt[0x600]);
+-	} else {
+-		for (i = 0; i < PG_SMMU_S1_SECTIONS; i++) {
+-			idx = first + i;
+-			if (idx >= PG_SMMU_S1_PT_SIZE / 4u) {
+-				break;
+-			}
+-			pt[idx] = ((uint32_t)(win_pa +
+-			    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) &
+-			    0xfff00000u) | desc_flags;
+-		}
+-		/*
+-		 * 0130: map the GMU-visible <2 GiB alias onto the same
+-		 * physical 4 MiB window.  The firmware truncates bit 31,
+-		 * so without this section it faults at 0x0c420008 before
+-		 * CTRL_INIT can run.
+-		 */
+-		if (alias_first != first) {
+-			for (i = 0; i < PG_SMMU_S1_SECTIONS; i++) {
+-				idx = alias_first + i;
+-				if (idx >= PG_SMMU_S1_PT_SIZE / 4u) {
+-					break;
+-				}
+-				pt[idx] = ((uint32_t)(win_pa +
+-				    (uint64_t)i * PG_SMMU_S1_SECTION_SIZE) &
+-				    0xfff00000u) | desc_flags;
+-			}
+-		}
+-		/*
+-		 * 0131: diagnostic mapping for the firmware heap window.
+-		 * Every one of the 16 sections aliases the same free
+-		 * low-DRAM MiB at 0x8c400000; only the page at +0x8f000
+-		 * is filled with a sentinel.  If the firmware writes VA
+-		 * 0x06f8fbc4 the SMMU must no longer report a translation
+-		 * fault, and the host can see the write.
+-		 */
+-		if (heap_first + PG_GMU_HEAP_SECTIONS <=
+-		    PG_SMMU_S1_PT_SIZE / 4u) {
+-			for (i = 0; i < PG_GMU_HEAP_SECTIONS; i++) {
+-				pt[heap_first + i] =
+-				    (PG_GMU_HEAP_WINDOW_PA & 0xfff00000u) |
+-				    desc_flags;
+-			}
+-		}
+-		/*
+-		 * 0133 bit 5: alternative GMU-visible base.  A single 1 MiB
+-		 * section maps the whole low-DRAM window that holds the HFI
+-		 * table; the table address handed to the firmware adds the
+-		 * 0x20000 in-window offset.
+-		 */
+-		if (pg_polaris0133(5)) {
+-			idx = PG_0133_HFI_VA_BASE >> 20;
+-			if (idx < PG_SMMU_S1_PT_SIZE / 4u) {
+-				pt[idx] = (PG_0133_HFI_PA_BASE & 0xfff00000u) |
+-				    desc_flags;
+-				printf("POLARIS PWR: SMMU S1 0133 hfi base "
+-				    "va=0x%08x first=%u desc=0x%08x\n",
+-				    PG_0133_HFI_VA_BASE, idx, pt[idx]);
+-			}
+-		}
+-	}
++	win_pa = (uint64_t)PG_GMU_HEAP_WINDOW_PA & ~(uint64_t)0x1fffffull;
++	heap_idx = (uint32_t)((PG_GMU_HEAP_VA_BASE >> 21) & 0x1ffu);
++	l2_0[heap_idx] = win_pa | desc_flags;
++	high_idx = (uint32_t)((0x106e00000ull >> 21) & 0x1ffu);
++	l2_4[high_idx] = win_pa | desc_flags;
++
++	/*
++	 * Map the 2 MiB block that contains the HFI queue table.  The GMU
++	 * truncates the physical address to 31 bits, so PA 0x8c420000 is
++	 * reached at VA 0x0c420000.  This block also contains the GPU-S1PT
++	 * reservation itself; firmware must stay below the 0x8000-byte HFI
++	 * table (0x8c428000 is the first page table page).
++	 */
++	hfi_block_pa = (uint64_t)pg_hfi.pa & ~(uint64_t)0x1fffffull;
++	hfi_block_va = ((uint64_t)(uint32_t)pg_hfi.pa & 0x7fffffffull) &
++	    ~(uint64_t)0x1fffffull;
++	hfi_idx = (uint32_t)((hfi_block_va >> 21) & 0x1ffu);
++	l2_0[hfi_idx] = hfi_block_pa | desc_flags;
+ 	__sync_synchronize();
+ 	pg_sync_checkpoint("s1-pt-filled");
+-	printf("POLARIS PWR: SMMU S1 pt pa=0x%llx win=0x%08x first=%u "
+-	    "desc[%u]=0x%08x desc[%u]=0x%08x\n", pt_pa, (uint32_t)win_pa,
+-	    first, first, pt[first], first + 1u, pt[first + 1u]);
+-	if (alias_first != first) {
+-		printf("POLARIS PWR: SMMU S1 alias va=0x%08x first=%u "
+-		    "desc[%u]=0x%08x\n", alias_first << 20, alias_first,
+-		    alias_first, pt[alias_first]);
+-	}
+-	printf("POLARIS PWR: SMMU S1 heap va=0x%08x sz=0x%08x pa=0x%08x "
+-	    "desc[0x%x]=0x%08x\n", PG_GMU_HEAP_VA_BASE,
+-	    PG_GMU_HEAP_SECTIONS * PG_SMMU_S1_SECTION_SIZE,
+-	    PG_GMU_HEAP_WINDOW_PA, heap_first, pt[heap_first]);
++	printf("POLARIS PWR: SMMU S1 0135 pt pa=0x%llx L1[0]=0x%llx "
++	    "L1[4]=0x%llx L2_0[37]=0x%llx L2_0[62]=0x%llx "
++	    "L2_4[37]=0x%llx\n", pt_pa, pt[0], pt[4], l2_0[0x37u],
++	    l2_0[0x62u], l2_4[0x37u]);
++	printf("POLARIS PWR: SMMU S1 0135 heap va=0x%08x pa=0x%08x "
++	    "idx=0x%x desc=0x%llx hfi va=0x%llx pa=0x%llx idx=0x%x\n",
++	    PG_GMU_HEAP_VA_BASE, (uint32_t)win_pa, heap_idx,
++	    l2_0[heap_idx], hfi_block_va, hfi_block_pa, hfi_idx);
+ 
+ 	/* Dump every candidate bank before choosing one. */
+ 	pg_sync_checkpoint("s1-0134-cb-probe");
+@@ -2741,35 +2719,70 @@ pg_hfi_smmu_stage1(void)
+ 		/* Only safe now: every CB above has SCTLR.M=0. */
+ 		(void)pg_smmu_micro_mmu_halt("s1");
+ 	}
+-	/* Disable, clear fault state, then program the bank exactly as vendor. */
++	/*
++	 * Disable, clear fault state, then program the bank for AArch64
++	 * long descriptors.  CBA2R.RW64 (bit 0), not TTBCR bit 31, selects
++	 * the AArch64 translation format on SMMUv2.
++	 */
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR), 0, 3);
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FSR),
+ 	    0xffffffffu, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CBA2R(cbndx), 0, 3);
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CBAR(cbndx),
+ 	    PG_SMMU_CBAR_S1_S2BYPASS, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_LO),
+-	    (uint32_t)pt_pa, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_HI), 0, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR1_LO), 0, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR), 0, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR2), 0, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CBA2R(cbndx),
++	    PG_SMMU_S1_CBA2R_RW64, 3);
++	pg_wr64(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_LO),
++	    PG_SMMU_S1_TTBR0_VAL);
++	pg_wr64(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR1_LO),
++	    PG_SMMU_S1_TTBR1_VAL);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR2),
++	    PG_SMMU_S1_TTBCR2_VAL, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR),
++	    PG_SMMU_S1_TTBCR_VAL, 3);
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_CONTEXTIDR), 0, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR0), 0, 3);
+-	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR1), 0, 3);
+-	pg_sync_checkpoint("s1-0134-cb-programmed");
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR0),
++	    PG_SMMU_S1_MAIR0_VAL, 3);
++	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR1),
++	    PG_SMMU_S1_MAIR1_VAL, 3);
++	__sync_synchronize();
++	cba2r = pg_rd32(pg_smmu_regs, PG_SMMU_CBA2R(cbndx));
++	ttbr0 = pg_rd64(pg_smmu_regs,
++	    PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_LO));
++	ttbcr = pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR));
++	ttbcr2 = pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR2));
++	mair0 = pg_rd32(pg_smmu_regs,
++	    PG_SMMU_CB(cbndx, PG_SMMU_CB_S1_MAIR0));
++	printf("POLARIS PWR: SMMU S1 0135 pre-enable CB%u CBA2R=0x%08x "
++	    "TTBR0=0x%llx TTBCR=0x%08x TTBCR2=0x%08x MAIR0=0x%08x\n",
++	    cbndx, cba2r, ttbr0, ttbcr, ttbcr2, mair0);
++	if (cba2r != PG_SMMU_S1_CBA2R_RW64 ||
++	    ttbr0 != PG_SMMU_S1_TTBR0_VAL ||
++	    ttbcr != PG_SMMU_S1_TTBCR_VAL ||
++	    ttbcr2 != PG_SMMU_S1_TTBCR2_VAL ||
++	    mair0 != PG_SMMU_S1_MAIR0_VAL) {
++		printf("POLARIS PWR: SMMU S1 0135 register verify failed; "
++		    "CB%u left disabled, CM3 must stay reset\n", cbndx);
++		pg_sync_checkpoint("s1-0135-verify-failed");
++		return false;
++	}
++	pg_sync_checkpoint("s1-0135-cb-programmed");
+ 	pg_wr32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR),
+ 	    PG_SMMU_SCTLR_S1, 3);
+-	pg_sync_checkpoint("s1-0134-sctlr-on");
++	__sync_synchronize();
++	pg_sync_checkpoint("s1-0135-sctlr-on");
+ 	if (pg_polaris0133(2)) {
+ 		pg_smmu_micro_mmu_resume("s1");
+ 	}
+-	printf("POLARIS PWR: SMMU S1 CB%u programmed CBAR=0x%08x SCTLR=0x%08x "
+-	    "TTBR0=0x%08x TTBCR=0x%08x FSR=0x%08x\n", cbndx,
++	printf("POLARIS PWR: SMMU S1 0135 CB%u programmed CBAR=0x%08x "
++	    "SCTLR=0x%08x TTBR0=0x%llx TTBCR=0x%08x TTBCR2=0x%08x "
++	    "CBA2R=0x%08x FSR=0x%08x\n", cbndx,
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CBAR(cbndx)),
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_SCTLR)),
+-	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_LO)),
++	    pg_rd64(pg_smmu_regs,
++	    PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBR0_LO)),
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_TTBCR2)),
++	    pg_rd32(pg_smmu_regs, PG_SMMU_CBA2R(cbndx)),
+ 	    pg_rd32(pg_smmu_regs, PG_SMMU_CB(cbndx, PG_SMMU_CB_FSR)));
+ 
+ 	/*
+@@ -2820,8 +2833,8 @@ pg_hfi_smmu_stage1(void)
+ 	if (pg_polaris0133(4)) {
+ 		pg_smmu_all_cb_dump("s1-done");
+ 	}
+-	if (pg_smmu_ats1pr_probe(cbndx, 0x0c420000u, "s1-alias")) {
+-		(void)pg_smmu_ats1pr_probe(cbndx, 0x06f8f000u, "s1-heap");
++	if (pg_smmu_ats1pr_probe(cbndx, 0x0c420000ull, "s1-alias")) {
++		(void)pg_smmu_ats1pr_probe(cbndx, 0x106f8f000ull, "s1-heap");
+ 	}
+ 	return true;
+ }
+@@ -3305,7 +3318,7 @@ polaris_gpu_hfi_start(void)
+ 	int hfion = 0;
+ 
+ 	(void)PE_parse_boot_argn("polarishfi", &hfion, sizeof(hfion));
+-	printf("POLARIS PWR: HFI start build 0134-smmu-reset-order "
++	printf("POLARIS PWR: HFI start build 0135-smmu-a64-long "
+ 	    "polarishfi=%d polaris0133=0x%x\n", hfion,
+ 	    pg_polaris0133_mask);
+ 	if (hfion != 1) {
+@@ -3544,7 +3557,7 @@ polaris_gpu_gmu_boot(uint64_t pa, uint32_t size,
+ 		mode0133 = 0;
+ 	}
+ 	pg_polaris0133_mask = (uint32_t)mode0133;
+-	printf("POLARIS PWR: 0134 build polarispwr=%d rpmh=%d modes=0x%x "
++	printf("POLARIS PWR: 0135 build polarispwr=%d rpmh=%d modes=0x%x "
+ 	    "ns=%u actlr=%u micro=%u resume=%u diag=%u hfibase=%u "
+ 	    "alias=%u old=%u\n",
+ 	    pwrlevel, rpmh_on, pg_polaris0133_mask,
